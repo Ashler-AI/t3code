@@ -183,5 +183,6 @@ describe("ConnectionCatalogDocument", () => {
     expect(document.profiles).toEqual([]);
     expect(document.credentials).toEqual([]);
     expect(JSON.stringify(document)).not.toContain("bootstrap");
+    expect(JSON.stringify(document)).not.toContain("attachCredential");
   });
 });

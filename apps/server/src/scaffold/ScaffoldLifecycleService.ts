@@ -199,6 +199,7 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
       httpBaseUrl: transport.httpBaseUrl,
       wsBaseUrl: transport.wsBaseUrl,
       bootstrapCredential: transport.bootstrapCredential,
+      attachCredential: transport.attachCredential,
       expiresAt: transport.expiresAt,
     });
   };

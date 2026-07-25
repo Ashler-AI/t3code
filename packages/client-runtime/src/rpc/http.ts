@@ -15,7 +15,12 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { FetchHttpClient, HttpClient, HttpClientError } from "effect/unstable/http";
+import {
+  FetchHttpClient,
+  HttpClient,
+  HttpClientError,
+  HttpClientRequest,
+} from "effect/unstable/http";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
@@ -84,6 +89,17 @@ export const remoteHttpClientLayer = (
   Layer.merge(
     FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetchFn))),
     httpHeaderRedactionLayer,
+  );
+
+export const withScaffoldAttachGrant = (
+  client: HttpClient.HttpClient,
+  credential: string,
+): HttpClient.HttpClient =>
+  client.pipe(
+    HttpClient.mapRequest(HttpClientRequest.setHeader("x-scaffold-attach-grant", credential)),
+    HttpClient.transform((effect) =>
+      effect.pipe(Effect.provideService(FetchHttpClient.RequestInit, { credentials: "include" })),
+    ),
   );
 
 const remoteApiBaseUrl = (httpBaseUrl: string): string => {

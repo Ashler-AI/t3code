@@ -38,10 +38,12 @@ class TestWebSocket {
   readyState = TestWebSocket.CONNECTING;
   readonly sent: string[] = [];
   readonly url: string;
+  readonly protocols: string | string[] | undefined;
   private readonly listeners = new Map<SocketEventType, Set<SocketListener>>();
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[]) {
     this.url = url;
+    this.protocols = protocols;
   }
 
   addEventListener(type: SocketEventType, listener: SocketListener) {
@@ -155,8 +157,8 @@ const LEGACY_SERVER_CONFIG = {
 
 const makeFactory = Effect.fn("TestRpcSessionFactory.make")(function* () {
   const sockets: TestWebSocket[] = [];
-  const constructorLayer = Layer.succeed(Socket.WebSocketConstructor, (url) => {
-    const socket = new TestWebSocket(url);
+  const constructorLayer = Layer.succeed(Socket.WebSocketConstructor, (url, protocols) => {
+    const socket = new TestWebSocket(url, protocols);
     sockets.push(socket);
     return socket as unknown as globalThis.WebSocket;
   });
@@ -223,6 +225,7 @@ describe("RpcSessionFactory", () => {
       const socket = yield* awaitSocket(sockets);
 
       expect(socket.url).toBe(PREPARED.socketUrl);
+      expect(socket.protocols).toBeUndefined();
       socket.open();
       yield* completeInitialConfig(socket);
       yield* Fiber.join(readyFiber);
@@ -265,6 +268,17 @@ describe("RpcSessionFactory", () => {
       });
       yield* Effect.yieldNow;
       expect(sockets).toHaveLength(1);
+    }),
+  );
+
+  it.effect("passes the ephemeral Scaffold attach grant as a websocket subprotocol", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      yield* factory.connect({ ...PREPARED, scaffoldAttachCredential: "attach-secret" });
+      const socket = yield* awaitSocket(sockets);
+
+      expect(socket.url).toBe(PREPARED.socketUrl);
+      expect(socket.protocols).toEqual(["scaffold.attach.attach-secret"]);
     }),
   );
 

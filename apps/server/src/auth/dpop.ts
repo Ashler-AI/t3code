@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as Option from "effect/Option";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
+import * as ServerConfig from "../config.ts";
 
 import {
   ServerAuthDpopReplayKeyCalculationError,
@@ -30,6 +31,7 @@ export const verifyRequestDpopProof = (input: {
   readonly request: HttpServerRequest.HttpServerRequest;
   readonly expectedThumbprint?: string;
   readonly expectedAccessToken?: string;
+  readonly trustedPublicBaseUrl?: URL;
 }) =>
   Effect.gen(function* () {
     const proof = input.request.headers.dpop;
@@ -39,11 +41,17 @@ export const verifyRequestDpopProof = (input: {
         diagnostic: "Invalid DPoP request URL.",
       });
     }
+    const config = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+    const trustedPublicBaseUrl =
+      input.trustedPublicBaseUrl ?? Option.getOrUndefined(config)?.trustedPublicBaseUrl;
+    const verificationUrl = trustedPublicBaseUrl
+      ? mapDpopRequestUrl(trustedPublicBaseUrl, url.value)
+      : url.value.href;
     const now = yield* DateTime.now;
     const result = verifyDpopProof({
       proof,
       method: input.request.method,
-      url: url.value.href,
+      url: verificationUrl,
       nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
       ...(input.expectedThumbprint ? { expectedThumbprint: input.expectedThumbprint } : {}),
       ...(input.expectedAccessToken ? { expectedAccessToken: input.expectedAccessToken } : {}),
@@ -85,3 +93,11 @@ export const verifyRequestDpopProof = (input: {
       );
     return result.thumbprint;
   });
+
+export function mapDpopRequestUrl(trustedPublicBaseUrl: URL, requestUrl: URL): string {
+  const base = new URL(trustedPublicBaseUrl);
+  const basePath = base.pathname.replace(/\/+$/, "");
+  base.pathname = `${basePath}${requestUrl.pathname.startsWith("/") ? "" : "/"}${requestUrl.pathname}`;
+  base.search = requestUrl.search;
+  return base.href;
+}

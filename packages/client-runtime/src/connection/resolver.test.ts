@@ -578,6 +578,7 @@ describe("ConnectionResolver", () => {
                   httpBaseUrl: ENDPOINT.httpBaseUrl,
                   wsBaseUrl: ENDPOINT.wsBaseUrl,
                   bootstrapCredential: "one-time-bootstrap",
+                  attachCredential: "attach-secret",
                   expiresAt: "2026-07-24T20:05:00.000Z",
                 }),
               ),
