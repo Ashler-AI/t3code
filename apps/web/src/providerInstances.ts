@@ -278,12 +278,12 @@ export function getDefaultProviderInstanceModel(
 ): string | undefined {
   const entry = getProviderInstanceEntry(providers, instanceId);
   if (!entry) return undefined;
-  return (
+  const liveModel =
     entry.models.find((model) => model.isDefault && !model.isCustom)?.slug ??
     entry.models.find((model) => !model.isCustom)?.slug ??
-    entry.models[0]?.slug ??
-    DEFAULT_MODEL_BY_PROVIDER[entry.driverKind]
-  );
+    entry.models[0]?.slug;
+  if (liveModel !== undefined || entry.driverKind === "omp") return liveModel;
+  return DEFAULT_MODEL_BY_PROVIDER[entry.driverKind];
 }
 
 const isSelectableProviderInstanceEntry = (entry: ProviderInstanceEntry): boolean =>
@@ -336,7 +336,21 @@ export function resolveDefaultProviderModelSelection(
   providers: ReadonlyArray<ServerProvider>,
   selection: ModelSelection | null | undefined,
 ): ModelSelection | null {
-  const instanceId = resolveSelectableProviderInstance(providers, selection?.instanceId);
+  const entries = deriveProviderInstanceEntries(providers);
+  const registeredDefaultOmp =
+    selection == null
+      ? entries.find(
+          (entry) =>
+            entry.instanceId === "omp" &&
+            entry.driverKind === "omp" &&
+            entry.enabled &&
+            entry.isAvailable,
+        )
+      : undefined;
+  if (registeredDefaultOmp?.status === "error") return null;
+  const instanceId =
+    registeredDefaultOmp?.instanceId ??
+    resolveSelectableProviderInstanceEntry(entries, selection?.instanceId)?.instanceId;
   if (instanceId === undefined) return null;
   if (selection?.instanceId === instanceId) return selection;
   const model = getDefaultProviderInstanceModel(providers, instanceId);

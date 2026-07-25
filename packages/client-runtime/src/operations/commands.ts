@@ -12,8 +12,8 @@ import {
   type EnvironmentRpcFailure,
   type EnvironmentRpcSuccess,
   type EnvironmentRpcUnavailableError,
-  request,
 } from "../rpc/client.ts";
+import { resolveUiSessionSource } from "../session-source/index.ts";
 
 type CommandType = ClientOrchestrationCommand["type"];
 type CommandOf<T extends CommandType> = Extract<ClientOrchestrationCommand, { readonly type: T }>;
@@ -80,7 +80,7 @@ function timestampedCommandMetadata(input: {
 }
 
 function dispatch(command: ClientOrchestrationCommand) {
-  return request(ORCHESTRATION_WS_METHODS.dispatchCommand, command);
+  return resolveUiSessionSource.pipe(Effect.flatMap((source) => source.dispatch(command)));
 }
 
 export const createProject: (input: CreateProjectInput) => CommandEffect = Effect.fn(

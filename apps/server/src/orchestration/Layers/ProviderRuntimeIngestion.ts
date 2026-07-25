@@ -2,8 +2,10 @@ import {
   ApprovalRequestId,
   type AssistantDeliveryMode,
   CommandId,
+  type EnvironmentId,
   MessageId,
   type OrchestrationEvent,
+  type OrchestrationEventMetadata,
   type OrchestrationMessage,
   type OrchestrationProposedPlanId,
   CheckpointRef,
@@ -16,10 +18,10 @@ import {
   type OrchestrationThread,
   type OrchestrationThreadActivity,
   type ProviderRuntimeEvent,
+  type ProviderRuntimeEventEnvelope,
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
-import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -27,7 +29,10 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
-import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import {
+  ProviderService,
+  type ProviderRuntimeEventDelivery,
+} from "../../provider/Services/ProviderService.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { isGitRepository } from "../../git/Utils.ts";
@@ -102,13 +107,60 @@ type TurnStartRequestedDomainEvent = Extract<
 
 type RuntimeIngestionInput =
   | {
-      source: "runtime";
+      source: "canonical-delivery";
+      delivery: ProviderRuntimeEventDelivery;
+    }
+  | {
+      source: "canonical-runtime";
+      envelope: ProviderRuntimeEventEnvelope;
+    }
+  | {
+      source: "legacy-runtime";
       event: ProviderRuntimeEvent;
     }
   | {
       source: "domain";
       event: TurnStartRequestedDomainEvent;
     };
+
+interface ProviderEventAttribution {
+  readonly environmentId: EnvironmentId;
+  readonly metadata: OrchestrationEventMetadata;
+}
+
+function canonicalEventAttribution(
+  envelope: ProviderRuntimeEventEnvelope,
+): ProviderEventAttribution {
+  return {
+    environmentId: envelope.environmentId,
+    metadata: {
+      providerEventId: envelope.eventId,
+      providerEnvironmentId: envelope.environmentId,
+      providerThreadId: envelope.threadId,
+      providerSourceSequence: envelope.sourceSequence,
+      providerResumeCursor: envelope.resumeCursor,
+      providerInstanceId: envelope.providerInstanceId,
+      ...(envelope.runtimeSessionId !== undefined
+        ? { providerRuntimeSessionId: envelope.runtimeSessionId }
+        : {}),
+    },
+  };
+}
+
+function validateCanonicalEnvelope(envelope: ProviderRuntimeEventEnvelope): void {
+  if (envelope.eventId !== envelope.event.eventId) {
+    throw new Error("canonical provider envelope eventId does not match its event");
+  }
+  if (envelope.threadId !== envelope.event.threadId) {
+    throw new Error("canonical provider envelope threadId does not match its event");
+  }
+  if (
+    envelope.event.providerInstanceId !== undefined &&
+    envelope.providerInstanceId !== envelope.event.providerInstanceId
+  ) {
+    throw new Error("canonical provider envelope providerInstanceId does not match its event");
+  }
+}
 
 function toTurnId(value: TurnId | string | undefined): TurnId | undefined {
   return value === undefined ? undefined : TurnId.make(String(value));
@@ -310,14 +362,46 @@ function requestKindFromCanonicalRequestType(
 export function runtimeEventToActivities(
   event: ProviderRuntimeEvent,
   taskTitle?: string,
+  sourceSequence?: number,
 ): ReadonlyArray<OrchestrationThreadActivity> {
   const maybeSequence = (() => {
+    if (sourceSequence !== undefined) {
+      return { sequence: sourceSequence };
+    }
     const eventWithSequence = event as ProviderRuntimeEvent & { sessionSequence?: number };
     return eventWithSequence.sessionSequence !== undefined
       ? { sequence: eventWithSequence.sessionSequence }
       : {};
   })();
   switch (event.type) {
+    case "content.delta": {
+      if (
+        event.payload.streamKind !== "reasoning_text" &&
+        event.payload.streamKind !== "reasoning_summary_text"
+      ) {
+        return [];
+      }
+      if (event.payload.delta.length === 0) {
+        return [];
+      }
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "reasoning.delta",
+          summary: "Thinking",
+          payload: {
+            detail: event.payload.delta,
+            reasoningItemId: event.itemId ?? event.turnId ?? event.eventId,
+            streamKind: event.payload.streamKind,
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "request.opened": {
       if (event.payload.requestType === "tool_user_input") {
         return [];
@@ -502,6 +586,8 @@ export function runtimeEventToActivities(
           payload: {
             taskId: event.payload.taskId,
             ...(event.payload.taskType ? { taskType: event.payload.taskType } : {}),
+            ...(event.payload.model ? { model: event.payload.model } : {}),
+            ...(event.payload.effort ? { effort: event.payload.effort } : {}),
             ...(event.payload.description
               ? { detail: truncateDetail(event.payload.description) }
               : {}),
@@ -688,15 +774,37 @@ export function runtimeEventToActivities(
 }
 
 const make = Effect.gen(function* () {
-  const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const serverSettingsService = yield* ServerSettingsService;
-  const providerCommandId = (event: ProviderRuntimeEvent, tag: string) =>
-    crypto.randomUUIDv4.pipe(
-      Effect.map((uuid) => CommandId.make(`provider:${event.eventId}:${tag}:${uuid}`)),
+  const providerCommandId = (
+    event: ProviderRuntimeEvent,
+    tag: string,
+    attribution?: ProviderEventAttribution | undefined,
+    stableSubIndex: string | number = 0,
+  ) =>
+    Effect.succeed(
+      CommandId.make(
+        [
+          "provider",
+          encodeURIComponent(attribution?.environmentId ?? "legacy"),
+          encodeURIComponent(event.threadId),
+          encodeURIComponent(event.eventId),
+          encodeURIComponent(tag),
+          encodeURIComponent(String(stableSubIndex)),
+        ].join(":"),
+      ),
+    );
+
+  const dispatchProviderCommand = (
+    command: Parameters<typeof orchestrationEngine.dispatch>[0],
+    attribution?: ProviderEventAttribution | undefined,
+  ) =>
+    orchestrationEngine.dispatch(
+      command,
+      attribution === undefined ? undefined : { metadata: attribution.metadata },
     );
 
   const turnMessageIdsByTurnKey = yield* Cache.make<string, Set<MessageId>>({
@@ -941,6 +1049,7 @@ const make = Effect.gen(function* () {
 
   const flushBufferedAssistantMessage = (input: {
     event: ProviderRuntimeEvent;
+    attribution?: ProviderEventAttribution | undefined;
     threadId: ThreadId;
     messageId: MessageId;
     turnId?: TurnId;
@@ -953,20 +1062,29 @@ const make = Effect.gen(function* () {
         return false;
       }
 
-      yield* orchestrationEngine.dispatch({
-        type: "thread.message.assistant.delta",
-        commandId: yield* providerCommandId(input.event, input.commandTag),
-        threadId: input.threadId,
-        messageId: input.messageId,
-        delta: bufferedText,
-        ...(input.turnId ? { turnId: input.turnId } : {}),
-        createdAt: input.createdAt,
-      });
+      yield* dispatchProviderCommand(
+        {
+          type: "thread.message.assistant.delta",
+          commandId: yield* providerCommandId(
+            input.event,
+            input.commandTag,
+            input.attribution,
+            input.messageId,
+          ),
+          threadId: input.threadId,
+          messageId: input.messageId,
+          delta: bufferedText,
+          ...(input.turnId ? { turnId: input.turnId } : {}),
+          createdAt: input.createdAt,
+        },
+        input.attribution,
+      );
       return true;
     });
 
   const flushBufferedAssistantMessagesForTurn = (input: {
     event: ProviderRuntimeEvent;
+    attribution?: ProviderEventAttribution | undefined;
     threadId: ThreadId;
     turnId: TurnId;
     createdAt: string;
@@ -983,6 +1101,7 @@ const make = Effect.gen(function* () {
         (messageId) =>
           flushBufferedAssistantMessage({
             event: input.event,
+            attribution: input.attribution,
             threadId: input.threadId,
             messageId,
             turnId: input.turnId,
@@ -1000,6 +1119,7 @@ const make = Effect.gen(function* () {
 
   const finalizeAssistantMessage = (input: {
     event: ProviderRuntimeEvent;
+    attribution?: ProviderEventAttribution | undefined;
     threadId: ThreadId;
     messageId: MessageId;
     turnId?: TurnId;
@@ -1020,32 +1140,49 @@ const make = Effect.gen(function* () {
       const hasRenderableText = hasRenderableAssistantText(text);
 
       if (hasRenderableText) {
-        yield* orchestrationEngine.dispatch({
-          type: "thread.message.assistant.delta",
-          commandId: yield* providerCommandId(input.event, input.finalDeltaCommandTag),
-          threadId: input.threadId,
-          messageId: input.messageId,
-          delta: text,
-          ...(input.turnId ? { turnId: input.turnId } : {}),
-          createdAt: input.createdAt,
-        });
+        yield* dispatchProviderCommand(
+          {
+            type: "thread.message.assistant.delta",
+            commandId: yield* providerCommandId(
+              input.event,
+              input.finalDeltaCommandTag,
+              input.attribution,
+              input.messageId,
+            ),
+            threadId: input.threadId,
+            messageId: input.messageId,
+            delta: text,
+            ...(input.turnId ? { turnId: input.turnId } : {}),
+            createdAt: input.createdAt,
+          },
+          input.attribution,
+        );
       }
 
       if (input.hasProjectedMessage || hasRenderableText) {
-        yield* orchestrationEngine.dispatch({
-          type: "thread.message.assistant.complete",
-          commandId: yield* providerCommandId(input.event, input.commandTag),
-          threadId: input.threadId,
-          messageId: input.messageId,
-          ...(input.turnId ? { turnId: input.turnId } : {}),
-          createdAt: input.createdAt,
-        });
+        yield* dispatchProviderCommand(
+          {
+            type: "thread.message.assistant.complete",
+            commandId: yield* providerCommandId(
+              input.event,
+              input.commandTag,
+              input.attribution,
+              input.messageId,
+            ),
+            threadId: input.threadId,
+            messageId: input.messageId,
+            ...(input.turnId ? { turnId: input.turnId } : {}),
+            createdAt: input.createdAt,
+          },
+          input.attribution,
+        );
       }
       yield* clearAssistantMessageState(input.messageId);
     });
 
   const finalizeActiveAssistantSegmentForTurn = (input: {
     event: ProviderRuntimeEvent;
+    attribution?: ProviderEventAttribution | undefined;
     threadId: ThreadId;
     turnId: TurnId;
     createdAt: string;
@@ -1065,6 +1202,7 @@ const make = Effect.gen(function* () {
 
       yield* finalizeAssistantMessage({
         event: input.event,
+        attribution: input.attribution,
         threadId: input.threadId,
         messageId: activeMessageId.value,
         turnId: input.turnId,
@@ -1088,6 +1226,7 @@ const make = Effect.gen(function* () {
 
   const upsertProposedPlan = (input: {
     event: ProviderRuntimeEvent;
+    attribution?: ProviderEventAttribution | undefined;
     threadId: ThreadId;
     threadProposedPlans: ReadonlyArray<{
       id: string;
@@ -1108,25 +1247,34 @@ const make = Effect.gen(function* () {
       }
 
       const existingPlan = findProposedPlanById(input.threadProposedPlans, input.planId);
-      yield* orchestrationEngine.dispatch({
-        type: "thread.proposed-plan.upsert",
-        commandId: yield* providerCommandId(input.event, "proposed-plan-upsert"),
-        threadId: input.threadId,
-        proposedPlan: {
-          id: input.planId,
-          turnId: input.turnId ?? null,
-          planMarkdown,
-          implementedAt: existingPlan?.implementedAt ?? null,
-          implementationThreadId: existingPlan?.implementationThreadId ?? null,
-          createdAt: existingPlan?.createdAt ?? input.createdAt,
-          updatedAt: input.updatedAt,
+      yield* dispatchProviderCommand(
+        {
+          type: "thread.proposed-plan.upsert",
+          commandId: yield* providerCommandId(
+            input.event,
+            "proposed-plan-upsert",
+            input.attribution,
+            input.planId,
+          ),
+          threadId: input.threadId,
+          proposedPlan: {
+            id: input.planId,
+            turnId: input.turnId ?? null,
+            planMarkdown,
+            implementedAt: existingPlan?.implementedAt ?? null,
+            implementationThreadId: existingPlan?.implementationThreadId ?? null,
+            createdAt: existingPlan?.createdAt ?? input.createdAt,
+            updatedAt: input.updatedAt,
+          },
+          createdAt: input.updatedAt,
         },
-        createdAt: input.updatedAt,
-      });
+        input.attribution,
+      );
     });
 
   const finalizeBufferedProposedPlan = (input: {
     event: ProviderRuntimeEvent;
+    attribution?: ProviderEventAttribution | undefined;
     threadId: ThreadId;
     threadProposedPlans: ReadonlyArray<{
       id: string;
@@ -1150,6 +1298,7 @@ const make = Effect.gen(function* () {
 
       yield* upsertProposedPlan({
         event: input.event,
+        attribution: input.attribution,
         threadId: input.threadId,
         threadProposedPlans: input.threadProposedPlans,
         planId: input.planId,
@@ -1262,6 +1411,8 @@ const make = Effect.gen(function* () {
 
   const markSourceProposedPlanImplemented = Effect.fn("markSourceProposedPlanImplemented")(
     function* (
+      event: ProviderRuntimeEvent,
+      attribution: ProviderEventAttribution | undefined,
       sourceThreadId: ThreadId,
       sourcePlanId: OrchestrationProposedPlanId,
       implementationThreadId: ThreadId,
@@ -1273,25 +1424,34 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      const commandUuid = yield* crypto.randomUUIDv4;
-      yield* orchestrationEngine.dispatch({
-        type: "thread.proposed-plan.upsert",
-        commandId: CommandId.make(
-          `provider:source-proposed-plan-implemented:${implementationThreadId}:${commandUuid}`,
-        ),
-        threadId: sourceThread.id,
-        proposedPlan: {
-          ...sourcePlan,
-          implementedAt,
-          implementationThreadId,
-          updatedAt: implementedAt,
+      yield* dispatchProviderCommand(
+        {
+          type: "thread.proposed-plan.upsert",
+          commandId: yield* providerCommandId(
+            event,
+            "source-proposed-plan-implemented",
+            attribution,
+            `${sourceThreadId}:${sourcePlanId}`,
+          ),
+          threadId: sourceThread.id,
+          proposedPlan: {
+            ...sourcePlan,
+            implementedAt,
+            implementationThreadId,
+            updatedAt: implementedAt,
+          },
+          createdAt: implementedAt,
         },
-        createdAt: implementedAt,
-      });
+        attribution,
+      );
     },
   );
 
-  const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
+  const processRuntimeEvent = (
+    event: ProviderRuntimeEvent,
+    sourceSequence?: number,
+    attribution?: ProviderEventAttribution | undefined,
+  ) =>
     Effect.gen(function* () {
       const thread = yield* resolveThreadShell(event.threadId);
       if (!thread) return;
@@ -1415,6 +1575,8 @@ const make = Effect.gen(function* () {
         if (shouldApplyThreadLifecycle) {
           if (event.type === "turn.started" && acceptedTurnStartedSourcePlan !== null) {
             yield* markSourceProposedPlanImplemented(
+              event,
+              attribution,
               acceptedTurnStartedSourcePlan.sourceThreadId,
               acceptedTurnStartedSourcePlan.sourcePlanId,
               thread.id,
@@ -1433,24 +1595,27 @@ const make = Effect.gen(function* () {
             );
           }
 
-          yield* orchestrationEngine.dispatch({
-            type: "thread.session.set",
-            commandId: yield* providerCommandId(event, "thread-session-set"),
-            threadId: thread.id,
-            session: {
+          yield* dispatchProviderCommand(
+            {
+              type: "thread.session.set",
+              commandId: yield* providerCommandId(event, "thread-session-set", attribution),
               threadId: thread.id,
-              status,
-              providerName: event.provider,
-              ...(event.providerInstanceId !== undefined
-                ? { providerInstanceId: event.providerInstanceId }
-                : {}),
-              runtimeMode: thread.session?.runtimeMode ?? "full-access",
-              activeTurnId: nextActiveTurnId,
-              lastError,
-              updatedAt: now,
+              session: {
+                threadId: thread.id,
+                status,
+                providerName: event.provider,
+                ...(event.providerInstanceId !== undefined
+                  ? { providerInstanceId: event.providerInstanceId }
+                  : {}),
+                runtimeMode: thread.session?.runtimeMode ?? "full-access",
+                activeTurnId: nextActiveTurnId,
+                lastError,
+                updatedAt: now,
+              },
+              createdAt: now,
             },
-            createdAt: now,
-          });
+            attribution,
+          );
         }
       }
 
@@ -1479,26 +1644,42 @@ const make = Effect.gen(function* () {
         if (assistantDeliveryMode === "buffered") {
           const spillChunk = yield* appendBufferedAssistantText(assistantMessageId, assistantDelta);
           if (spillChunk.length > 0) {
-            yield* orchestrationEngine.dispatch({
-              type: "thread.message.assistant.delta",
-              commandId: yield* providerCommandId(event, "assistant-delta-buffer-spill"),
-              threadId: thread.id,
-              messageId: assistantMessageId,
-              delta: spillChunk,
-              ...(turnId ? { turnId } : {}),
-              createdAt: now,
-            });
+            yield* dispatchProviderCommand(
+              {
+                type: "thread.message.assistant.delta",
+                commandId: yield* providerCommandId(
+                  event,
+                  "assistant-delta-buffer-spill",
+                  attribution,
+                  assistantMessageId,
+                ),
+                threadId: thread.id,
+                messageId: assistantMessageId,
+                delta: spillChunk,
+                ...(turnId ? { turnId } : {}),
+                createdAt: now,
+              },
+              attribution,
+            );
           }
         } else {
-          yield* orchestrationEngine.dispatch({
-            type: "thread.message.assistant.delta",
-            commandId: yield* providerCommandId(event, "assistant-delta"),
-            threadId: thread.id,
-            messageId: assistantMessageId,
-            delta: assistantDelta,
-            ...(turnId ? { turnId } : {}),
-            createdAt: now,
-          });
+          yield* dispatchProviderCommand(
+            {
+              type: "thread.message.assistant.delta",
+              commandId: yield* providerCommandId(
+                event,
+                "assistant-delta",
+                attribution,
+                assistantMessageId,
+              ),
+              threadId: thread.id,
+              messageId: assistantMessageId,
+              delta: assistantDelta,
+              ...(turnId ? { turnId } : {}),
+              createdAt: now,
+            },
+            attribution,
+          );
         }
       }
 
@@ -1516,6 +1697,7 @@ const make = Effect.gen(function* () {
           assistantDeliveryMode === "buffered"
             ? yield* flushBufferedAssistantMessagesForTurn({
                 event,
+                attribution,
                 threadId: thread.id,
                 turnId: pauseForUserTurnId,
                 createdAt: now,
@@ -1527,6 +1709,7 @@ const make = Effect.gen(function* () {
             : new Set<MessageId>();
         yield* finalizeActiveAssistantSegmentForTurn({
           event,
+          attribution,
           threadId: thread.id,
           turnId: pauseForUserTurnId,
           createdAt: now,
@@ -1600,6 +1783,7 @@ const make = Effect.gen(function* () {
 
           yield* finalizeAssistantMessage({
             event,
+            attribution,
             threadId: thread.id,
             messageId: assistantMessageId,
             ...(turnId ? { turnId } : {}),
@@ -1626,6 +1810,7 @@ const make = Effect.gen(function* () {
         const detailedThread = yield* getLoadedThreadDetail();
         yield* finalizeBufferedProposedPlan({
           event,
+          attribution,
           threadId: thread.id,
           threadProposedPlans: detailedThread?.proposedPlans ?? [],
           planId: proposedPlanCompletion.planId,
@@ -1647,6 +1832,7 @@ const make = Effect.gen(function* () {
             (assistantMessageId) =>
               finalizeAssistantMessage({
                 event,
+                attribution,
                 threadId: thread.id,
                 messageId: assistantMessageId,
                 turnId,
@@ -1662,6 +1848,7 @@ const make = Effect.gen(function* () {
 
           yield* finalizeBufferedProposedPlan({
             event,
+            attribution,
             threadId: thread.id,
             threadProposedPlans: proposedPlans,
             planId: proposedPlanIdForTurn(thread.id, turnId),
@@ -1683,34 +1870,99 @@ const make = Effect.gen(function* () {
           : activeTurnId === null || eventTurnId === undefined || sameId(activeTurnId, eventTurnId);
 
         if (shouldApplyRuntimeError) {
-          yield* orchestrationEngine.dispatch({
-            type: "thread.session.set",
-            commandId: yield* providerCommandId(event, "runtime-error-session-set"),
-            threadId: thread.id,
-            session: {
+          yield* dispatchProviderCommand(
+            {
+              type: "thread.session.set",
+              commandId: yield* providerCommandId(event, "runtime-error-session-set", attribution),
               threadId: thread.id,
-              status: "error",
-              providerName: event.provider,
-              ...(event.providerInstanceId !== undefined
-                ? { providerInstanceId: event.providerInstanceId }
-                : {}),
-              runtimeMode: thread.session?.runtimeMode ?? "full-access",
-              activeTurnId: eventTurnId ?? null,
-              lastError: runtimeErrorMessage,
-              updatedAt: now,
+              session: {
+                threadId: thread.id,
+                status: "error",
+                providerName: event.provider,
+                ...(event.providerInstanceId !== undefined
+                  ? { providerInstanceId: event.providerInstanceId }
+                  : {}),
+                runtimeMode: thread.session?.runtimeMode ?? "full-access",
+                activeTurnId: eventTurnId ?? null,
+                lastError: runtimeErrorMessage,
+                updatedAt: now,
+              },
+              createdAt: now,
             },
-            createdAt: now,
-          });
+            attribution,
+          );
         }
       }
 
       if (event.type === "thread.metadata.updated" && event.payload.name) {
-        yield* orchestrationEngine.dispatch({
-          type: "thread.meta.update",
-          commandId: yield* providerCommandId(event, "thread-meta-update"),
-          threadId: thread.id,
-          title: event.payload.name,
-        });
+        yield* dispatchProviderCommand(
+          {
+            type: "thread.meta.update",
+            commandId: yield* providerCommandId(event, "thread-meta-update", attribution),
+            threadId: thread.id,
+            title: event.payload.name,
+          },
+          attribution,
+        );
+      }
+
+      const authoritativeOmpSelection = (() => {
+        if (event.provider !== "omp") return undefined;
+        if (event.type === "turn.started" && shouldApplyThreadLifecycle && event.payload.model) {
+          return { model: event.payload.model, effort: event.payload.effort };
+        }
+        if (event.type === "model.rerouted") {
+          return { model: event.payload.toModel, effort: event.payload.effort };
+        }
+        return undefined;
+      })();
+
+      if (authoritativeOmpSelection) {
+        const effortOptionIds = new Set(["reasoningEffort", "effort", "thinking"]);
+        const existingOptions = thread.modelSelection.options ?? [];
+        const existingEffortOptions = existingOptions.filter((option) =>
+          effortOptionIds.has(option.id),
+        );
+        const effortIsCurrent =
+          authoritativeOmpSelection.effort === undefined ||
+          (existingEffortOptions.length === 1 &&
+            existingEffortOptions[0]?.id === "reasoningEffort" &&
+            existingEffortOptions[0]?.value === authoritativeOmpSelection.effort);
+        const instanceId =
+          event.providerInstanceId ??
+          thread.session?.providerInstanceId ??
+          thread.modelSelection.instanceId;
+        const selectionChanged =
+          thread.modelSelection.instanceId !== instanceId ||
+          thread.modelSelection.model !== authoritativeOmpSelection.model ||
+          !effortIsCurrent;
+
+        if (selectionChanged) {
+          const options =
+            authoritativeOmpSelection.effort === undefined
+              ? thread.modelSelection.options
+              : [
+                  ...existingOptions.filter((option) => !effortOptionIds.has(option.id)),
+                  { id: "reasoningEffort", value: authoritativeOmpSelection.effort },
+                ];
+          yield* dispatchProviderCommand(
+            {
+              type: "thread.meta.update",
+              commandId: yield* providerCommandId(
+                event,
+                "runtime-model-selection-update",
+                attribution,
+              ),
+              threadId: thread.id,
+              modelSelection: {
+                instanceId,
+                model: authoritativeOmpSelection.model,
+                ...(options !== undefined ? { options } : {}),
+              },
+            },
+            attribution,
+          );
+        }
       }
 
       if (event.type === "turn.diff.updated") {
@@ -1733,19 +1985,26 @@ const make = Effect.gen(function* () {
             const assistantMessageId = MessageId.make(
               `assistant:${event.itemId ?? event.turnId ?? event.eventId}`,
             );
-            yield* orchestrationEngine.dispatch({
-              type: "thread.turn.diff.complete",
-              commandId: yield* providerCommandId(event, "thread-turn-diff-complete"),
-              threadId: thread.id,
-              turnId,
-              completedAt: now,
-              checkpointRef: CheckpointRef.make(`provider-diff:${event.eventId}`),
-              status: "missing",
-              files: [],
-              assistantMessageId,
-              checkpointTurnCount: maxCheckpointTurnCount(checkpointContext.checkpoints) + 1,
-              createdAt: now,
-            });
+            yield* dispatchProviderCommand(
+              {
+                type: "thread.turn.diff.complete",
+                commandId: yield* providerCommandId(
+                  event,
+                  "thread-turn-diff-complete",
+                  attribution,
+                ),
+                threadId: thread.id,
+                turnId,
+                completedAt: now,
+                checkpointRef: CheckpointRef.make(`provider-diff:${event.eventId}`),
+                status: "missing",
+                files: [],
+                assistantMessageId,
+                checkpointTurnCount: maxCheckpointTurnCount(checkpointContext.checkpoints) + 1,
+                createdAt: now,
+              },
+              attribution,
+            );
           }
         }
       }
@@ -1765,17 +2024,20 @@ const make = Effect.gen(function* () {
         }
       }
 
-      const activities = runtimeEventToActivities(event, taskTitle);
-      yield* Effect.forEach(activities, (activity) =>
-        providerCommandId(event, "thread-activity-append").pipe(
+      const activities = runtimeEventToActivities(event, taskTitle, sourceSequence);
+      yield* Effect.forEach(activities.entries(), ([activityIndex, activity]) =>
+        providerCommandId(event, "thread-activity-append", attribution, activityIndex).pipe(
           Effect.flatMap((commandId) =>
-            orchestrationEngine.dispatch({
-              type: "thread.activity.append",
-              commandId,
-              threadId: thread.id,
-              activity,
-              createdAt: activity.createdAt,
-            }),
+            dispatchProviderCommand(
+              {
+                type: "thread.activity.append",
+                commandId,
+                threadId: thread.id,
+                activity,
+                createdAt: activity.createdAt,
+              },
+              attribution,
+            ),
           ),
         ),
       ).pipe(Effect.asVoid);
@@ -1783,8 +2045,34 @@ const make = Effect.gen(function* () {
 
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
 
+  const completedCanonicalEnvelopes = new Set<string>();
+  const processCanonicalEnvelope = (envelope: ProviderRuntimeEventEnvelope) => {
+    const envelopeKey = `${envelope.environmentId}:${envelope.threadId}:${envelope.eventId}`;
+    if (completedCanonicalEnvelopes.has(envelopeKey)) {
+      return Effect.void;
+    }
+    return Effect.sync(() => validateCanonicalEnvelope(envelope)).pipe(
+      Effect.andThen(
+        processRuntimeEvent(
+          envelope.event,
+          envelope.sourceSequence,
+          canonicalEventAttribution(envelope),
+        ),
+      ),
+      Effect.tap(() => Effect.sync(() => completedCanonicalEnvelopes.add(envelopeKey))),
+    );
+  };
+
   const processInput = (input: RuntimeIngestionInput) =>
-    input.source === "runtime" ? processRuntimeEvent(input.event) : processDomainEvent(input.event);
+    input.source === "canonical-delivery"
+      ? processCanonicalEnvelope(input.delivery.envelope).pipe(
+          Effect.andThen(input.delivery.acknowledge),
+        )
+      : input.source === "canonical-runtime"
+        ? processCanonicalEnvelope(input.envelope)
+        : input.source === "legacy-runtime"
+          ? processRuntimeEvent(input.event)
+          : processDomainEvent(input.event);
 
   const processInputSafely = (input: RuntimeIngestionInput) =>
     processInput(input).pipe(
@@ -1792,12 +2080,30 @@ const make = Effect.gen(function* () {
         if (Cause.hasInterruptsOnly(cause)) {
           return Effect.failCause(cause);
         }
-        return Effect.logWarning("provider runtime ingestion failed to process event", {
+        const envelope =
+          input.source === "canonical-delivery"
+            ? input.delivery.envelope
+            : input.source === "canonical-runtime"
+              ? input.envelope
+              : undefined;
+        const event =
+          input.source === "canonical-delivery"
+            ? input.delivery.envelope.event
+            : input.source === "canonical-runtime"
+              ? input.envelope.event
+              : input.event;
+        const logFailure = Effect.logWarning("provider runtime ingestion failed to process event", {
           source: input.source,
-          eventId: input.event.eventId,
-          eventType: input.event.type,
+          eventId: envelope?.eventId ?? event.eventId,
+          eventType: event.type,
           cause: Cause.pretty(cause),
         });
+        return input.source === "canonical-delivery"
+          ? logFailure.pipe(
+              Effect.andThen(Effect.sleep("100 millis")),
+              Effect.andThen(input.delivery.retry(Cause.squash(cause))),
+            )
+          : logFailure;
       }),
     );
 
@@ -1805,11 +2111,27 @@ const make = Effect.gen(function* () {
 
   const start: ProviderRuntimeIngestionShape["start"] = () =>
     Effect.gen(function* () {
-      yield* forkParked(
-        Stream.runForEach(providerService.streamEvents, (event) =>
-          worker.enqueue({ source: "runtime", event }),
-        ),
-      );
+      const canonicalDeliveries = providerService.streamCanonicalDeliveries;
+      const canonicalEvents = providerService.streamCanonicalEvents;
+      if (canonicalDeliveries) {
+        yield* forkParked(
+          Stream.runForEach(canonicalDeliveries, (delivery) =>
+            worker.enqueue({ source: "canonical-delivery", delivery }),
+          ),
+        );
+      } else if (canonicalEvents) {
+        yield* forkParked(
+          Stream.runForEach(canonicalEvents, (envelope) =>
+            worker.enqueue({ source: "canonical-runtime", envelope }),
+          ),
+        );
+      } else {
+        yield* forkParked(
+          Stream.runForEach(providerService.streamEvents, (event) =>
+            worker.enqueue({ source: "legacy-runtime", event }),
+          ),
+        );
+      }
       yield* forkParked(
         Stream.runForEach(orchestrationEngine.streamDomainEvents, (event) => {
           if (event.type !== "thread.turn-start-requested") {
@@ -1823,6 +2145,7 @@ const make = Effect.gen(function* () {
   return {
     start,
     drain: worker.drain,
+    ingestCanonical: processCanonicalEnvelope,
   } satisfies ProviderRuntimeIngestionShape;
 });
 

@@ -1,12 +1,15 @@
 import {
   type RuntimeEventRawSource,
   RuntimeItemId,
+  RuntimeTaskId,
   type CanonicalRequestType,
   type EventId,
   type ProviderApprovalDecision,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
+  type RuntimeContentStreamKind,
   type RuntimeRequestId,
+  type ThreadTokenUsageSnapshot,
   type ThreadId,
   type ToolLifecycleItemType,
   type TurnId,
@@ -191,12 +194,174 @@ export function makeAcpToolCallEvent(input: {
   };
 }
 
+interface AcpSubagentSnapshot {
+  readonly taskId: string;
+  readonly description?: string;
+  readonly status: "pending" | "running" | "completed" | "failed" | "aborted";
+  readonly summary?: string;
+  readonly usage?: unknown;
+  readonly lastToolName?: string;
+  readonly model?: string;
+  readonly effort?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function trimmedString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function subagentModelMetadata(value: unknown): {
+  readonly model?: string;
+  readonly effort?: string;
+} {
+  const resolvedModel = trimmedString(value);
+  if (!resolvedModel) return {};
+  const separator = resolvedModel.lastIndexOf(":");
+  if (separator <= resolvedModel.indexOf("/")) {
+    return { model: resolvedModel };
+  }
+  const model = resolvedModel.slice(0, separator).trim();
+  const effort = resolvedModel.slice(separator + 1).trim();
+  return {
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+  };
+}
+
+function subagentSnapshotsFromUnknown(value: unknown): ReadonlyArray<AcpSubagentSnapshot> {
+  if (!isRecord(value)) return [];
+  const details = isRecord(value.details) ? value.details : value;
+  const progress = Array.isArray(details.progress) ? details.progress : [];
+  const results = Array.isArray(details.results) ? details.results : [];
+  const snapshots = [...progress, ...results].flatMap((entry): Array<AcpSubagentSnapshot> => {
+    if (!isRecord(entry)) return [];
+    const taskId = trimmedString(entry.id);
+    if (!taskId) return [];
+    const rawStatus = trimmedString(entry.status);
+    const status =
+      rawStatus === "pending" ||
+      rawStatus === "running" ||
+      rawStatus === "completed" ||
+      rawStatus === "failed" ||
+      rawStatus === "aborted"
+        ? rawStatus
+        : typeof entry.exitCode === "number"
+          ? entry.exitCode === 0
+            ? "completed"
+            : "failed"
+          : undefined;
+    if (!status) return [];
+    const metadata = subagentModelMetadata(entry.resolvedModel);
+    const explicitEffort = trimmedString(entry.effort) ?? trimmedString(entry.thinkingLevel);
+    const description =
+      trimmedString(entry.description) ??
+      trimmedString(entry.assignment) ??
+      trimmedString(entry.task);
+    const recentOutput = Array.isArray(entry.recentOutput)
+      ? entry.recentOutput
+          .filter((part): part is string => typeof part === "string")
+          .join("\n")
+          .trim()
+      : undefined;
+    const summary = trimmedString(entry.output) ?? recentOutput;
+    const lastToolName = trimmedString(entry.currentTool);
+    return [
+      {
+        taskId,
+        status,
+        ...(description ? { description } : {}),
+        ...(summary ? { summary } : {}),
+        ...(entry.usage !== undefined ? { usage: entry.usage } : {}),
+        ...(lastToolName ? { lastToolName } : {}),
+        ...metadata,
+        ...(explicitEffort ? { effort: explicitEffort } : {}),
+      },
+    ];
+  });
+  return Array.from(new Map(snapshots.map((snapshot) => [snapshot.taskId, snapshot])).values());
+}
+
+/** Extract OMP task/subagent snapshots carried in standard ACP tool-call raw output. */
+export function extractAcpSubagentSnapshots(
+  toolCall: AcpToolCallState,
+): ReadonlyArray<AcpSubagentSnapshot> {
+  return subagentSnapshotsFromUnknown(toolCall.data.rawOutput);
+}
+
+export function makeAcpSubagentTaskEvent(input: {
+  readonly stamp: AcpEventStamp;
+  readonly provider: ProviderDriverKind;
+  readonly threadId: ThreadId;
+  readonly turnId: TurnId | undefined;
+  readonly snapshot: AcpSubagentSnapshot;
+  readonly lifecycle: "started" | "progress" | "completed";
+  readonly rawPayload: unknown;
+}): ProviderRuntimeEvent {
+  const common = {
+    ...input.stamp,
+    provider: input.provider,
+    threadId: input.threadId,
+    turnId: input.turnId,
+    raw: {
+      source: "acp.jsonrpc" as const,
+      method: "session/update",
+      payload: input.rawPayload,
+    },
+  };
+  const taskId = RuntimeTaskId.make(input.snapshot.taskId);
+  if (input.lifecycle === "started") {
+    return {
+      type: "task.started",
+      ...common,
+      payload: {
+        taskId,
+        taskType: "subagent",
+        ...(input.snapshot.description ? { description: input.snapshot.description } : {}),
+        ...(input.snapshot.model ? { model: input.snapshot.model } : {}),
+        ...(input.snapshot.effort ? { effort: input.snapshot.effort } : {}),
+      },
+    };
+  }
+  if (input.lifecycle === "progress") {
+    return {
+      type: "task.progress",
+      ...common,
+      payload: {
+        taskId,
+        description: input.snapshot.description ?? "Subagent working",
+        ...(input.snapshot.summary ? { summary: input.snapshot.summary } : {}),
+        ...(input.snapshot.usage !== undefined ? { usage: input.snapshot.usage } : {}),
+        ...(input.snapshot.lastToolName ? { lastToolName: input.snapshot.lastToolName } : {}),
+      },
+    };
+  }
+  return {
+    type: "task.completed",
+    ...common,
+    payload: {
+      taskId,
+      status:
+        input.snapshot.status === "completed"
+          ? "completed"
+          : input.snapshot.status === "aborted"
+            ? "stopped"
+            : "failed",
+      ...(input.snapshot.summary ? { summary: input.snapshot.summary } : {}),
+      ...(input.snapshot.usage !== undefined ? { usage: input.snapshot.usage } : {}),
+    },
+  };
+}
+
 export function makeAcpAssistantItemEvent(input: {
   readonly stamp: AcpEventStamp;
   readonly provider: ProviderDriverKind;
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly itemId: string;
+  readonly itemType?: "assistant_message" | "reasoning";
   readonly lifecycle: "item.started" | "item.completed";
 }): ProviderRuntimeEvent {
   return {
@@ -207,8 +372,31 @@ export function makeAcpAssistantItemEvent(input: {
     turnId: input.turnId,
     itemId: RuntimeItemId.make(input.itemId),
     payload: {
-      itemType: "assistant_message",
+      itemType: input.itemType ?? "assistant_message",
       status: input.lifecycle === "item.completed" ? "completed" : "inProgress",
+    },
+  };
+}
+
+export function makeAcpThreadMetadataUpdatedEvent(input: {
+  readonly stamp: AcpEventStamp;
+  readonly provider: ProviderDriverKind;
+  readonly threadId: ThreadId;
+  readonly turnId: TurnId | undefined;
+  readonly title: string;
+  readonly rawPayload: unknown;
+}): ProviderRuntimeEvent {
+  return {
+    type: "thread.metadata.updated",
+    ...input.stamp,
+    provider: input.provider,
+    threadId: input.threadId,
+    turnId: input.turnId,
+    payload: { name: input.title },
+    raw: {
+      source: "acp.jsonrpc",
+      method: "session/update",
+      payload: input.rawPayload,
     },
   };
 }
@@ -219,6 +407,7 @@ export function makeAcpContentDeltaEvent(input: {
   readonly threadId: ThreadId;
   readonly turnId: TurnId | undefined;
   readonly itemId?: string;
+  readonly streamKind?: Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
   readonly text: string;
   readonly rawPayload: unknown;
 }): ProviderRuntimeEvent {
@@ -230,8 +419,33 @@ export function makeAcpContentDeltaEvent(input: {
     turnId: input.turnId,
     ...(input.itemId ? { itemId: RuntimeItemId.make(input.itemId) } : {}),
     payload: {
-      streamKind: "assistant_text",
+      streamKind: input.streamKind ?? "assistant_text",
       delta: input.text,
+    },
+    raw: {
+      source: "acp.jsonrpc",
+      method: "session/update",
+      payload: input.rawPayload,
+    },
+  };
+}
+
+export function makeAcpTokenUsageUpdatedEvent(input: {
+  readonly stamp: AcpEventStamp;
+  readonly provider: ProviderDriverKind;
+  readonly threadId: ThreadId;
+  readonly turnId: TurnId | undefined;
+  readonly usage: ThreadTokenUsageSnapshot;
+  readonly rawPayload: unknown;
+}): ProviderRuntimeEvent {
+  return {
+    type: "thread.token-usage.updated",
+    ...input.stamp,
+    provider: input.provider,
+    threadId: input.threadId,
+    turnId: input.turnId,
+    payload: {
+      usage: input.usage,
     },
     raw: {
       source: "acp.jsonrpc",

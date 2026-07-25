@@ -31,6 +31,12 @@ export const PROVIDER_OPTIONS: Array<{
   /** Shown on the model picker sidebar when relevant */
   pickerSidebarBadge?: "new" | "soon";
 }> = [
+  {
+    value: ProviderDriverKind.make("omp"),
+    label: "OMP",
+    available: true,
+    pickerSidebarBadge: "new",
+  },
   { value: ProviderDriverKind.make("codex"), label: "Codex", available: true },
   { value: ProviderDriverKind.make("claudeAgent"), label: "Claude", available: true },
   {
@@ -78,6 +84,12 @@ export interface WorkLogEntry {
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   /** Originating orchestration activity kind (e.g. `user-input.requested`) for row chrome. */
   sourceActivityKind?: OrchestrationThreadActivity["kind"];
+  taskId?: string;
+  taskType?: string;
+  subagentTask?: string;
+  subagentModel?: string;
+  subagentEffort?: string;
+  subagentStatus?: "running" | "completed" | "failed" | "stopped";
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -251,6 +263,11 @@ export function workEntryIndicatesToolSuccess(entry: WorkLogEntry): boolean {
 /** Tool-like row with neither clear success nor failure (empty, incomplete, in progress, etc.). */
 export function workEntryIndicatesToolNeutralStatus(entry: WorkLogEntry): boolean {
   if (!workLogEntryIsToolLike(entry)) {
+    return false;
+  }
+  // Thinking is streamed content, not an incomplete tool lifecycle. It stays
+  // visible during the turn and is hidden by the completed-turn fold later.
+  if (entry.tone === "thinking") {
     return false;
   }
   if (workEntryIndicatesToolFailure(entry)) {
@@ -628,14 +645,36 @@ export function deriveWorkLogEntries(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
 ): WorkLogEntry[] {
   const ordered = [...activities].toSorted(compareActivitiesByOrder);
+  const taskMetadataById = new Map<
+    string,
+    { taskType?: string; task?: string; model?: string; effort?: string }
+  >();
+  for (const activity of ordered) {
+    if (activity.kind !== "task.started") continue;
+    const payload = asRecord(activity.payload);
+    const taskId = asTrimmedString(payload?.taskId);
+    if (!taskId) continue;
+    taskMetadataById.set(taskId, {
+      ...(asTrimmedString(payload?.taskType)
+        ? { taskType: asTrimmedString(payload?.taskType)! }
+        : {}),
+      ...(asTrimmedString(payload?.detail) ? { task: asTrimmedString(payload?.detail)! } : {}),
+      ...(asTrimmedString(payload?.model) ? { model: asTrimmedString(payload?.model)! } : {}),
+      ...(asTrimmedString(payload?.effort) ? { effort: asTrimmedString(payload?.effort)! } : {}),
+    });
+  }
   const entries: DerivedWorkLogEntry[] = [];
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
-    if (activity.kind === "task.started") continue;
+    if (activity.kind === "task.started") {
+      const payload = asRecord(activity.payload);
+      const taskType = asTrimmedString(payload?.taskType);
+      if (!taskType || !isSubagentTaskType(taskType)) continue;
+    }
     if (activity.kind === "context-window.updated") continue;
     if (activity.summary === "Checkpoint captured") continue;
     if (isPlanBoundaryToolActivity(activity)) continue;
-    entries.push(toDerivedWorkLogEntry(activity));
+    entries.push(toDerivedWorkLogEntry(activity, taskMetadataById));
   }
   return collapseDerivedWorkLogEntries(entries).map((entry) => {
     const { activityKind, collapseKey: _collapseKey, ...rest } = entry;
@@ -674,7 +713,17 @@ function extractWorkLogToolLifecycleStatus(
   return undefined;
 }
 
-function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWorkLogEntry {
+function isSubagentTaskType(taskType: string): boolean {
+  return /(^|[-_\s])(sub)?agent($|[-_\s])/i.test(taskType);
+}
+
+function toDerivedWorkLogEntry(
+  activity: OrchestrationThreadActivity,
+  taskMetadataById: ReadonlyMap<
+    string,
+    { taskType?: string; task?: string; model?: string; effort?: string }
+  >,
+): DerivedWorkLogEntry {
   const payload =
     activity.payload && typeof activity.payload === "object"
       ? (activity.payload as Record<string, unknown>)
@@ -682,7 +731,12 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   const commandPreview = extractToolCommand(payload);
   const changedFiles = extractChangedFiles(payload);
   const title = extractToolTitle(payload);
-  const isTaskActivity = activity.kind === "task.progress" || activity.kind === "task.completed";
+  const isTaskActivity =
+    activity.kind === "task.started" ||
+    activity.kind === "task.progress" ||
+    activity.kind === "task.completed";
+  const taskId = isTaskActivity ? asTrimmedString(payload?.taskId) : null;
+  const taskMetadata = taskId ? taskMetadataById.get(taskId) : undefined;
   const taskSummary =
     isTaskActivity && typeof payload?.summary === "string" && payload.summary.length > 0
       ? payload.summary
@@ -695,14 +749,19 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       ? payload.detail
       : null;
   const taskLabel = taskSummary || taskDetailAsLabel;
-  const detail = isTaskActivity
-    ? !taskDetailAsLabel &&
-      payload &&
-      typeof payload.detail === "string" &&
-      payload.detail.length > 0
-      ? stripTrailingExitCode(payload.detail).output
+  const isReasoningActivity = activity.kind === "reasoning.delta";
+  const detail = isReasoningActivity
+    ? typeof payload?.detail === "string"
+      ? payload.detail
       : null
-    : extractToolDetail(payload, title ?? activity.summary);
+    : isTaskActivity
+      ? !taskDetailAsLabel &&
+        payload &&
+        typeof payload.detail === "string" &&
+        payload.detail.length > 0
+        ? stripTrailingExitCode(payload.detail).output
+        : null
+      : extractToolDetail(payload, title ?? activity.summary);
   const toolCallId = isTaskActivity ? null : extractToolCallId(payload);
   const entry: DerivedWorkLogEntry = {
     id: activity.id,
@@ -710,13 +769,39 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
     turnId: activity.turnId,
     label: taskLabel || activity.summary,
     tone:
-      activity.kind === "task.progress"
+      activity.kind === "task.started" || activity.kind === "task.progress" || isReasoningActivity
         ? "thinking"
         : activity.tone === "approval"
           ? "info"
           : activity.tone,
     activityKind: activity.kind,
   };
+  if (taskId) {
+    entry.taskId = taskId;
+    entry.collapseKey = `task:${taskId}`;
+  }
+  const taskType = asTrimmedString(payload?.taskType) ?? taskMetadata?.taskType;
+  if (taskType && isSubagentTaskType(taskType)) {
+    entry.taskType = taskType;
+    entry.subagentTask = taskMetadata?.task ?? taskLabel ?? activity.summary;
+    if (taskMetadata?.model) entry.subagentModel = taskMetadata.model;
+    if (taskMetadata?.effort) entry.subagentEffort = taskMetadata.effort;
+    entry.subagentStatus =
+      activity.kind === "task.completed"
+        ? payload?.status === "failed"
+          ? "failed"
+          : payload?.status === "stopped"
+            ? "stopped"
+            : "completed"
+        : "running";
+  }
+  if (isReasoningActivity) {
+    const reasoningItemId =
+      typeof payload?.reasoningItemId === "string" ? payload.reasoningItemId : activity.turnId;
+    if (reasoningItemId) {
+      entry.collapseKey = `reasoning:${reasoningItemId}`;
+    }
+  }
   const itemType = extractWorkLogItemType(payload);
   const requestKind = extractWorkLogRequestKind(payload);
   if (detail) {
@@ -782,6 +867,22 @@ function shouldCollapseToolLifecycleEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
+  if (previous.activityKind === "reasoning.delta" || next.activityKind === "reasoning.delta") {
+    return (
+      previous.activityKind === "reasoning.delta" &&
+      next.activityKind === "reasoning.delta" &&
+      previous.collapseKey !== undefined &&
+      previous.collapseKey === next.collapseKey
+    );
+  }
+  if (previous.activityKind.startsWith("task.") || next.activityKind.startsWith("task.")) {
+    return (
+      previous.activityKind.startsWith("task.") &&
+      next.activityKind.startsWith("task.") &&
+      previous.collapseKey !== undefined &&
+      previous.collapseKey === next.collapseKey
+    );
+  }
   if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
     return false;
   }
@@ -807,6 +908,12 @@ function mergeDerivedWorkLogEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): DerivedWorkLogEntry {
+  if (previous.activityKind === "reasoning.delta" && next.activityKind === "reasoning.delta") {
+    return {
+      ...previous,
+      detail: `${previous.detail ?? ""}${next.detail ?? ""}`,
+    };
+  }
   const changedFiles = mergeChangedFiles(previous.changedFiles, next.changedFiles);
   const detail = next.detail ?? previous.detail;
   const command = next.command ?? previous.command;

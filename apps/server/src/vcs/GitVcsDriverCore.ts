@@ -25,7 +25,11 @@ import {
   type ReviewDiffPreviewSource,
   type VcsRef,
 } from "@t3tools/contracts";
-import { dedupeRemoteBranchesWithLocalMatches, normalizeGitRemoteUrl } from "@t3tools/shared/git";
+import {
+  dedupeRemoteBranchesWithLocalMatches,
+  isTemporaryWorktreeBranch,
+  normalizeGitRemoteUrl,
+} from "@t3tools/shared/git";
 import { compactTraceAttributes } from "@t3tools/shared/observability";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
@@ -38,6 +42,9 @@ import {
 import { ServerConfig } from "../config.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+export const WORKTREE_CREATE_TIMEOUT_MS = Duration.toMillis(Duration.minutes(10));
+const GIT_FORCE_KILL_AFTER = Duration.seconds(5);
+const WORKTREE_RECONCILE_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
 const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
 const PREPARED_COMMIT_PATCH_MAX_OUTPUT_BYTES = 49_000;
@@ -730,6 +737,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           .spawn(
             ChildProcess.make("git", commandInput.args, {
               cwd: commandInput.cwd,
+              forceKillAfter: GIT_FORCE_KILL_AFTER,
               env: {
                 ...process.env,
                 ...input.env,
@@ -819,7 +827,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
               Effect.fail(
                 new GitCommandError({
                   ...gitCommandContext(commandInput),
-                  detail: "Git command timed out.",
+                  detail: `Git command timed out after ${timeoutMs}ms and was stopped.`,
                 }),
               ),
             onSome: Effect.succeed,
@@ -2586,22 +2594,183 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     const args = input.newRefName
       ? ["worktree", "add", "-b", input.newRefName, worktreePath, input.refName]
       : ["worktree", "add", worktreePath, input.refName];
+    const targetPathExistedBefore = yield* fileSystem
+      .exists(worktreePath)
+      .pipe(Effect.orElseSucceed(() => true));
+    const newBranchExistedBefore = input.newRefName
+      ? yield* executeGit(
+          "GitVcsDriver.createWorktree.preflightBranch",
+          input.cwd,
+          ["show-ref", "--verify", "--quiet", `refs/heads/${input.newRefName}`],
+          { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+        ).pipe(Effect.map((result) => result.exitCode === 0))
+      : true;
+
+    const reconcileCompletedWorktree = Effect.fn("GitVcsDriver.createWorktree.reconcile")(
+      function* () {
+        const [worktreeList, expectedHead, actualHead, status] = yield* Effect.all(
+          [
+            executeGit(
+              "GitVcsDriver.createWorktree.reconcile.list",
+              input.cwd,
+              ["worktree", "list", "--porcelain"],
+              { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+            ),
+            executeGit(
+              "GitVcsDriver.createWorktree.reconcile.expectedHead",
+              input.cwd,
+              ["rev-parse", `${targetBranch}^{commit}`],
+              { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+            ),
+            executeGit(
+              "GitVcsDriver.createWorktree.reconcile.actualHead",
+              worktreePath,
+              ["rev-parse", "HEAD"],
+              { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+            ),
+            executeGit(
+              "GitVcsDriver.createWorktree.reconcile.status",
+              worktreePath,
+              ["status", "--porcelain=v1", "--untracked-files=no"],
+              { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+        if (
+          worktreeList.exitCode !== 0 ||
+          expectedHead.exitCode !== 0 ||
+          actualHead.exitCode !== 0 ||
+          status.exitCode !== 0 ||
+          expectedHead.stdout.trim() !== actualHead.stdout.trim() ||
+          status.stdout.trim().length > 0
+        ) {
+          return false;
+        }
+
+        const registeredPaths = worktreeList.stdout
+          .split("\n")
+          .filter((line) => line.startsWith("worktree "))
+          .map((line) => line.slice("worktree ".length));
+        const expectedPath = yield* fileSystem
+          .realPath(worktreePath)
+          .pipe(Effect.orElseSucceed(() => worktreePath));
+        for (const registeredPath of registeredPaths) {
+          const canonicalPath = yield* fileSystem
+            .realPath(registeredPath)
+            .pipe(Effect.orElseSucceed(() => registeredPath));
+          if (canonicalPath === expectedPath) {
+            return true;
+          }
+        }
+        return false;
+      },
+    );
+
+    const cleanupIncompleteWorktree = Effect.fn("GitVcsDriver.createWorktree.cleanupIncomplete")(
+      function* () {
+        if (targetPathExistedBefore) {
+          return false;
+        }
+        yield* executeGit(
+          "GitVcsDriver.createWorktree.cleanupWorktree",
+          input.cwd,
+          ["worktree", "remove", "--force", worktreePath],
+          { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+        ).pipe(Effect.ignore);
+        yield* fileSystem
+          .remove(worktreePath, { recursive: true, force: true })
+          .pipe(Effect.ignore);
+        if (input.newRefName && !newBranchExistedBefore) {
+          yield* executeGit(
+            "GitVcsDriver.createWorktree.cleanupBranch",
+            input.cwd,
+            ["branch", "-D", "--", input.newRefName],
+            { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+          ).pipe(Effect.ignore);
+        }
+
+        const [pathStillExists, branchStillExists] = yield* Effect.all(
+          [
+            fileSystem.exists(worktreePath).pipe(Effect.orElseSucceed(() => true)),
+            input.newRefName && !newBranchExistedBefore
+              ? executeGit(
+                  "GitVcsDriver.createWorktree.verifyCleanupBranch",
+                  input.cwd,
+                  ["show-ref", "--verify", "--quiet", `refs/heads/${input.newRefName}`],
+                  { timeoutMs: WORKTREE_RECONCILE_TIMEOUT_MS, allowNonZeroExit: true },
+                ).pipe(
+                  Effect.map((result) => result.exitCode === 0),
+                  Effect.orElseSucceed(() => true),
+                )
+              : Effect.succeed(false),
+          ],
+          { concurrency: "unbounded" },
+        );
+        return !pathStillExists && !branchStillExists;
+      },
+    );
 
     yield* executeGit("GitVcsDriver.createWorktree", input.cwd, args, {
       fallbackErrorDetail: "git worktree add failed",
-    });
+      timeoutMs: WORKTREE_CREATE_TIMEOUT_MS,
+    }).pipe(
+      Effect.onInterrupt(() => cleanupIncompleteWorktree().pipe(Effect.asVoid)),
+      Effect.catchIf(
+        (error) => error.detail.includes("timed out"),
+        (timeoutError) =>
+          reconcileCompletedWorktree().pipe(
+            Effect.orElseSucceed(() => false),
+            Effect.flatMap((completed) => {
+              if (completed) {
+                return Effect.void;
+              }
+              return cleanupIncompleteWorktree().pipe(
+                Effect.flatMap((cleanupComplete) =>
+                  Effect.fail(
+                    new GitCommandError({
+                      ...gitCommandContext({
+                        operation: "GitVcsDriver.createWorktree",
+                        cwd: input.cwd,
+                        args,
+                      }),
+                      detail: `Git worktree materialization timed out after ${WORKTREE_CREATE_TIMEOUT_MS}ms; the process was stopped, the target could not be verified as complete, and exact-target cleanup ${cleanupComplete ? "completed" : "could not be verified"}.`,
+                      cause: timeoutError,
+                    }),
+                  ),
+                ),
+              );
+            }),
+          ),
+      ),
+    );
 
     if (input.newRefName && input.baseRefName) {
       const remoteNames = yield* listRemoteNames(input.cwd).pipe(Effect.orElseSucceed(() => []));
-      const parsedBaseRef = parseRemoteRefWithRemoteNames(
+      const parsedStartingRef = parseRemoteRefWithRemoteNames(
         input.baseRefName,
         remoteNames.toSorted((left, right) => right.length - left.length),
       );
-      const baseBranch = parsedBaseRef?.branchName ?? input.baseRefName;
+      const startingBranch = parsedStartingRef?.branchName ?? input.baseRefName;
+      // A session worktree can start from a feature branch that already has a PR.
+      // Review the whole PR range rather than only changes made after the session
+      // started. When GitHub merge-base metadata is unavailable, the existing
+      // default-branch resolver provides the established main/master fallback.
+      const resolvedReviewBase = isTemporaryWorktreeBranch(input.newRefName)
+        ? yield* resolveBaseBranchForNoUpstream(input.cwd, startingBranch).pipe(
+            Effect.orElseSucceed(() => null),
+          )
+        : null;
+      const reviewBaseRef = resolvedReviewBase ?? input.baseRefName;
+      const parsedReviewBaseRef = parseRemoteRefWithRemoteNames(
+        reviewBaseRef,
+        remoteNames.toSorted((left, right) => right.length - left.length),
+      );
+      const reviewBaseBranch = parsedReviewBaseRef?.branchName ?? reviewBaseRef;
       yield* runGit("GitVcsDriver.createWorktree.configureBaseRef", input.cwd, [
         "config",
         `branch.${input.newRefName}.gh-merge-base`,
-        baseBranch,
+        reviewBaseBranch,
       ]);
     }
 

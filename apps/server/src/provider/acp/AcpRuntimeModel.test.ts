@@ -311,6 +311,7 @@ describe("AcpRuntimeModel", () => {
       sessionId: "session-1",
       update: {
         sessionUpdate: "agent_message_chunk",
+        messageId: " message-1 ",
         content: {
           type: "text",
           text: "hello from acp",
@@ -321,15 +322,138 @@ describe("AcpRuntimeModel", () => {
     expect(contentResult.events).toEqual([
       {
         _tag: "ContentDelta",
+        itemId: "message-1",
+        streamKind: "assistant_text",
         text: "hello from acp",
         rawPayload: {
           sessionId: "session-1",
           update: {
             sessionUpdate: "agent_message_chunk",
+            messageId: " message-1 ",
             content: {
               type: "text",
               text: "hello from acp",
             },
+          },
+        },
+      },
+    ]);
+  });
+
+  it("projects ACP thought chunks as reasoning while preserving message identity", () => {
+    const result = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "agent_thought_chunk",
+        messageId: "thought-1",
+        content: {
+          type: "text",
+          text: "checking the repository",
+        },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(result.events).toEqual([
+      {
+        _tag: "ContentDelta",
+        itemId: "thought-1",
+        streamKind: "reasoning_text",
+        text: "checking the repository",
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            messageId: "thought-1",
+            content: {
+              type: "text",
+              text: "checking the repository",
+            },
+          },
+        },
+      },
+    ]);
+  });
+
+  it("projects valid ACP usage updates and ignores invalid token windows", () => {
+    const result = parseSessionUpdateEvent({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "usage_update",
+        used: 31_251,
+        size: 200_000,
+        cost: { amount: 0.42, currency: "USD" },
+      },
+    } satisfies EffectAcpSchema.SessionNotification);
+
+    expect(result.events).toEqual([
+      {
+        _tag: "TokenUsageUpdated",
+        usage: {
+          usedTokens: 31_251,
+          maxTokens: 200_000,
+        },
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "usage_update",
+            used: 31_251,
+            size: 200_000,
+            cost: { amount: 0.42, currency: "USD" },
+          },
+        },
+      },
+    ]);
+
+    expect(
+      parseSessionUpdateEvent({
+        sessionId: "session-1",
+        update: {
+          sessionUpdate: "usage_update",
+          used: 1,
+          size: 0,
+        },
+      } satisfies EffectAcpSchema.SessionNotification).events,
+    ).toEqual([]);
+  });
+
+  it("projects asynchronous config and session metadata updates", () => {
+    const configOptions = [
+      {
+        id: "thinking",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: "high",
+        options: [{ value: "high", name: "High" }],
+      },
+    ] as const;
+    expect(
+      parseSessionUpdateEvent({
+        sessionId: "session-1",
+        update: { sessionUpdate: "config_option_update", configOptions },
+      } satisfies EffectAcpSchema.SessionNotification).events,
+    ).toEqual([{ _tag: "ConfigOptionsUpdated", configOptions }]);
+
+    expect(
+      parseSessionUpdateEvent({
+        sessionId: "session-1",
+        update: {
+          sessionUpdate: "session_info_update",
+          title: "  Inspect ACP state  ",
+          updatedAt: "2026-07-24T19:00:00.000Z",
+        },
+      } satisfies EffectAcpSchema.SessionNotification).events,
+    ).toEqual([
+      {
+        _tag: "SessionInfoUpdated",
+        title: "Inspect ACP state",
+        updatedAt: "2026-07-24T19:00:00.000Z",
+        rawPayload: {
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "session_info_update",
+            title: "  Inspect ACP state  ",
+            updatedAt: "2026-07-24T19:00:00.000Z",
           },
         },
       },

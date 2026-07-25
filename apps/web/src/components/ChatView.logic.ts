@@ -507,6 +507,16 @@ export function createLocalDispatchSnapshot(
   };
 }
 
+export function updateLocalDispatchPreparation(
+  current: LocalDispatchSnapshot,
+  preparingWorktree: boolean,
+): LocalDispatchSnapshot {
+  if (!preparingWorktree || current.preparingWorktree) {
+    return current;
+  }
+  return { ...current, preparingWorktree: true };
+}
+
 export function hasServerAcknowledgedLocalDispatch(input: {
   localDispatch: LocalDispatchSnapshot | null;
   phase: SessionPhase;

@@ -398,10 +398,35 @@ export function buildRootGroups(input: {
   return groups;
 }
 
+export function buildAshlerRootGroups(input: {
+  newSessionItem: CommandPaletteSubmenuItem;
+  accountItems: ReadonlyArray<CommandPaletteActionItem>;
+  planUsageItems: ReadonlyArray<CommandPaletteActionItem>;
+}): CommandPaletteGroup[] {
+  return [
+    { value: "sessions", label: "Sessions", items: [input.newSessionItem] },
+    ...(input.accountItems.length > 0
+      ? [{ value: "omp-accounts", label: "Accounts", items: input.accountItems }]
+      : []),
+    {
+      value: "omp-plan-usage",
+      label: "Plan usage",
+      items: input.planUsageItems,
+    },
+  ];
+}
+
+export function shouldRefreshOmpOverviewOnOpen(input: {
+  readonly cacheHydrated: boolean;
+  readonly hasEnvironment: boolean;
+}): boolean {
+  return input.cacheHydrated && input.hasEnvironment;
+}
+
 export function getCommandPaletteInputPlaceholder(mode: CommandPaletteMode): string {
   switch (mode) {
     case "root":
-      return "Search commands, projects, and threads...";
+      return "Search commands...";
     case "root-browse":
       return "Enter project path (e.g. ~/projects/my-app)";
     case "submenu":

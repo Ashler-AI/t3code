@@ -41,7 +41,66 @@ function summarizePayload(payload: unknown): Readonly<Record<string, unknown>> {
   }
 }
 
+const MAX_RPC_ERROR_TEXT_LENGTH = 1_024;
+
+function redactRpcErrorText(value: string): string {
+  return value
+    .replace(/\bAuthorization\s*:\s*Bearer\s+[^\s,;\])}]+/gi, "Authorization: Bearer <redacted>")
+    .replace(/\bBearer\s+(?!<redacted>)[A-Za-z0-9._~+/-]+=*/gi, "Bearer <redacted>")
+    .replace(/\b(access[_-]?token|api[_-]?key|token)\b(\s*[:=]\s*)[^\s,;]+/gi, "$1$2<redacted>")
+    .slice(0, MAX_RPC_ERROR_TEXT_LENGTH);
+}
+
+const STANDARD_JSON_RPC_ERROR_MESSAGES = new Map<number, string>([
+  [-32700, "Parse error"],
+  [-32600, "Invalid Request"],
+  [-32601, "Method not found"],
+  [-32602, "Invalid params"],
+  [-32603, "Internal error"],
+]);
+
+function structuralRpcErrorMessage(code: number | undefined, value: unknown): string | undefined {
+  if (code === undefined || typeof value !== "string") return undefined;
+  const expected = STANDARD_JSON_RPC_ERROR_MESSAGES.get(code);
+  return value === expected ? expected : undefined;
+}
+
+function rpcErrorDiagnostic(cause: Cause.Cause<unknown>) {
+  for (const reason of cause.reasons) {
+    if (reason._tag !== "Fail") continue;
+    const error = reason.error;
+    if (
+      typeof error !== "object" ||
+      error === null ||
+      !("_tag" in error) ||
+      error._tag !== "AcpRequestError"
+    ) {
+      continue;
+    }
+    const code = "code" in error && typeof error.code === "number" ? error.code : undefined;
+    const message = structuralRpcErrorMessage(
+      code,
+      "errorMessage" in error ? error.errorMessage : undefined,
+    );
+    const data =
+      "data" in error && typeof error.data === "object" && error.data !== null
+        ? error.data
+        : undefined;
+    const details =
+      data && "details" in data && typeof data.details === "string"
+        ? redactRpcErrorText(data.details)
+        : undefined;
+    return {
+      ...(code !== undefined ? { code } : {}),
+      ...(message !== undefined ? { message } : {}),
+      ...(details !== undefined ? { details } : {}),
+    };
+  }
+  return undefined;
+}
+
 function formatRequestLogPayload(event: AcpSessionRuntime.AcpSessionRequestLogEvent) {
+  const rpcError = event.cause === undefined ? undefined : rpcErrorDiagnostic(event.cause);
   return {
     method: structuralMethod(event.method),
     status: event.status,
@@ -51,6 +110,7 @@ function formatRequestLogPayload(event: AcpSessionRuntime.AcpSessionRequestLogEv
       ? {
           errorTag: causeErrorTag(event.cause),
           reasonCount: event.cause.reasons.length,
+          ...(rpcError === undefined ? {} : { rpcError }),
         }
       : {}),
   };

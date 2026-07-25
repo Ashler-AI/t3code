@@ -21,6 +21,12 @@ const emitAskQuestion = process.env.T3_ACP_EMIT_ASK_QUESTION === "1";
 const emitXAiAskUserQuestion = process.env.T3_ACP_EMIT_XAI_ASK_USER_QUESTION === "1";
 const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLETE_THEN_HANG === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
+const emitOmpSessionUpdates = process.env.T3_ACP_EMIT_OMP_SESSION_UPDATES === "1";
+const ompRuntimeModel = process.env.T3_ACP_OMP_RUNTIME_MODEL;
+const ompRuntimeThinking = process.env.T3_ACP_OMP_RUNTIME_THINKING;
+const useOmpConfigOptions = process.env.T3_ACP_OMP_CONFIG_OPTIONS === "1";
+const useOmpAdvisorPolicyOptions = process.env.T3_ACP_OMP_ADVISOR_POLICY_OPTIONS === "1";
+const emitAvailableCommands = process.env.T3_ACP_EMIT_AVAILABLE_COMMANDS === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
@@ -40,6 +46,7 @@ const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
+const ompSteerState = process.env.T3_ACP_OMP_STEER_STATE;
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
@@ -51,6 +58,7 @@ let currentModeId = "ask";
 let currentModelId = "default";
 let parameterizedModelPicker = false;
 let currentReasoning = "medium";
+let currentAdvisorId = "off";
 let currentContext = "272k";
 let currentFast = false;
 let promptCount = 0;
@@ -94,6 +102,70 @@ process.once("exit", (code) => {
 });
 
 function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
+  if (useOmpAdvisorPolicyOptions) {
+    return [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: currentModelId,
+        options: [
+          { value: "openai/gpt-5.6-terra", name: "Terra" },
+          { value: "anthropic/claude-sonnet-5", name: "Sonnet 5" },
+        ],
+      },
+      {
+        id: "thinking",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: currentReasoning,
+        options: [{ value: "high", name: "High" }],
+      },
+      {
+        id: "advisor",
+        name: "Advisor",
+        category: "model",
+        type: "select",
+        currentValue: currentAdvisorId,
+        options: [
+          { value: "off", name: "Off" },
+          { value: "openai/gpt-5.6-terra:high", name: "Terra · High" },
+          { value: "anthropic/claude-sonnet-5:high", name: "Sonnet 5 · High" },
+        ],
+      },
+    ];
+  }
+  if (useOmpConfigOptions) {
+    return [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: currentModelId,
+        options: [
+          { value: "default", name: "Auto" },
+          { value: "openai/gpt-5.6", name: "GPT-5.6" },
+          { value: "anthropic/claude-sonnet-5", name: "Claude Sonnet 5" },
+        ],
+      },
+      {
+        id: "thinking",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: currentReasoning,
+        options: [
+          { value: "off", name: "Off" },
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+        ],
+      },
+    ];
+  }
   if (parameterizedModelPicker) {
     const baseOptions: Array<AcpSchema.SessionConfigOption> = [
       {
@@ -310,11 +382,25 @@ const program = Effect.gen(function* () {
   yield* agent.handleAuthenticate(() => Effect.succeed({}));
 
   yield* agent.handleCreateSession(() =>
-    Effect.succeed({
-      sessionId,
-      modes: modeState(),
-      models: modelState(),
-      configOptions: configOptions(),
+    Effect.gen(function* () {
+      if (emitAvailableCommands) {
+        yield* agent.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "available_commands_update",
+            availableCommands: [
+              { name: "skill:review", description: "Review the current changes." },
+              { name: "handoff", description: "Hand work to another environment." },
+            ],
+          },
+        });
+      }
+      return {
+        sessionId,
+        modes: modeState(),
+        models: modelState(),
+        configOptions: configOptions(),
+      };
     }),
   );
 
@@ -420,6 +506,12 @@ const program = Effect.gen(function* () {
       }
       if (request.configId === "reasoning" && typeof request.value === "string") {
         currentReasoning = request.value;
+      }
+      if (request.configId === "thinking" && typeof request.value === "string") {
+        currentReasoning = request.value;
+      }
+      if (request.configId === "advisor" && typeof request.value === "string") {
+        currentAdvisorId = request.value;
       }
       if (request.configId === "context" && typeof request.value === "string") {
         currentContext = request.value;
@@ -846,6 +938,48 @@ const program = Effect.gen(function* () {
         return { stopReason: "end_turn" };
       }
 
+      if (emitOmpSessionUpdates) {
+        if (ompRuntimeModel) currentModelId = ompRuntimeModel;
+        if (ompRuntimeThinking) currentReasoning = ompRuntimeThinking;
+        const messageId = "omp-message-1";
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            messageId,
+            content: { type: "text", text: "checking the workspace" },
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            messageId,
+            content: { type: "text", text: "done" },
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: configOptions(),
+          },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: { sessionUpdate: "usage_update", used: 1200, size: 200_000 },
+        });
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "session_info_update",
+            title: "OMP workspace check",
+            updatedAt: "2026-07-24T19:00:00.000Z",
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+
       yield* agent.client.sessionUpdate({
         sessionId: requestedSessionId,
         update: {
@@ -878,6 +1012,24 @@ const program = Effect.gen(function* () {
   );
 
   yield* agent.handleUnknownExtRequest((method, params) => {
+    if (method === "_omp/session/steer" && ompSteerState) {
+      const validParams =
+        typeof params === "object" &&
+        params !== null &&
+        "sessionId" in params &&
+        typeof params.sessionId === "string" &&
+        "text" in params &&
+        typeof params.text === "string";
+      if (!validParams) {
+        return Effect.fail(AcpError.AcpRequestError.invalidParams("Invalid OMP steer params"));
+      }
+      return Effect.succeed(
+        ompSteerState === "streaming"
+          ? { accepted: true, state: "streaming" }
+          : { accepted: false, state: "idle" },
+      );
+    }
+
     if (method === "cursor/list_available_models") {
       return Effect.succeed({
         models: availableModels(),

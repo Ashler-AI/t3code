@@ -10,10 +10,16 @@ import * as Stream from "effect/Stream";
 import * as Etag from "effect/unstable/http/Etag";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
+import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
+import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as HttpApiScalar from "effect/unstable/httpapi/HttpApiScalar";
 
 import { RelayApi } from "@t3tools/contracts/relay";
+import {
+  SessionFabricContextRequest,
+  SessionFabricSearchRequest,
+} from "@t3tools/contracts/session-fabric";
 
 import {
   clientApi,
@@ -57,6 +63,8 @@ import * as EnvironmentPublishSignatures from "./environments/EnvironmentPublish
 import * as ManagedEndpointProvider from "./environments/ManagedEndpointProvider.ts";
 import * as ManagedTunnelLimits from "./environments/ManagedTunnelLimits.ts";
 import * as MobileRegistrations from "./agentActivity/MobileRegistrations.ts";
+import SessionDirectory from "./sessionFabric/SessionDirectory.ts";
+import SessionStreamCoordinator from "./sessionFabric/SessionStreamCoordinator.ts";
 
 const webcryptoLayer = Layer.succeed(
   Crypto.Crypto,
@@ -117,6 +125,8 @@ export const ApiLive = Api.make(
     const managedEndpointZone = yield* ManagedEndpointZone;
     const randomApnsDeliveryJobSigningSecret = yield* ApnsDeliveryJobSigningSecret;
     const observability = yield* RelayObservability;
+    const sessionStreams = yield* SessionStreamCoordinator;
+    const sessionDirectory = yield* SessionDirectory;
 
     //
     // 2. Create bindings
@@ -233,6 +243,89 @@ export const ApiLive = Api.make(
       Layer.provide(runtimeLayer),
     );
 
+    // Session IDs are opaque and sessions are public in the initial fabric
+    // rollout. Authentication can be added at this Worker boundary without
+    // changing the per-session Durable Object protocol.
+    const sessionFabricRoute = HttpRouter.add(
+      "GET",
+      "/v1/session-fabric/sessions/*",
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const url = new URL(request.url);
+        const match = url.pathname.match(
+          /^\/v1\/session-fabric\/sessions\/([^/]+)\/(?:connect|snapshot|events|context)$/,
+        );
+        const encodedSessionId = match?.[1];
+        if (encodedSessionId === undefined) {
+          return HttpServerResponse.empty({ status: 404 });
+        }
+        let sessionId: string;
+        try {
+          sessionId = decodeURIComponent(encodedSessionId);
+        } catch {
+          return HttpServerResponse.text("Invalid session id", { status: 400 });
+        }
+        return yield* sessionStreams.getByName(sessionId).fetch(request);
+      }),
+    );
+
+    const sessionFabricDirectoryRoute = HttpRouter.add(
+      "GET",
+      "/v1/session-fabric/sessions",
+      Effect.gen(function* () {
+        const sessions = yield* sessionDirectory.getByName("public-session-directory").list();
+        return HttpServerResponse.jsonUnsafe(
+          { sessions },
+          { headers: { "cache-control": "no-store" } },
+        );
+      }),
+    );
+
+    const sessionFabricSearchRoute = HttpRouter.add(
+      "POST",
+      "/v1/session-fabric/search",
+      Effect.gen(function* () {
+        const decoded = yield* Effect.result(
+          HttpServerRequest.schemaBodyJson(SessionFabricSearchRequest),
+        );
+        if (decoded._tag === "Failure") {
+          return HttpServerResponse.text("Invalid session search request", { status: 400 });
+        }
+        const response = yield* sessionDirectory
+          .getByName("public-session-directory")
+          .search(decoded.success);
+        return HttpServerResponse.jsonUnsafe(response, {
+          headers: { "cache-control": "no-store" },
+        });
+      }),
+    );
+
+    const sessionFabricContextRoute = HttpRouter.add(
+      "POST",
+      "/v1/session-fabric/context",
+      Effect.gen(function* () {
+        const decoded = yield* Effect.result(
+          HttpServerRequest.schemaBodyJson(SessionFabricContextRequest),
+        );
+        if (decoded._tag === "Failure") {
+          return HttpServerResponse.text("Invalid session context request", { status: 400 });
+        }
+        const input = decoded.success;
+        return yield* sessionStreams
+          .getByName(input.sessionId)
+          .getContext(input.includeCodeDiff, input.includeContinuation)
+          .pipe(
+            Effect.map((context) =>
+              context === null
+                ? HttpServerResponse.empty({ status: 404 })
+                : HttpServerResponse.jsonUnsafe(context, {
+                    headers: { "cache-control": "no-store" },
+                  }),
+            ),
+          );
+      }),
+    );
+
     yield* Cloudflare.Queues.consumeQueueMessages<unknown>(
       apnsDeliveryQueue,
       {
@@ -281,6 +374,10 @@ export const ApiLive = Api.make(
         ),
         HttpApiScalar.layer(RelayApi, { path: "/docs" }),
         relayDocsRedirectRoute,
+        sessionFabricRoute,
+        sessionFabricDirectoryRoute,
+        sessionFabricSearchRoute,
+        sessionFabricContextRoute,
       ).pipe(Layer.provide([Etag.layerWeak, httpPlatformNotSupportedLayer, relayCors])),
       relayNotFoundRoute,
     ).pipe(

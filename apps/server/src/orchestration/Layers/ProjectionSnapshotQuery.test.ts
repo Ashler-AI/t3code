@@ -1,5 +1,6 @@
 import {
   CheckpointRef,
+  CommandId,
   EventId,
   MessageId,
   ProjectId,
@@ -11,19 +12,24 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
-import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import {
+  PendingTurnStartRecoveryQuery,
+  ProjectionSnapshotQuery,
+} from "../Services/ProjectionSnapshotQuery.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
 const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(value);
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 const projectionSnapshotLayer = it.layer(
   OrchestrationProjectionSnapshotQueryLive.pipe(
@@ -34,6 +40,112 @@ const projectionSnapshotLayer = it.layer(
 );
 
 projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
+  it.effect("returns the exact original event for a persisted pending turn start", () =>
+    Effect.gen(function* () {
+      const recoveryQuery = yield* PendingTurnStartRecoveryQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const commandId = CommandId.make("cmd-pending-turn-start");
+      const eventId = asEventId("evt-pending-turn-start");
+      const threadId = ThreadId.make("thread-pending-turn-start");
+      const messageId = asMessageId("message-pending-turn-start");
+      const occurredAt = "2026-04-06T00:00:00.000Z";
+
+      yield* sql`DELETE FROM orchestration_events`;
+      yield* sql`DELETE FROM projection_turns`;
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id,
+          aggregate_kind,
+          stream_id,
+          stream_version,
+          event_type,
+          occurred_at,
+          command_id,
+          causation_event_id,
+          correlation_id,
+          actor_kind,
+          payload_json,
+          metadata_json
+        )
+        VALUES (
+          ${eventId},
+          ${"thread"},
+          ${threadId},
+          ${0},
+          ${"thread.turn-start-requested"},
+          ${occurredAt},
+          ${commandId},
+          ${null},
+          ${commandId},
+          ${"client"},
+          ${encodeUnknownJson({
+            threadId,
+            messageId,
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            createdAt: occurredAt,
+          })},
+          ${encodeUnknownJson({ adapterKey: "codex" })}
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          pending_message_id,
+          assistant_message_id,
+          state,
+          requested_at,
+          started_at,
+          completed_at,
+          checkpoint_turn_count,
+          checkpoint_ref,
+          checkpoint_status,
+          checkpoint_files_json
+        )
+        VALUES (
+          ${threadId},
+          ${null},
+          ${messageId},
+          ${null},
+          ${"pending"},
+          ${occurredAt},
+          ${null},
+          ${null},
+          ${null},
+          ${null},
+          ${null},
+          ${"[]"}
+        )
+      `;
+
+      const events = yield* recoveryQuery.listPendingTurnStartEvents();
+
+      assert.equal(events.length, 1);
+      const [event] = events;
+      assert.isDefined(event);
+      assert.deepStrictEqual(event, {
+        sequence: event.sequence,
+        eventId,
+        type: "thread.turn-start-requested",
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt,
+        commandId,
+        causationEventId: null,
+        correlationId: commandId,
+        payload: {
+          threadId,
+          messageId,
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt: occurredAt,
+        },
+        metadata: { adapterKey: "codex" },
+      });
+    }),
+  );
+
   it.effect("hydrates read model from projection tables and computes snapshot sequence", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;

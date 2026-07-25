@@ -8,6 +8,7 @@
  */
 import type {
   CheckpointRef,
+  OrchestrationEvent,
   OrchestrationCheckpointSummary,
   OrchestrationProject,
   OrchestrationProjectShell,
@@ -26,6 +27,27 @@ import type * as Option from "effect/Option";
 import type * as Effect from "effect/Effect";
 
 import type { ProjectionRepositoryError } from "../../persistence/Errors.ts";
+
+export type PendingTurnStartEvent = Extract<
+  OrchestrationEvent,
+  { type: "thread.turn-start-requested" }
+>;
+
+export interface PendingTurnStartRecoveryQueryShape {
+  /**
+   * Returns the original committed events for turn starts that have not yet
+   * reached a concrete provider turn or terminal session state.
+   */
+  readonly listPendingTurnStartEvents: () => Effect.Effect<
+    ReadonlyArray<PendingTurnStartEvent>,
+    ProjectionRepositoryError
+  >;
+}
+
+export class PendingTurnStartRecoveryQuery extends Context.Service<
+  PendingTurnStartRecoveryQuery,
+  PendingTurnStartRecoveryQueryShape
+>()("t3/orchestration/Services/ProjectionSnapshotQuery/PendingTurnStartRecoveryQuery") {}
 
 export interface ProjectionSnapshotCounts {
   readonly projectCount: number;

@@ -1,7 +1,7 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, OmpAccountRef, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { shouldShowOpenInPicker } from "./ChatHeader";
+import { getOmpAccountAssignmentPresentation, shouldShowOpenInPicker } from "./ChatHeader";
 
 describe("shouldShowOpenInPicker", () => {
   const primaryEnvironmentId = EnvironmentId.make("environment-primary");
@@ -44,5 +44,65 @@ describe("shouldShowOpenInPicker", () => {
         primaryEnvironmentId,
       }),
     ).toBe(false);
+  });
+});
+
+describe("OMP account assignment presentation", () => {
+  it("shows only the masked account identity with a friendly balancing reason", () => {
+    expect(
+      getOmpAccountAssignmentPresentation({
+        threadId: ThreadId.make("thread-visible"),
+        automatic: true,
+        reassignmentReason: "load-balanced",
+        account: {
+          accountRef: OmpAccountRef.make("opaque-account-ref"),
+          provider: "anthropic-claude",
+          authKind: "oauth",
+          displayName: "Claude Max",
+          maskedEmail: "cz***en@ashler.ai",
+          organization: "Ashler",
+          state: "available",
+          managed: false,
+        },
+      }),
+    ).toEqual({
+      label: "Claude · cz***en@ashler.ai",
+      detail: "Automatically assigned to balance usage across accounts.",
+    });
+  });
+
+  it("explains automatic quota failover without exposing raw provider details", () => {
+    const presentation = getOmpAccountAssignmentPresentation({
+      threadId: ThreadId.make("thread-visible"),
+      automatic: true,
+      reassignmentReason: "quota-exhausted",
+      account: {
+        accountRef: OmpAccountRef.make("opaque-account-ref"),
+        provider: "openai-codex",
+        authKind: "managed",
+        displayName: "Team ChatGPT",
+        maskedEmail: "zh***er@gmail.com",
+        state: "available",
+        managed: true,
+      },
+    });
+
+    expect(presentation).toEqual({
+      label: "ChatGPT · zh***er@gmail.com",
+      detail: "Automatically reassigned because another account exhausted its quota.",
+    });
+    expect(JSON.stringify(presentation)).not.toContain("thread-visible");
+    expect(JSON.stringify(presentation)).not.toContain("opaque-account-ref");
+  });
+
+  it("hides unassigned sessions", () => {
+    expect(
+      getOmpAccountAssignmentPresentation({
+        threadId: ThreadId.make("thread-visible"),
+        automatic: true,
+        account: null,
+      }),
+    ).toBeNull();
+    expect(getOmpAccountAssignmentPresentation(null)).toBeNull();
   });
 });

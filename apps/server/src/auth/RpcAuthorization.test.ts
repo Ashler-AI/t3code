@@ -30,6 +30,25 @@ describe("RPC authorization scopes", () => {
     );
   });
 
+  it("separates OMP account reads from account and Scaffold lifecycle operations", () => {
+    for (const method of [
+      WS_METHODS.ompAccountsGetSnapshot,
+      WS_METHODS.ompAccountsGetAssignment,
+      WS_METHODS.ompAccountsRefresh,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+    for (const method of [
+      WS_METHODS.ompAccountsBeginLogin,
+      WS_METHODS.ompAccountsRespondLogin,
+      WS_METHODS.ompAccountsCancelLogin,
+      WS_METHODS.ompAccountsRemove,
+      WS_METHODS.scaffoldPause,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+  });
+
   it("allows relay status reads without granting relay installation access", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.cloudGetRelayClientStatus)).toBe(
       AuthRelayReadScope,

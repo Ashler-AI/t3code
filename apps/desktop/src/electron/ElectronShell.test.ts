@@ -36,6 +36,20 @@ describe("ElectronShell", () => {
     }).pipe(Effect.provide(ElectronShell.layer)),
   );
 
+  it.effect("opens OMP provider OAuth authorization URLs in the system browser", () =>
+    Effect.gen(function* () {
+      openExternalMock.mockResolvedValue(undefined);
+
+      const electronShell = yield* ElectronShell.ElectronShell;
+      const authorizationUrl =
+        "https://auth.openai.com/oauth/authorize?client_id=omp&redirect_uri=http%3A%2F%2Flocalhost%2Fcallback";
+      const result = yield* electronShell.openExternal(authorizationUrl);
+
+      assert.equal(result, true);
+      assert.deepEqual(openExternalMock.mock.calls, [[authorizationUrl]]);
+    }).pipe(Effect.provide(ElectronShell.layer)),
+  );
+
   it.effect("does not open unsafe external URLs", () =>
     Effect.gen(function* () {
       const electronShell = yield* ElectronShell.ElectronShell;

@@ -11,6 +11,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import {
@@ -21,6 +22,7 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
+import { UiSessionSource } from "../session-source/index.ts";
 import {
   archiveThread,
   createProject,
@@ -73,6 +75,44 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  it.effect("dispatches through an injected UI session source", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor([]);
+      yield* SubscriptionRef.set(supervisor.session, Option.none());
+      const source = UiSessionSource.of({
+        authoritativeShellSnapshot: () => Effect.succeed(Option.none()),
+        authoritativeThreadSnapshot: () => Effect.succeed(Option.none()),
+        subscribeShell: () => Stream.never,
+        subscribeThread: () => Stream.never,
+        dispatch: (command) =>
+          Effect.sync(() => {
+            dispatched.push(command);
+            return { sequence: 42 };
+          }),
+        listThreads: () => Effect.succeed(Option.none()),
+        listSessions: () => Effect.succeed(Option.none()),
+      });
+
+      const result = yield* archiveThread({
+        commandId: CommandId.make("injected-command"),
+        threadId: ThreadId.make("thread-1"),
+      }).pipe(
+        Effect.provideService(UiSessionSource, source),
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+      );
+
+      expect(result).toEqual({ sequence: 42 });
+      expect(dispatched).toEqual([
+        {
+          type: "thread.archive",
+          commandId: "injected-command",
+          threadId: "thread-1",
+        },
+      ]);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
   it.effect("adds generated command metadata", () =>
     Effect.gen(function* () {
       const dispatched: ClientOrchestrationCommand[] = [];

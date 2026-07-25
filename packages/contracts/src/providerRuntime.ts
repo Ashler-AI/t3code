@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
+  EnvironmentId,
   EventId,
   IsoDateTime,
   NonNegativeInt,
@@ -8,6 +9,7 @@ import {
   PositiveInt,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeSessionId,
   RuntimeTaskId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -257,6 +259,8 @@ const ProviderRuntimeEventBase = Schema.Struct({
   turnId: Schema.optional(TurnId),
   itemId: Schema.optional(RuntimeItemId),
   requestId: Schema.optional(RuntimeRequestId),
+  /** Provider-owned durable replay boundary accepted with this event. */
+  resumeCursor: Schema.optional(Schema.Unknown),
   providerRefs: Schema.optional(ProviderRefs),
   raw: Schema.optional(RuntimeEventRaw),
 });
@@ -463,6 +467,8 @@ const TaskStartedPayload = Schema.Struct({
   taskId: RuntimeTaskId,
   description: Schema.optional(TrimmedNonEmptyStringSchema),
   taskType: Schema.optional(TrimmedNonEmptyStringSchema),
+  model: Schema.optional(TrimmedNonEmptyStringSchema),
+  effort: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type TaskStartedPayload = typeof TaskStartedPayload.Type;
 
@@ -555,6 +561,7 @@ const ModelReroutedPayload = Schema.Struct({
   fromModel: TrimmedNonEmptyStringSchema,
   toModel: TrimmedNonEmptyStringSchema,
   reason: TrimmedNonEmptyStringSchema,
+  effort: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type ModelReroutedPayload = typeof ModelReroutedPayload.Type;
 
@@ -1018,6 +1025,45 @@ export type ProviderRuntimeEventV2 = typeof ProviderRuntimeEventV2.Type;
 
 export const ProviderRuntimeEvent = ProviderRuntimeEventV2;
 export type ProviderRuntimeEvent = ProviderRuntimeEventV2;
+
+/**
+ * Provider-owned replay state carried at the canonical ingestion boundary.
+ * OMP's cursor is modeled explicitly because it supplies stable normalized
+ * event ordering and runtime-session identity. Other adapters remain opaque
+ * until they expose an equivalent durable cursor contract.
+ */
+export const ProviderRuntimeResumeCursor = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("omp"),
+    schemaVersion: Schema.Literal(3),
+    sessionId: RuntimeSessionId,
+    eventSequence: NonNegativeInt,
+    acpSequence: NonNegativeInt,
+    activeTurnId: Schema.optional(TurnId),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("opaque"),
+    value: Schema.Unknown,
+  }),
+]);
+export type ProviderRuntimeResumeCursor = typeof ProviderRuntimeResumeCursor.Type;
+
+/**
+ * Additive server-owned envelope used by orchestration ingestion. Provider
+ * adapters continue emitting ProviderRuntimeEvent directly.
+ */
+export const ProviderRuntimeEventEnvelope = Schema.Struct({
+  protocolVersion: Schema.Literal(1),
+  eventId: EventId,
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  sourceSequence: NonNegativeInt,
+  resumeCursor: Schema.NullOr(ProviderRuntimeResumeCursor),
+  providerInstanceId: ProviderInstanceId,
+  runtimeSessionId: Schema.optional(RuntimeSessionId),
+  event: ProviderRuntimeEvent,
+});
+export type ProviderRuntimeEventEnvelope = typeof ProviderRuntimeEventEnvelope.Type;
 
 // Compatibility aliases for call sites still importing legacy names.
 const ProviderRuntimeMessageDeltaEvent = ProviderRuntimeContentDeltaEvent;

@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, SessionFabricClientId, SessionFabricSessionId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
 import * as TokenStore from "../authorization/tokenStore.ts";
@@ -9,11 +9,15 @@ import {
   RelayConnectionRegistration,
   SshConnectionProfile,
   SshConnectionRegistration,
+  ScaffoldConnectionRegistration,
+  SessionFabricConnectionRegistration,
 } from "../connection/catalog.ts";
 import {
   BearerConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
+  ScaffoldConnectionTarget,
+  SessionFabricConnectionTarget,
 } from "../connection/model.ts";
 import {
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
@@ -52,6 +56,24 @@ const REMOTE_TOKEN = new TokenStore.RemoteDpopAccessToken({
 });
 
 describe("ConnectionCatalogDocument", () => {
+  it("persists a session fabric target without browser-owned transcript state", () => {
+    const target = new SessionFabricConnectionTarget({
+      environmentId: ENVIRONMENT_ID,
+      label: "Shared session",
+      relayBaseUrl: "https://relay.example.test",
+      sessionId: SessionFabricSessionId.make("session-fabric-1"),
+      clientId: SessionFabricClientId.make("client-1"),
+    });
+    const document = registerConnectionInCatalog(
+      EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      new SessionFabricConnectionRegistration({ target }),
+    );
+
+    expect(document.targets).toEqual([target]);
+    expect(document.profiles).toEqual([]);
+    expect(document.credentials).toEqual([]);
+  });
+
   it("registers a bearer connection as one catalog mutation", () => {
     const document = registerConnectionInCatalog(
       EMPTY_CONNECTION_CATALOG_DOCUMENT,
@@ -142,5 +164,24 @@ describe("ConnectionCatalogDocument", () => {
     expect(document.targets).toEqual([target]);
     expect(document.profiles).toEqual([profile]);
     expect(document.credentials).toEqual([]);
+  });
+
+  it("persists a Scaffold binding without transport authority", () => {
+    const target = new ScaffoldConnectionTarget({
+      environmentId: ENVIRONMENT_ID,
+      label: "Scaffold sandbox",
+      deployment: "staging",
+      sessionId: "session-1",
+      lifecycleEpoch: 7,
+    });
+    const document = registerConnectionInCatalog(
+      EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      new ScaffoldConnectionRegistration({ target }),
+    );
+
+    expect(document.targets).toEqual([target]);
+    expect(document.profiles).toEqual([]);
+    expect(document.credentials).toEqual([]);
+    expect(JSON.stringify(document)).not.toContain("bootstrap");
   });
 });

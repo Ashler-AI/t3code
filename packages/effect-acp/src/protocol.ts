@@ -374,6 +374,7 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const routeDecodedMessage = (
     message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
   ): Effect.Effect<void, AcpError.AcpError> => {
+    message = normalizeStandardJsonRpcError(message);
     switch (message._tag) {
       case "Request":
         return handleRequestEncoded(message);
@@ -571,4 +572,36 @@ function isProtocolError(
     "message" in value &&
     typeof value.message === "string"
   );
+}
+
+/**
+ * Effect's JSON-RPC serializer reserves `error._tag = "Cause"` for typed
+ * failures. ACP agents use standard JSON-RPC errors instead, so the serializer
+ * initially represents those as defects. Recover the declared ACP error channel
+ * before RpcClient decodes the defect and drops `code` / `data`.
+ */
+function normalizeStandardJsonRpcError(
+  message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
+): RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded {
+  if (message._tag !== "Exit" || message.exit._tag !== "Failure") return message;
+
+  let changed = false;
+  const cause = message.exit.cause.map((reason) => {
+    if (reason._tag !== "Die" || !isProtocolError(reason.defect)) return reason;
+    changed = true;
+    return {
+      _tag: "Fail" as const,
+      error: reason.defect,
+    };
+  });
+
+  return changed
+    ? {
+        ...message,
+        exit: {
+          _tag: "Failure",
+          cause,
+        },
+      }
+    : message;
 }

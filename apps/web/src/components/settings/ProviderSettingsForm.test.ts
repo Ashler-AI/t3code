@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { ProviderDriverKind } from "@t3tools/contracts";
 
 import { DRIVER_OPTION_BY_VALUE } from "./providerDriverMeta";
+import { PROVIDER_CLIENT_DEFINITIONS } from "./providerDriverMeta";
 import {
   deriveProviderSettingsFields,
   nextProviderConfigWithFieldValue,
@@ -10,6 +11,17 @@ import {
 } from "./ProviderSettingsForm";
 
 describe("ProviderSettingsForm helpers", () => {
+  it("presents OMP as the default provider with its managed agent-directory setting", () => {
+    expect(PROVIDER_CLIENT_DEFINITIONS[0]?.value).toBe(ProviderDriverKind.make("omp"));
+    const omp = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("omp")];
+
+    expect(omp).toBeDefined();
+    expect(deriveProviderSettingsFields(omp!).map((field) => field.key)).toEqual([
+      "binaryPath",
+      "agentDir",
+    ]);
+  });
+
   it("derives visible provider config fields from the client definition schema", () => {
     const codex = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("codex")];
 

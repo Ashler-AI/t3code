@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { serializeComposerFileLink, serializeComposerMentionPath } from "./composerTrigger.ts";
+import {
+  serializeComposerFileLink,
+  serializeComposerMentionPath,
+  serializeComposerSessionReference,
+  serializeComposerSkillReference,
+} from "./composerTrigger.ts";
 
 describe("serializeComposerMentionPath", () => {
   it("keeps simple mention paths unquoted", () => {
@@ -39,5 +44,21 @@ describe("serializeComposerFileLink", () => {
     expect(serializeComposerFileLink("@scope/package.json")).toBe(
       "[package.json](@scope/package.json)",
     );
+  });
+});
+
+describe("typed composer references", () => {
+  it("serializes provider-qualified skill references", () => {
+    expect(serializeComposerSkillReference("omp", "code-review")).toBe("@[skill|omp|code-review]");
+  });
+
+  it("serializes session identity and worktree metadata", () => {
+    expect(
+      serializeComposerSessionReference({
+        environmentId: "local:primary",
+        threadId: "thread 1",
+        worktreePath: "/tmp/work tree",
+      }),
+    ).toBe("@[session|local%3Aprimary|thread%201|%2Ftmp%2Fwork%20tree]");
   });
 });

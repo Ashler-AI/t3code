@@ -29,6 +29,7 @@ import {
   startNewThreadForProject,
   shouldShowBranchMismatchBanner,
   shouldWriteThreadErrorToCurrentServerThread,
+  updateLocalDispatchPreparation,
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -676,5 +677,22 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
     expect(hasServerAcknowledgedLocalDispatch({ ...common, hasPendingApproval: true })).toBe(true);
     expect(hasServerAcknowledgedLocalDispatch({ ...common, hasPendingUserInput: true })).toBe(true);
     expect(hasServerAcknowledgedLocalDispatch({ ...common, threadError: "failed" })).toBe(true);
+  });
+});
+
+describe("updateLocalDispatchPreparation", () => {
+  it("does not clear worktree preparation before the server acknowledges the dispatch", () => {
+    const preparing = createLocalDispatchSnapshot(makeThread(), { preparingWorktree: true });
+
+    expect(updateLocalDispatchPreparation(preparing, false)).toBe(preparing);
+    expect(updateLocalDispatchPreparation(preparing, false).preparingWorktree).toBe(true);
+  });
+
+  it("upgrades an active send when worktree preparation becomes known", () => {
+    const sending = createLocalDispatchSnapshot(makeThread(), { preparingWorktree: false });
+
+    expect(updateLocalDispatchPreparation(sending, true)).toMatchObject({
+      preparingWorktree: true,
+    });
   });
 });

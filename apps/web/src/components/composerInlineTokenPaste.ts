@@ -36,7 +36,8 @@ export function registerComposerInlineTokenPaste(
       // Token grammar requires trailing whitespace; a virtual newline lets a
       // mention at the very end of the pasted text still parse.
       const mentions = collectComposerInlineTokens(`${text}\n`).filter(
-        (token) => token.type === "mention" && token.end <= text.length,
+        (token): token is Extract<typeof token, { type: "mention" }> =>
+          token.type === "mention" && token.end <= text.length,
       );
       if (mentions.length === 0) {
         return false;

@@ -86,6 +86,8 @@ import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSna
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderInstanceRegistry from "./provider/Services/ProviderInstanceRegistry.ts";
+import * as ProviderService from "./provider/Services/ProviderService.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -569,18 +571,22 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provide(
-        Layer.mock(ProviderRegistry.ProviderRegistry)({
-          getProviders: Effect.succeed([]),
-          refresh: () => Effect.succeed([]),
-          refreshInstance: () => Effect.succeed([]),
-          getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
-            Effect.succeed(
-              makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null }),
-            ),
-          setProviderMaintenanceActionState: () => Effect.succeed([]),
-          streamChanges: Stream.empty,
-          ...options?.layers?.providerRegistry,
-        }),
+        Layer.mergeAll(
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            getProviders: Effect.succeed([]),
+            refresh: () => Effect.succeed([]),
+            refreshInstance: () => Effect.succeed([]),
+            getProviderMaintenanceCapabilitiesForInstance: (_instanceId, provider) =>
+              Effect.succeed(
+                makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null }),
+              ),
+            setProviderMaintenanceActionState: () => Effect.succeed([]),
+            streamChanges: Stream.empty,
+            ...options?.layers?.providerRegistry,
+          }),
+          Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({}),
+          Layer.mock(ProviderService.ProviderService)({}),
+        ),
       ),
       Layer.provide(
         Layer.mock(ServerSettings.ServerSettingsService)({
@@ -4550,6 +4556,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           },
           providerRegistry: {
             getProviders: Effect.succeed([]),
+            refresh: () => Effect.succeed(nextProviders),
             streamChanges: Stream.succeed(nextProviders),
           },
         },
@@ -4571,6 +4578,77 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         version: 1,
         type: "providerStatuses",
         payload: { providers: nextProviders },
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not miss the provider refresh completed for an initial config subscriber", () =>
+    Effect.gen(function* () {
+      const staleProviders = [
+        {
+          instanceId: ProviderInstanceId.make("omp"),
+          driver: ProviderDriverKind.make("omp"),
+          enabled: true,
+          installed: true,
+          version: null,
+          status: "error" as const,
+          auth: { status: "unknown" as const },
+          checkedAt: "2026-07-24T00:00:00.000Z",
+          models: [],
+          slashCommands: [],
+          skills: [],
+          message: "OMP CLI is installed but timed out while running `omp --version`.",
+        },
+      ] as const;
+      const readyProviders = [
+        {
+          ...staleProviders[0],
+          version: "17.1.2",
+          status: "ready" as const,
+          checkedAt: "2026-07-24T00:01:00.000Z",
+          models: [
+            {
+              slug: "openai/gpt-5.6-terra",
+              name: "GPT-5.6 Terra",
+              isCustom: false,
+              capabilities: { optionDescriptors: [] },
+            },
+          ],
+          message: undefined,
+        },
+      ] as const;
+
+      yield* buildAppUnderTest({
+        layers: {
+          keybindings: {
+            loadConfigState: Effect.succeed({ keybindings: [], issues: [] }),
+            streamChanges: Stream.empty,
+          },
+          providerRegistry: {
+            getProviders: Effect.succeed(staleProviders),
+            refresh: () => Effect.succeed(readyProviders),
+            streamChanges: Stream.empty,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.subscribeServerConfig]({}).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      ).pipe(Effect.timeoutOption("1 second"));
+
+      assert.isTrue(Option.isSome(result));
+      const [snapshot, refreshed] = Array.from(Option.getOrThrow(result));
+      assert.equal(snapshot?.type, "snapshot");
+      if (snapshot?.type === "snapshot") {
+        assert.deepEqual(snapshot.config.providers, staleProviders);
+      }
+      assert.deepEqual(refreshed, {
+        version: 1,
+        type: "providerStatuses",
+        payload: { providers: readyProviders },
       });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

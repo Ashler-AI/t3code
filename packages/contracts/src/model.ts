@@ -131,9 +131,17 @@ const CODEX_DRIVER_KIND = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
+const OMP_DRIVER_KIND = ProviderDriverKind.make("omp");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
 
 export const DEFAULT_MODEL = "gpt-5.6-sol";
+export const DEFAULT_OMP_MODEL = "openai-codex/gpt-5.6-sol";
+export const DEFAULT_OMP_GIT_TEXT_GENERATION_MODEL = "openai-codex/gpt-5.6-luna";
+export const PREFERRED_DEFAULT_OMP_MODELS: ReadonlyArray<string> = [
+  DEFAULT_OMP_MODEL,
+  "openai-codex/gpt-5.6-terra",
+  "openai-codex/gpt-5.6-luna",
+];
 
 /**
  * Codex default-model preference, most preferred first. The provider snapshot
@@ -151,6 +159,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   [CLAUDE_DRIVER_KIND]: "claude-sonnet-5",
   [CURSOR_DRIVER_KIND]: "auto",
   [GROK_DRIVER_KIND]: "grok-build",
+  [OMP_DRIVER_KIND]: DEFAULT_OMP_MODEL,
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
 };
 
@@ -161,6 +170,7 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   [CODEX_DRIVER_KIND]: DEFAULT_TEXT_GENERATION_MODEL,
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
+  [OMP_DRIVER_KIND]: DEFAULT_OMP_GIT_TEXT_GENERATION_MODEL,
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
 };
 
@@ -220,5 +230,6 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [CLAUDE_DRIVER_KIND]: "Claude",
   [CURSOR_DRIVER_KIND]: "Cursor",
   [GROK_DRIVER_KIND]: "Grok",
+  [OMP_DRIVER_KIND]: "OMP",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
 };

@@ -330,6 +330,57 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect("segments OMP reasoning from assistant text and refreshes asynchronous config", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const promptResult = yield* runtime.prompt({
+        prompt: [{ type: "text", text: "hi" }],
+      });
+      expect(promptResult).toMatchObject({ stopReason: "end_turn" });
+
+      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 8)));
+      expect(notes.map((note) => note._tag)).toEqual([
+        "AssistantItemStarted",
+        "ContentDelta",
+        "AssistantItemCompleted",
+        "AssistantItemStarted",
+        "ContentDelta",
+        "TokenUsageUpdated",
+        "SessionInfoUpdated",
+        "AssistantItemCompleted",
+      ]);
+      expect(notes[0]).toMatchObject({ itemType: "reasoning" });
+      expect(notes[1]).toMatchObject({ streamKind: "reasoning_text" });
+      expect(notes[2]).toMatchObject({ itemType: "reasoning" });
+      expect(notes[3]).toMatchObject({ itemType: "assistant_message" });
+      expect(notes[4]).toMatchObject({ streamKind: "assistant_text" });
+      expect(notes[5]).toMatchObject({ usage: { usedTokens: 1200, maxTokens: 200_000 } });
+      expect(notes[6]).toMatchObject({ title: "OMP workspace check" });
+
+      const configOptions = yield* runtime.getConfigOptions;
+      expect(configOptions.find((option) => option.id === "thinking")).toMatchObject({
+        currentValue: "high",
+      });
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: { T3_ACP_EMIT_OMP_SESSION_UPDATES: "1" },
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    ),
+  );
+
   it.effect("suppresses generic placeholder tool updates until completion", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
@@ -533,6 +584,14 @@ describe("AcpSessionRuntime", () => {
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
       yield* runtime.start();
+
+      const replay = yield* runtime.getReplayNotifications;
+      expect(replay.map((entry) => entry.sourceSequence)).toEqual([1, 2, 3]);
+      expect(replay.map((entry) => entry.notification.update.sessionUpdate)).toEqual([
+        "tool_call",
+        "agent_message_chunk",
+        "user_message_chunk",
+      ]);
 
       yield* runtime.prompt({
         prompt: [{ type: "text", text: "hi" }],

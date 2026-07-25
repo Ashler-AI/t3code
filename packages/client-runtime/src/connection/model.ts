@@ -1,4 +1,10 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  NonNegativeInt,
+  ScaffoldDeployment,
+  SessionFabricClientId,
+  SessionFabricSessionId,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 const ConnectionTargetBase = {
@@ -30,6 +36,17 @@ export class RelayConnectionTarget extends Schema.TaggedClass<RelayConnectionTar
   },
 ) {}
 
+/** A virtual environment backed by one durable session stream, not a live server RPC socket. */
+export class SessionFabricConnectionTarget extends Schema.TaggedClass<SessionFabricConnectionTarget>()(
+  "SessionFabricConnectionTarget",
+  {
+    ...ConnectionTargetBase,
+    relayBaseUrl: Schema.String,
+    sessionId: SessionFabricSessionId,
+    clientId: SessionFabricClientId,
+  },
+) {}
+
 export class SshConnectionTarget extends Schema.TaggedClass<SshConnectionTarget>()(
   "SshConnectionTarget",
   {
@@ -38,18 +55,33 @@ export class SshConnectionTarget extends Schema.TaggedClass<SshConnectionTarget>
   },
 ) {}
 
+/** Persisted Scaffold binding. Transport and bootstrap authority are intentionally absent. */
+export class ScaffoldConnectionTarget extends Schema.TaggedClass<ScaffoldConnectionTarget>()(
+  "ScaffoldConnectionTarget",
+  {
+    ...ConnectionTargetBase,
+    deployment: ScaffoldDeployment,
+    sessionId: Schema.String,
+    lifecycleEpoch: NonNegativeInt,
+  },
+) {}
+
 export const ConnectionTarget = Schema.Union([
   PrimaryConnectionTarget,
   BearerConnectionTarget,
   RelayConnectionTarget,
+  SessionFabricConnectionTarget,
   SshConnectionTarget,
+  ScaffoldConnectionTarget,
 ]);
 export type ConnectionTarget = typeof ConnectionTarget.Type;
 
 export const PersistedConnectionTarget = Schema.Union([
   BearerConnectionTarget,
   RelayConnectionTarget,
+  SessionFabricConnectionTarget,
   SshConnectionTarget,
+  ScaffoldConnectionTarget,
 ]);
 export type PersistedConnectionTarget = typeof PersistedConnectionTarget.Type;
 

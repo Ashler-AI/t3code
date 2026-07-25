@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "modelFamilies": {
+    "openai": {
+      "providerAliases": ["openai-codex", "openai", "scaffold-openai"],
+      "modelIds": ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
+    },
+    "anthropic": {
+      "providerAliases": ["anthropic", "scaffold-anthropic"],
+      "modelIds": ["claude-sonnet-5", "claude-fable-5"]
+    },
+    "bifrost": {
+      "providerAliases": ["ashler", "bifrost", "scaffold-bifrost"],
+      "modelIds": ["x-ai/grok-4.5", "moonshotai/Kimi-K2.6"]
+    }
+  },
+  "advisor": {
+    "openaiPrimary": {
+      "targetFamily": "anthropic",
+      "modelId": "claude-sonnet-5",
+      "effort": "high"
+    },
+    "anthropicPrimary": {
+      "targetFamily": "openai",
+      "modelId": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    "default": {
+      "targetFamily": "openai",
+      "modelId": "gpt-5.6-terra",
+      "effort": "high"
+    }
+  }
+}

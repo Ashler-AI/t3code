@@ -57,6 +57,17 @@ nodeServicesIt("ACP native logging", (it) => {
         },
       });
 
+      yield* requestLogger({
+        method: "session/new",
+        payload: {},
+        status: "failed",
+        cause: Cause.fail(
+          AcpErrors.AcpRequestError.internalError("Internal error", {
+            details: `t3-code: HTTP 401 [Authorization: Bearer ${secret}]`,
+          }),
+        ),
+      });
+
       const serialized = encodeUnknownJson(records);
       assert.notInclude(serialized, secret);
       assert.include(serialized, '"method":"session/prompt"');
@@ -64,6 +75,12 @@ nodeServicesIt("ACP native logging", (it) => {
       assert.include(serialized, '"reasonCount":1');
       assert.include(serialized, '"valueType":"string"');
       assert.include(serialized, '"messageTag":"Request"');
+      assert.include(serialized, '"code":-32603');
+      assert.include(serialized, '"message":"Internal error"');
+      assert.include(
+        serialized,
+        '"details":"t3-code: HTTP 401 [Authorization: Bearer <redacted>]"',
+      );
     }),
   );
 

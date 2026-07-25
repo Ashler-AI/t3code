@@ -274,6 +274,23 @@ describe("DesktopUpdates", () => {
     }).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });
 
+  it.effect("prefers the Ashler product update feed when it is configured", () => {
+    const harness = makeHarness({
+      env: { ASHLER_CODE_UPDATE_FEED_URL: "https://updates.ashler.ai/code/" },
+    });
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+
+        assert.deepEqual(harness.feedUrls(), [
+          { provider: "generic", url: "https://updates.ashler.ai/code/" },
+        ]);
+      }),
+    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
   it.effect("updates and broadcasts state from updater events", () => {
     const harness = makeHarness();
 

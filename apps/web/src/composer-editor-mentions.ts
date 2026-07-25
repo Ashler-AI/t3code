@@ -20,11 +20,65 @@ export type ComposerPromptSegment =
   | {
       type: "skill";
       name: string;
+      provider?: string;
+      source?: string;
+    }
+  | {
+      type: "session";
+      environmentId: string;
+      threadId: string;
+      worktreePath: string | null;
+      source: string;
     }
   | {
       type: "terminal-context";
       context: TerminalContextDraft | null;
     };
+
+type ComposerSessionReferenceToken = {
+  type: "session";
+  environmentId: string;
+  threadId: string;
+  worktreePath: string | null;
+  source: string;
+  start: number;
+  end: number;
+};
+
+const SESSION_REFERENCE_TOKEN_REGEX =
+  /(^|\s)@\[session\|([^\]|]*)\|([^\]|]*)(?:\|([^\]]*))?\](?=\s)/g;
+
+function decodeSessionReferencePart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function collectSessionReferenceTokens(text: string): ComposerSessionReferenceToken[] {
+  const tokens: ComposerSessionReferenceToken[] = [];
+  for (const match of text.matchAll(SESSION_REFERENCE_TOKEN_REGEX)) {
+    const fullMatch = match[0];
+    const prefix = match[1] ?? "";
+    const environmentId = decodeSessionReferencePart(match[2] ?? "");
+    const threadId = decodeSessionReferencePart(match[3] ?? "");
+    if (!environmentId || !threadId) continue;
+    const worktreePath = decodeSessionReferencePart(match[4] ?? "");
+    const start = (match.index ?? 0) + prefix.length;
+    const end = start + fullMatch.length - prefix.length;
+    tokens.push({
+      type: "session",
+      environmentId,
+      threadId,
+      worktreePath: worktreePath || null,
+      source: text.slice(start, end),
+      start,
+      end,
+    });
+  }
+  return tokens;
+}
 
 function rangeIncludesIndex(start: number, end: number, index: number): boolean {
   return start <= index && index < end;
@@ -130,7 +184,10 @@ function splitPromptTextIntoComposerSegments(text: string): ComposerPromptSegmen
     return segments;
   }
 
-  const tokenMatches = collectComposerInlineTokens(text);
+  const tokenMatches = [
+    ...collectComposerInlineTokens(text),
+    ...collectSessionReferenceTokens(text),
+  ].sort((left, right) => left.start - right.start);
   let cursor = 0;
   for (const match of tokenMatches) {
     if (match.start < cursor) {
@@ -147,8 +204,21 @@ function splitPromptTextIntoComposerSegments(text: string): ComposerPromptSegmen
         path: match.value,
         source: match.source,
       });
+    } else if (match.type === "skill") {
+      segments.push({
+        type: "skill",
+        name: match.value,
+        ...(match.provider ? { provider: match.provider } : {}),
+        ...(match.syntax === "at" ? { source: match.source } : {}),
+      });
     } else {
-      segments.push({ type: "skill", name: match.value });
+      segments.push({
+        type: "session",
+        environmentId: match.environmentId,
+        threadId: match.threadId,
+        worktreePath: match.worktreePath,
+        source: match.source,
+      });
     }
 
     cursor = match.end;

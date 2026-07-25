@@ -481,7 +481,9 @@ const projectAddCommand = Command.make("add", {
           projectId,
           title,
           workspaceRoot,
-          defaultModelSelection: ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(),
+          // Offline project mutation has no authoritative provider catalog.
+          // Leave the default unset instead of fabricating an OMP model.
+          defaultModelSelection: ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection([]),
           createdAt: DateTime.formatIso(yield* DateTime.now),
         });
         return `Added project ${projectId} (${title}) at ${workspaceRoot}.`;

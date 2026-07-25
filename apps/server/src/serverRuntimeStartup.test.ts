@@ -1,5 +1,11 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { DEFAULT_MODEL, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ServerProvider,
+  ThreadId,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -13,14 +19,71 @@ import * as Stream from "effect/Stream";
 import * as ServerConfig from "./config.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 
-it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
-  assert.deepStrictEqual(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(), {
-    instanceId: ProviderInstanceId.make("codex"),
-    model: DEFAULT_MODEL,
-  });
+const liveOmpProvider: ServerProvider = {
+  instanceId: ProviderInstanceId.make("omp"),
+  driver: ProviderDriverKind.make("omp"),
+  displayName: "OMP",
+  enabled: true,
+  installed: true,
+  version: "17.1.2",
+  status: "ready",
+  auth: { status: "authenticated" },
+  checkedAt: "2026-01-01T00:00:00.000Z",
+  models: [
+    {
+      slug: "openai-codex/gpt-5.6-terra",
+      name: "Terra",
+      isCustom: false,
+      capabilities: null,
+    },
+    {
+      slug: "openai-codex/gpt-5.6-sol",
+      name: "Sol",
+      isCustom: false,
+      capabilities: null,
+    },
+  ],
+  slashCommands: [],
+  skills: [],
+};
+
+const providerRegistryService: ProviderRegistry.ProviderRegistry["Service"] = {
+  getProviders: Effect.succeed([liveOmpProvider]),
+  refresh: () => Effect.succeed([liveOmpProvider]),
+  refreshInstance: () => Effect.succeed([liveOmpProvider]),
+  getProviderMaintenanceCapabilitiesForInstance: () => Effect.die("unused"),
+  setProviderMaintenanceActionState: () => Effect.succeed([liveOmpProvider]),
+  streamChanges: Stream.empty,
+};
+
+it("uses a live allowed OMP model for auto-bootstrapped model selection", () => {
+  assert.deepStrictEqual(
+    ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection([liveOmpProvider]),
+    {
+      instanceId: ProviderInstanceId.make("omp"),
+      model: "openai-codex/gpt-5.6-sol",
+    },
+  );
+  assert.isNull(ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection([]));
+  assert.isNull(
+    ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection([
+      {
+        ...liveOmpProvider,
+        models: [
+          {
+            slug: "openai-codex/gpt-5.5",
+            name: "Unsupported",
+            isCustom: false,
+            capabilities: null,
+          },
+        ],
+      },
+    ]),
+  );
 });
 
 it.effect("enqueueCommand waits for readiness and then drains queued work", () =>
@@ -147,7 +210,9 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
               id: bootstrapProjectId,
               title: "Startup Project",
               workspaceRoot: "/tmp/startup-project",
-              defaultModelSelection: ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection(),
+              defaultModelSelection: ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection([
+                liveOmpProvider,
+              ]),
               scripts: [],
               createdAt: "2026-01-01T00:00:00.000Z",
               updatedAt: "2026-01-01T00:00:00.000Z",
@@ -172,6 +237,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets returns existing project and threa
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
+      Effect.provideService(ProviderRegistry.ProviderRegistry, providerRegistryService),
       Effect.provide(NodeServices.layer),
     );
 
@@ -217,6 +283,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
+      Effect.provideService(ProviderRegistry.ProviderRegistry, providerRegistryService),
       Effect.provide(NodeServices.layer),
     );
 
@@ -268,6 +335,7 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
         streamDomainEvents: Stream.empty,
         latestSequence: Effect.succeed(0),
       } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
+      Effect.provideService(ProviderRegistry.ProviderRegistry, providerRegistryService),
       Effect.provideService(Crypto.Crypto, {
         ...crypto,
         randomUUIDv4: Effect.fail(uuidError),

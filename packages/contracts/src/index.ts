@@ -29,3 +29,6 @@ export * from "./preview.ts";
 export * from "./previewAutomation.ts";
 export * from "./resourceTelemetry.ts";
 export * from "./rpc.ts";
+export * from "./ompAccounts.ts";
+export * from "./scaffold.ts";
+export * from "./sessionFabric.ts";

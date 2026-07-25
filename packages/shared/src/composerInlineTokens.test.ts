@@ -3,6 +3,20 @@ import { describe, expect, it } from "vite-plus/test";
 import { collectComposerInlineTokens } from "./composerInlineTokens.ts";
 
 describe("collectComposerInlineTokens", () => {
+  it("collects typed @ skill references without treating session references as mobile tokens", () => {
+    const text =
+      "Use @[skill|omp|code-review] then ask @[session|local%3Aprimary|thread-2|%2Ftmp%2Fworktree] please ";
+    const tokens = collectComposerInlineTokens(text);
+
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]).toMatchObject({
+      type: "skill",
+      value: "code-review",
+      provider: "omp",
+      syntax: "at",
+      source: "@[skill|omp|code-review]",
+    });
+  });
   it("collects file links, mentions, and skills with source ranges", () => {
     const text = "Use $ui and inspect [Chat.tsx](src/Chat.tsx) with @AGENTS.md please";
 

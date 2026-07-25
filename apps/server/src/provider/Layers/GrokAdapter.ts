@@ -49,6 +49,8 @@ import {
   makeAcpPlanUpdatedEvent,
   makeAcpRequestOpenedEvent,
   makeAcpRequestResolvedEvent,
+  makeAcpThreadMetadataUpdatedEvent,
+  makeAcpTokenUsageUpdatedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
@@ -800,6 +802,40 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                   return;
                 }
 
+                if (event._tag === "TokenUsageUpdated") {
+                  yield* offerRuntimeEvent(
+                    makeAcpTokenUsageUpdatedEvent({
+                      stamp: yield* makeEventStamp(),
+                      provider: PROVIDER,
+                      threadId: ctx.threadId,
+                      turnId: ctx.activeTurnId,
+                      usage: event.usage,
+                      rawPayload: event.rawPayload,
+                    }),
+                  );
+                  return;
+                }
+
+                if (event._tag === "SessionInfoUpdated") {
+                  if (event.title) {
+                    yield* offerRuntimeEvent(
+                      makeAcpThreadMetadataUpdatedEvent({
+                        stamp: yield* makeEventStamp(),
+                        provider: PROVIDER,
+                        threadId: ctx.threadId,
+                        turnId: ctx.activeTurnId,
+                        title: event.title,
+                        rawPayload: event.rawPayload,
+                      }),
+                    );
+                  }
+                  return;
+                }
+
+                if (event._tag === "ConfigOptionsUpdated") {
+                  return;
+                }
+
                 const notificationTurnId = resolveNotificationTurnId(ctx);
                 if (
                   notificationTurnId === undefined ||
@@ -818,6 +854,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         threadId: ctx.threadId,
                         turnId: notificationTurnId,
                         itemId: event.itemId,
+                        itemType: event.itemType,
                         lifecycle: "item.started",
                       }),
                     );
@@ -830,6 +867,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         threadId: ctx.threadId,
                         turnId: notificationTurnId,
                         itemId: event.itemId,
+                        itemType: event.itemType,
                         lifecycle: "item.completed",
                       }),
                     );
@@ -864,6 +902,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                         threadId: ctx.threadId,
                         turnId: notificationTurnId,
                         ...(event.itemId ? { itemId: event.itemId } : {}),
+                        streamKind: event.streamKind,
                         text: event.text,
                         rawPayload: event.rawPayload,
                       }),
