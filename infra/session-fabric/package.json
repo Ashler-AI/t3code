@@ -1,0 +1,25 @@
+{
+  "name": "@t3tools/session-fabric-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "alchemy deploy",
+    "destroy": "alchemy destroy",
+    "dev": "alchemy dev",
+    "smoke:scaffold": "node scripts/scaffold-proof.ts",
+    "test": "vp test run",
+    "typecheck": "tsgo --noEmit"
+  },
+  "dependencies": {
+    "@t3tools/contracts": "workspace:*",
+    "alchemy": "https://pkg.ing/alchemy/078ff00",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260601.1",
+    "@effect/platform-node": "catalog:",
+    "@effect/vitest": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}
