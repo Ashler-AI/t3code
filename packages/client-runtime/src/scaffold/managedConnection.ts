@@ -94,6 +94,7 @@ export const prepareManagedScaffoldConnection = Effect.fn(
         providerKind: "manual" as const,
       },
       credential: preparedResult.bootstrapCredential,
+      attachCredential: preparedResult.attachCredential,
     }),
   });
   return {

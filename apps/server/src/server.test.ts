@@ -1786,6 +1786,56 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("validates DPoP against the trusted external base and ignores forwarded hosts", () =>
+    Effect.gen(function* () {
+      const trustedPublicBaseUrl = new URL("https://public.example.test/scaffold/session/");
+      yield* buildAppUnderTest({ config: { trustedPublicBaseUrl } });
+
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const issueCredential = Effect.fn(function* () {
+        const response = yield* HttpClient.post("/api/auth/pairing-token", {
+          headers: { cookie: ownerCookie },
+          body: yield* HttpBody.json({}),
+        });
+        return ((yield* response.json) as { readonly credential: string }).credential;
+      });
+      const now = yield* DateTime.now;
+      const iat = Math.floor(now.epochMilliseconds / 1_000);
+      const trustedTokenUrl = new URL("oauth/token", trustedPublicBaseUrl).href;
+      const validProof = makeDpopProof({
+        method: "POST",
+        url: trustedTokenUrl,
+        iat,
+        jti: "trusted-public-url",
+      });
+      const valid = yield* exchangeAccessToken(yield* issueCredential(), {
+        headers: {
+          dpop: validProof.proof,
+          "x-forwarded-host": "spoofed.example.test",
+          "x-forwarded-proto": "https",
+        },
+        scope: "orchestration:read orchestration:operate terminal:operate review:write",
+      });
+
+      assert.equal(valid.response.status, 200);
+      assert.equal(valid.body.token_type, "DPoP");
+
+      const wrongProof = makeDpopProof({
+        method: "POST",
+        url: "https://wrong.example.test/oauth/token",
+        iat,
+        jti: "wrong-public-url",
+      });
+      const invalid = yield* exchangeAccessToken(yield* issueCredential(), {
+        headers: { dpop: wrongProof.proof },
+        scope: "orchestration:read orchestration:operate terminal:operate review:write",
+      });
+
+      assert.equal(invalid.response.status, 401);
+      assert.equal(invalid.body.reason, "invalid_credential");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("rejects cloud link proofs for non-loopback managed endpoint origins", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();

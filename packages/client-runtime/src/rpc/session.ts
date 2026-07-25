@@ -94,6 +94,9 @@ export const make = Effect.gen(function* () {
     });
     const socketLayer = Socket.layerWebSocket(connection.socketUrl, {
       openTimeout: SOCKET_OPEN_TIMEOUT,
+      ...(connection.scaffoldAttachCredential
+        ? { protocols: [`scaffold.attach.${connection.scaffoldAttachCredential}`] }
+        : {}),
     }).pipe(Layer.provide(Layer.succeed(Socket.WebSocketConstructor, webSocketConstructor)));
     const protocolLayer = Layer.effect(
       RpcClient.Protocol,

@@ -18,6 +18,11 @@ export const ScaffoldSessionStatus = Schema.Literals([
 ]);
 export type ScaffoldSessionStatus = typeof ScaffoldSessionStatus.Type;
 
+export const ScaffoldAttachCredential = TrimmedNonEmptyString.check(
+  Schema.isPattern(/^[A-Za-z0-9._~-]+$/),
+);
+export type ScaffoldAttachCredential = typeof ScaffoldAttachCredential.Type;
+
 export class ScaffoldSessionObservation extends Schema.Class<ScaffoldSessionObservation>(
   "ScaffoldSessionObservation",
 )({
@@ -102,6 +107,7 @@ export class ScaffoldPreparedConnection extends Schema.Class<ScaffoldPreparedCon
   httpBaseUrl: TrimmedNonEmptyString,
   wsBaseUrl: TrimmedNonEmptyString,
   bootstrapCredential: TrimmedNonEmptyString,
+  attachCredential: ScaffoldAttachCredential,
   expiresAt: TrimmedNonEmptyString,
 }) {}
 

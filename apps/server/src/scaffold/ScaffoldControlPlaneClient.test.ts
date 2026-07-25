@@ -84,6 +84,7 @@ describe("ScaffoldControlPlaneClient", () => {
         httpBaseUrl: "https://sandbox.example.com/",
         wsBaseUrl: "wss://sandbox.example.com/",
         bootstrapCredential: "one-time-secret",
+        attachCredential: "attach-secret",
         expiresAt: "2026-07-24T21:00:00.000Z",
       },
     };
@@ -94,7 +95,29 @@ describe("ScaffoldControlPlaneClient", () => {
     });
     await expect(
       client.issueT3Transport({ environmentId, sessionId: "ses_1", lifecycleEpoch: 2 }),
-    ).resolves.toMatchObject({ bootstrapCredential: "one-time-secret" });
+    ).resolves.toMatchObject({
+      bootstrapCredential: "one-time-secret",
+      attachCredential: "attach-secret",
+    });
+
+    for (const attachCredential of [undefined, "   ", "bad credential", "bad,credential"]) {
+      const invalidAttach = makeScaffoldControlPlaneClient({
+        target,
+        now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+        fetch: async () =>
+          json({
+            ...valid,
+            transport: { ...valid.transport, attachCredential },
+          }),
+      });
+      await expect(
+        invalidAttach.issueT3Transport({
+          environmentId,
+          sessionId: "ses_1",
+          lifecycleEpoch: 2,
+        }),
+      ).rejects.toMatchObject({ code: "scaffold_invalid_transport" });
+    }
 
     const invalid = makeScaffoldControlPlaneClient({
       target,

@@ -20,6 +20,7 @@ export interface ScaffoldEphemeralTransport {
   readonly httpBaseUrl: string;
   readonly wsBaseUrl: string;
   readonly bootstrapCredential: string;
+  readonly attachCredential: string;
   readonly expiresAt: string;
 }
 
@@ -31,6 +32,11 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function attachCredentialValue(value: unknown): string | undefined {
+  const candidate = stringValue(value);
+  return candidate && /^[A-Za-z0-9._~-]+$/u.test(candidate) ? candidate : undefined;
 }
 
 function numberValue(value: unknown): number | undefined {
@@ -233,6 +239,7 @@ export function makeScaffoldControlPlaneClient(options: {
       const bootstrapCredential = stringValue(
         transport?.bootstrapCredential ?? transport?.credential,
       );
+      const attachCredential = attachCredentialValue(transport?.attachCredential);
       const expiresAt = stringValue(transport?.expiresAt);
       const expiresAtMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
       if (
@@ -243,6 +250,7 @@ export function makeScaffoldControlPlaneClient(options: {
         !httpBaseUrl ||
         !wsBaseUrl ||
         !bootstrapCredential ||
+        !attachCredential ||
         !expiresAt ||
         !Number.isFinite(expiresAtMs) ||
         expiresAtMs <= now()
@@ -261,6 +269,7 @@ export function makeScaffoldControlPlaneClient(options: {
         httpBaseUrl,
         wsBaseUrl,
         bootstrapCredential,
+        attachCredential,
         expiresAt,
       };
     },
