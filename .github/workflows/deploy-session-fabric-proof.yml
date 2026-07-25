@@ -48,6 +48,8 @@ jobs:
         if: inputs.operation == 'deploy'
         run: vp run --filter @t3tools/session-fabric-worker deploy --stage proof --yes
         env:
+          BASETEN_API_KEY: ${{ secrets.BASETEN_API_KEY }}
+          BASETEN_EMBEDDING_URL: ${{ vars.BASETEN_EMBEDDING_URL }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
       - id: endpoint

@@ -14,6 +14,7 @@ import {
   buildScaffoldSessionProofCommand,
   fetchScaffoldProofSnapshotResponse,
   isTerminalScaffoldProofCommandReceipt,
+  scaffoldSessionSemanticSearchResult,
   scaffoldSessionProofMetadata,
 } from "./scaffoldProof.ts";
 
@@ -121,6 +122,37 @@ describe("Scaffold session fabric proof", () => {
         },
       }),
     ).toThrow("not backed by a Scaffold sandbox");
+  });
+
+  it("requires a positive semantic match with zero lexical token overlap", () => {
+    const query = "coordinated interfaces transferred a programming artifact";
+    const result = {
+      session: scaffoldSnapshot.session,
+      score: 0.47,
+      matchText: scaffoldSnapshot.session.initialPrompt,
+    };
+
+    expect(
+      scaffoldSessionSemanticSearchResult({
+        snapshot: scaffoldSnapshot,
+        query,
+        response: { results: [result] },
+      }),
+    ).toEqual(result);
+    expect(() =>
+      scaffoldSessionSemanticSearchResult({
+        snapshot: scaffoldSnapshot,
+        query: "Scaffold runner",
+        response: { results: [result] },
+      }),
+    ).toThrow("lexical overlap");
+    expect(() =>
+      scaffoldSessionSemanticSearchResult({
+        snapshot: scaffoldSnapshot,
+        query,
+        response: { results: [] },
+      }),
+    ).toThrow("did not return the target Scaffold session");
   });
 
   it("builds a real turn command against the global session and sandbox thread", () => {
