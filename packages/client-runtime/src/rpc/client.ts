@@ -5,6 +5,7 @@ import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/unstable/rpc";
@@ -156,14 +157,14 @@ interface SubscriptionOptions<TTag extends EnvironmentSubscriptionRpcTag> {
   readonly resubscribe?: Stream.Stream<unknown, never, never>;
 }
 
-export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag>(
+export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag, R>(
   tag: TTag,
-  makeInput: (session: RpcSession) => Effect.Effect<EnvironmentRpcInput<TTag>>,
+  makeInput: (session: RpcSession) => Effect.Effect<EnvironmentRpcInput<TTag>, never, R>,
   options?: SubscriptionOptions<TTag>,
 ): Stream.Stream<
   EnvironmentRpcStreamValue<TTag>,
   EnvironmentRpcStreamFailure<TTag>,
-  EnvironmentSupervisor
+  EnvironmentSupervisor | Exclude<R, Scope.Scope>
 > {
   return Stream.unwrap(
     EnvironmentSupervisor.pipe(
@@ -191,7 +192,8 @@ export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag>(
                 >;
                 const subscribeToSession = (): Stream.Stream<
                   EnvironmentRpcStreamValue<TTag>,
-                  EnvironmentRpcStreamFailure<TTag>
+                  EnvironmentRpcStreamFailure<TTag>,
+                  Exclude<R, Scope.Scope>
                 > =>
                   Stream.suspend(() =>
                     Stream.unwrap(

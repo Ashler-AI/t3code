@@ -30,6 +30,7 @@ import * as ConnectionWakeups from "../connection/wakeups.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as RpcSession from "../rpc/session.ts";
+import { UiSessionSource, type UiSessionSourceShape } from "../session-source/index.ts";
 import {
   EMPTY_ENVIRONMENT_THREAD_STATE,
   makeEnvironmentThreadState,
@@ -133,6 +134,7 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   readonly cached?: OrchestrationThread;
   readonly httpSnapshot?: Option.Option<OrchestrationThreadDetailSnapshot>;
   readonly completionMarker?: boolean;
+  readonly sessionSource?: UiSessionSourceShape;
 }) {
   const inputs = yield* Queue.unbounded<TestThreadInput>();
   const observed = yield* Queue.unbounded<EnvironmentThreadState>();
@@ -219,15 +221,17 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
     saveVcsRefs: () => Effect.void,
     clear: () => Effect.void,
   });
-  const threadState = yield* makeEnvironmentThreadState(THREAD_ID).pipe(
+  const makeThreadState = makeEnvironmentThreadState(THREAD_ID).pipe(
     Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
     Effect.provideService(Persistence.EnvironmentCacheStore, cache),
-    Effect.provideService(ThreadSnapshotLoader, snapshotLoader),
     Effect.provideService(
       ConnectionWakeups.ConnectionWakeups,
       ConnectionWakeups.ConnectionWakeups.of({ changes: Stream.fromQueue(wakeups) }),
     ),
   );
+  const threadState = yield* options?.sessionSource === undefined
+    ? makeThreadState.pipe(Effect.provideService(ThreadSnapshotLoader, snapshotLoader))
+    : makeThreadState.pipe(Effect.provideService(UiSessionSource, options.sessionSource));
   yield* SubscriptionRef.changes(threadState).pipe(
     Stream.runForEach((state) =>
       Ref.set(latest, state).pipe(Effect.andThen(Queue.offer(observed, state))),
@@ -415,6 +419,58 @@ describe("EnvironmentThreads", () => {
       // resumed from that snapshot's sequence.
       expect(yield* Ref.get(harness.loaderCalls)).toBeGreaterThanOrEqual(1);
       expect(yield* Ref.get(harness.lastSubscribeAfterSequence)).toBe(1);
+    }),
+  );
+
+  it.effect("uses an injected authoritative snapshot and resumes from its sequence", () =>
+    Effect.gen(function* () {
+      const authoritativeCalls = yield* Ref.make(0);
+      const subscribeAfterSequence = yield* Ref.make<number | undefined>(undefined);
+      const injectedThread: OrchestrationThread = {
+        ...BASE_THREAD,
+        title: "Injected source title",
+      };
+      const source = UiSessionSource.of({
+        authoritativeShellSnapshot: () => Effect.succeed(Option.none()),
+        authoritativeThreadSnapshot: (_prepared, threadId) =>
+          Ref.update(authoritativeCalls, (count) => count + 1).pipe(
+            Effect.as(
+              Option.some({
+                snapshotSequence: 13,
+                thread: { ...injectedThread, id: threadId },
+              }),
+            ),
+          ),
+        subscribeThread: (makeInput) =>
+          Stream.unwrap(
+            makeInput({
+              shellResumeCompletionMarker: false,
+              threadResumeCompletionMarker: false,
+            }).pipe(
+              Effect.tap((input) => Ref.set(subscribeAfterSequence, input.afterSequence)),
+              Effect.as(Stream.never),
+            ),
+          ),
+        subscribeShell: () => Stream.never,
+        dispatch: () => Effect.never,
+        listThreads: () => Effect.succeed(Option.none()),
+        listSessions: () => Effect.succeed(Option.none()),
+      });
+      const harness = yield* makeHarness({ sessionSource: source });
+
+      const state = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.title === "Injected source title",
+      );
+
+      expect(Option.getOrThrow(state.data)).toEqual(injectedThread);
+      expect(yield* Ref.get(authoritativeCalls)).toBe(1);
+      expect(yield* Ref.get(subscribeAfterSequence)).toBe(13);
+      expect(yield* Ref.get(harness.loaderCalls)).toBe(0);
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(0);
     }),
   );
 

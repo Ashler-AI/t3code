@@ -1,10 +1,18 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import { HttpServer } from "effect/unstable/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -18,6 +26,17 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getEnvironmentId: Effect.succeed(environmentId),
   getDescriptor: Effect.die("unused"),
 });
+const fakeProviderInstances = ProviderInstanceRegistry.ProviderInstanceRegistry.of({
+  getInstance: (instanceId) =>
+    Effect.succeed({
+      instanceId,
+      driverKind: ProviderDriverKind.make(instanceId === "omp" ? "omp" : "codex"),
+    } as ProviderInstance),
+  listInstances: Effect.succeed([]),
+  listUnavailable: Effect.succeed([]),
+  streamChanges: Stream.empty,
+  subscribeChanges: Effect.die("unused"),
+});
 
 const makeRegistry = (now: () => number, httpServer = fakeHttpServer) =>
   McpSessionRegistry.__testing
@@ -29,6 +48,10 @@ const makeRegistry = (now: () => number, httpServer = fakeHttpServer) =>
     .pipe(
       Effect.provideService(HttpServer.HttpServer, httpServer),
       Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+      Effect.provideService(
+        ProviderInstanceRegistry.ProviderInstanceRegistry,
+        fakeProviderInstances,
+      ),
       Effect.provide(NodeServices.layer),
     );
 
@@ -52,6 +75,30 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
     expect(yield* registry.resolve(token)).toBeUndefined();
 
     timestamp += 2_000;
+  }),
+);
+
+it.effect("grants session read/send capabilities only to OMP provider credentials", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const omp = yield* registry.issue({
+      threadId: ThreadId.make("thread-omp"),
+      providerInstanceId: ProviderInstanceId.make("omp"),
+    });
+    const codex = yield* registry.issue({
+      threadId: ThreadId.make("thread-codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+
+    const resolveIssued = (authorizationHeader: string) =>
+      registry.resolve(authorizationHeader.replace(/^Bearer\s+/, ""));
+    const ompScope = yield* resolveIssued(omp.config.authorizationHeader);
+    const codexScope = yield* resolveIssued(codex.config.authorizationHeader);
+
+    expect(ompScope?.capabilities).toEqual(
+      new Set(["preview", "session_reference_read", "session_message_send"]),
+    );
+    expect(codexScope?.capabilities).toEqual(new Set(["preview"]));
   }),
 );
 

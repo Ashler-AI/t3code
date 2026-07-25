@@ -22,6 +22,7 @@ import * as ConnectionWakeups from "../connection/wakeups.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
+import { UiSessionSource } from "../session-source/index.ts";
 import { makeEnvironmentShellState, ShellSnapshotLoader } from "./shell.ts";
 
 const TARGET = new PrimaryConnectionTarget({
@@ -58,6 +59,66 @@ function session(client: WsRpcProtocolClient): RpcSession.RpcSession {
 }
 
 describe("environment shell synchronization", () => {
+  it.effect("uses an injected source without direct snapshot or RPC services", () =>
+    Effect.gen(function* () {
+      const capturedAfterSequence = yield* Ref.make<number | undefined>(undefined);
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make(Option.none<RpcSession.RpcSession>()),
+        prepared: yield* SubscriptionRef.make(Option.some(PREPARED)),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const cache = Persistence.EnvironmentCacheStore.of({
+        loadShell: () => Effect.succeed(Option.none()),
+        saveShell: () => Effect.void,
+        loadThread: () => Effect.succeed(Option.none()),
+        saveThread: () => Effect.void,
+        removeThread: () => Effect.void,
+        loadServerConfig: () => Effect.succeed(Option.none()),
+        saveServerConfig: () => Effect.void,
+        loadVcsRefs: () => Effect.succeed(Option.none()),
+        saveVcsRefs: () => Effect.void,
+        clear: () => Effect.void,
+      });
+      const source = UiSessionSource.of({
+        authoritativeShellSnapshot: () => Effect.succeed(Option.some(LIVE_SHELL_SNAPSHOT)),
+        authoritativeThreadSnapshot: () => Effect.succeed(Option.none()),
+        subscribeShell: (makeInput) =>
+          Stream.unwrap(
+            makeInput({
+              shellResumeCompletionMarker: false,
+              threadResumeCompletionMarker: false,
+            }).pipe(
+              Effect.tap((input) => Ref.set(capturedAfterSequence, input.afterSequence)),
+              Effect.as(Stream.never),
+            ),
+          ),
+        subscribeThread: () => Stream.never,
+        dispatch: () => Effect.never,
+        listThreads: () => Effect.succeed(Option.none()),
+        listSessions: () => Effect.succeed(Option.none()),
+      });
+
+      const shellState = yield* makeEnvironmentShellState().pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+        Effect.provideService(UiSessionSource, source),
+      );
+      let afterSequence = yield* Ref.get(capturedAfterSequence);
+      for (let attempt = 0; attempt < 100 && afterSequence === undefined; attempt += 1) {
+        yield* Effect.yieldNow;
+        afterSequence = yield* Ref.get(capturedAfterSequence);
+      }
+      const state = yield* SubscriptionRef.get(shellState);
+
+      expect(Option.getOrThrow(state.snapshot)).toEqual(LIVE_SHELL_SNAPSHOT);
+      expect(afterSequence).toBe(LIVE_SHELL_SNAPSHOT.snapshotSequence);
+    }),
+  );
+
   it.effect("publishes live state before persistence and preserves it when ready", () =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<OrchestrationShellStreamItem>();

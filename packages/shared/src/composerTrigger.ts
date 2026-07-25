@@ -40,6 +40,20 @@ export function serializeComposerFileLink(path: string): string {
   return `[${label}](${encodeMarkdownLinkDestination(path)})`;
 }
 
+const encodeComposerReferencePart = (value: string): string => encodeURIComponent(value);
+
+export function serializeComposerSkillReference(provider: string, skillName: string): string {
+  return `@[skill|${encodeComposerReferencePart(provider)}|${encodeComposerReferencePart(skillName)}]`;
+}
+
+export function serializeComposerSessionReference(input: {
+  environmentId: string;
+  threadId: string;
+  worktreePath: string | null;
+}): string {
+  return `@[session|${encodeComposerReferencePart(input.environmentId)}|${encodeComposerReferencePart(input.threadId)}|${encodeComposerReferencePart(input.worktreePath ?? "")}]`;
+}
+
 function clampCursor(text: string, cursor: number): number {
   if (!Number.isFinite(cursor)) return text.length;
   return Math.max(0, Math.min(text.length, Math.floor(cursor)));

@@ -12,6 +12,8 @@ import type { ThreadRouteTarget } from "../threadRoutes";
 import { cn } from "../lib/utils";
 import { isLatestTurnSettled } from "../session-logic";
 import { resolveServerBackedAppStageLabel } from "../branding.logic";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
+import type { DraftId, DraftThreadState } from "../composerDraftStore";
 
 export const THREAD_SELECTION_SAFE_SELECTOR = "[data-thread-item], [data-thread-selection-safe]";
 export const THREAD_JUMP_HINT_SHOW_DELAY_MS = 100;
@@ -44,6 +46,44 @@ type LogicalSidebarProject = SidebarProject & {
 };
 
 export type ThreadTraversalDirection = "previous" | "next";
+
+export interface ProvisionalDraftRow {
+  readonly draftId: DraftId;
+  readonly draftThread: DraftThreadState;
+}
+
+/**
+ * Keep local draft sessions visible until their canonical server shell arrives.
+ * Scaffold drafts have their own richer lifecycle row and are excluded here.
+ */
+export function selectProvisionalDraftRows(input: {
+  draftThreadsByDraftId: Readonly<Record<string, DraftThreadState>>;
+  scaffoldDraftIds: ReadonlySet<string>;
+  materializedThreadKeys: ReadonlySet<string>;
+  scopedProjectKeys: ReadonlySet<string> | null;
+}): ProvisionalDraftRow[] {
+  return Object.entries(input.draftThreadsByDraftId)
+    .flatMap(([draftId, draftThread]) => {
+      if (input.scaffoldDraftIds.has(draftId)) return [];
+      if (
+        input.materializedThreadKeys.has(
+          scopedThreadKey(scopeThreadRef(draftThread.environmentId, draftThread.threadId)),
+        )
+      ) {
+        return [];
+      }
+      if (
+        input.scopedProjectKeys !== null &&
+        !input.scopedProjectKeys.has(`${draftThread.environmentId}:${draftThread.projectId}`)
+      ) {
+        return [];
+      }
+      return [{ draftId: draftId as DraftId, draftThread }];
+    })
+    .toSorted((left, right) =>
+      left.draftThread.createdAt.localeCompare(right.draftThread.createdAt),
+    );
+}
 
 export async function archiveSelectedThreadEntries<
   TEntry extends { readonly threadKey: string },
@@ -402,6 +442,35 @@ export function resolveThreadRowClassName(input: {
 // Unread completion is tracked separately: it describes whether a ready
 // thread needs attention, not what the thread is currently doing.
 export type SidebarV2Status = "approval" | "input" | "working" | "failed" | "ready";
+
+export type AshlerSidebarIndicator =
+  | { readonly kind: "working"; readonly label: "Agent is working" }
+  | { readonly kind: "attention"; readonly label: "Needs attention" }
+  | null;
+
+export function resolveAshlerSidebarIndicator(input: {
+  readonly status: SidebarV2Status;
+  readonly hasUnreadContent: boolean;
+  readonly wokeFromSnooze: boolean;
+}): AshlerSidebarIndicator {
+  if (input.status === "working") {
+    return { kind: "working", label: "Agent is working" };
+  }
+  if (
+    input.hasUnreadContent ||
+    input.wokeFromSnooze ||
+    input.status === "approval" ||
+    input.status === "input" ||
+    input.status === "failed"
+  ) {
+    return { kind: "attention", label: "Needs attention" };
+  }
+  return null;
+}
+
+export function isScaffoldEnvironmentLabel(label: string | null): boolean {
+  return label !== null && /(^|\s|[-_])scaffold($|\s|[-_])/i.test(label);
+}
 
 type SidebarV2StatusInput = Pick<
   SidebarThreadSummary,

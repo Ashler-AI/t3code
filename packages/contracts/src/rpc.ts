@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
+import { ThreadId } from "./baseSchemas.ts";
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AuthAccessStreamError,
@@ -59,6 +60,18 @@ import {
   OrchestrationRpcSchemas,
 } from "./orchestration.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import {
+  OmpAccountAssignment,
+  OmpAccountOperationError,
+  OmpAccountOverview,
+  OmpAccountRef,
+  OmpLoginChallenge,
+} from "./ompAccounts.ts";
+import {
+  ScaffoldEnvironmentBinding,
+  ScaffoldLifecycleError,
+  ScaffoldPauseInput,
+} from "./scaffold.ts";
 import {
   RelayClientInstallFailedError,
   RelayClientInstallProgressEventSchema,
@@ -219,6 +232,19 @@ export const WS_METHODS = {
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverSignalProcess: "server.signalProcess",
 
+  // OMP subscription accounts and plan usage
+  ompAccountsGetSnapshot: "ompAccounts.getSnapshot",
+  ompAccountsGetAssignment: "ompAccounts.getAssignment",
+  ompAccountsRefresh: "ompAccounts.refresh",
+  ompAccountsBeginLogin: "ompAccounts.beginLogin",
+  ompAccountsRespondLogin: "ompAccounts.respondLogin",
+  ompAccountsCancelLogin: "ompAccounts.cancelLogin",
+  ompAccountsRemove: "ompAccounts.remove",
+
+  // Managed Scaffold lifecycle. This method executes on the local T3 server;
+  // browser clients never call the Scaffold control plane directly.
+  scaffoldPause: "scaffold.pause",
+
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
@@ -332,6 +358,58 @@ export const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess,
   payload: ServerSignalProcessInput,
   success: ServerSignalProcessResult,
   error: EnvironmentAuthorizationError,
+});
+
+export const WsOmpAccountsGetSnapshotRpc = Rpc.make(WS_METHODS.ompAccountsGetSnapshot, {
+  payload: Schema.Struct({}),
+  success: OmpAccountOverview,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsOmpAccountsGetAssignmentRpc = Rpc.make(WS_METHODS.ompAccountsGetAssignment, {
+  payload: Schema.Struct({ threadId: ThreadId }),
+  success: OmpAccountAssignment,
+  error: Schema.Union([OmpAccountOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsOmpAccountsRefreshRpc = Rpc.make(WS_METHODS.ompAccountsRefresh, {
+  payload: Schema.Struct({}),
+  success: OmpAccountOverview,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsOmpAccountsBeginLoginRpc = Rpc.make(WS_METHODS.ompAccountsBeginLogin, {
+  payload: Schema.Struct({ provider: Schema.Literals(["openai", "anthropic"]) }),
+  success: OmpLoginChallenge,
+  error: Schema.Union([OmpAccountOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsOmpAccountsRespondLoginRpc = Rpc.make(WS_METHODS.ompAccountsRespondLogin, {
+  payload: Schema.Struct({
+    provider: Schema.Literals(["openai", "anthropic"]),
+    flowId: Schema.String,
+    response: Schema.String,
+  }),
+  success: OmpLoginChallenge,
+  error: Schema.Union([OmpAccountOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsOmpAccountsCancelLoginRpc = Rpc.make(WS_METHODS.ompAccountsCancelLogin, {
+  payload: Schema.Struct({ flowId: Schema.String }),
+  success: Schema.Void,
+  error: Schema.Union([OmpAccountOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsOmpAccountsRemoveRpc = Rpc.make(WS_METHODS.ompAccountsRemove, {
+  payload: Schema.Struct({ accountRef: OmpAccountRef }),
+  success: Schema.Void,
+  error: Schema.Union([OmpAccountOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsScaffoldPauseRpc = Rpc.make(WS_METHODS.scaffoldPause, {
+  payload: ScaffoldPauseInput,
+  success: ScaffoldEnvironmentBinding,
+  error: Schema.Union([ScaffoldLifecycleError, EnvironmentAuthorizationError]),
 });
 
 export const WsCloudGetRelayClientStatusRpc = Rpc.make(WS_METHODS.cloudGetRelayClientStatus, {
@@ -713,6 +791,14 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerSignalProcessRpc,
+  WsOmpAccountsGetSnapshotRpc,
+  WsOmpAccountsGetAssignmentRpc,
+  WsOmpAccountsRefreshRpc,
+  WsOmpAccountsBeginLoginRpc,
+  WsOmpAccountsRespondLoginRpc,
+  WsOmpAccountsCancelLoginRpc,
+  WsOmpAccountsRemoveRpc,
+  WsScaffoldPauseRpc,
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsSourceControlLookupRepositoryRpc,

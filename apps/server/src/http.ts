@@ -3,6 +3,8 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
+  ScaffoldLifecycleError,
+  ScaffoldPrepareConnectionInput,
 } from "@t3tools/contracts";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
@@ -37,10 +39,17 @@ import {
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
+import { makeScaffoldLifecycleService } from "./scaffold/ScaffoldLifecycleService.ts";
+import * as Schema from "effect/Schema";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
+const scaffoldLifecycle = makeScaffoldLifecycleService();
+const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
+const decodeScaffoldPrepareConnectionInput = Schema.decodeUnknownEffect(
+  ScaffoldPrepareConnectionInput,
+);
 
 export const browserApiCorsLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -160,6 +169,57 @@ export const otlpTracesProxyRouteLayer = HttpRouter.add(
           HttpServerResponse.text("Trace export failed.", { status: 502 }),
         ),
       );
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
+  ),
+);
+
+/**
+ * Local lifecycle-only coordinator seam. The response contains one short-lived
+ * bootstrap credential; subsequent descriptor, token, HTTP, and websocket
+ * traffic goes directly from the browser to the sandbox.
+ */
+export const scaffoldPrepareConnectionRouteLayer = HttpRouter.add(
+  "POST",
+  "/api/scaffold/connection",
+  Effect.gen(function* () {
+    yield* authenticateRawRouteWithScope(AuthOrchestrationOperateScope);
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const input = yield* decodeScaffoldPrepareConnectionInput(yield* request.json).pipe(
+      Effect.option,
+    );
+    if (Option.isNone(input)) {
+      return HttpServerResponse.jsonUnsafe({ error: "scaffold_invalid_request" }, { status: 400 });
+    }
+    return yield* Effect.tryPromise(() => scaffoldLifecycle.prepare(input.value)).pipe(
+      Effect.map((prepared) =>
+        HttpServerResponse.jsonUnsafe(prepared, {
+          status: 200,
+          headers: { "cache-control": "no-store" },
+        }),
+      ),
+      Effect.catch((error) => {
+        const lifecycleError = isScaffoldLifecycleError(error)
+          ? error
+          : new ScaffoldLifecycleError({
+              reason: "unavailable",
+              message: "Scaffold lifecycle request failed.",
+              status: 503,
+              code: "scaffold_unexpected_error",
+            });
+        const status = lifecycleError.status >= 400 ? lifecycleError.status : 503;
+        return Effect.succeed(
+          HttpServerResponse.jsonUnsafe(lifecycleError, {
+            status,
+            headers: { "cache-control": "no-store" },
+          }),
+        );
+      }),
+    );
   }).pipe(
     Effect.catchTags({
       EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,

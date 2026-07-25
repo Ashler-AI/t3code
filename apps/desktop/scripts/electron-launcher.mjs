@@ -1,4 +1,4 @@
-// This file mostly exists because we want dev mode to say "T3 Code (Dev)" instead of "electron"
+// This file mostly exists so dev mode uses the product name instead of "electron".
 
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
@@ -6,6 +6,7 @@ import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
+import productManifest from "../../../ashler/product.json" with { type: "json" };
 import { ensureElectronRuntime } from "./ensure-electron-runtime.mjs";
 
 const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
@@ -15,11 +16,19 @@ const repoRoot = NodePath.resolve(desktopDir, "..", "..");
 const devBundleIdSuffix = NodePath.basename(repoRoot)
   .toLowerCase()
   .replaceAll(/[^a-z0-9]+/g, "");
-export const APP_DISPLAY_NAME = isDevelopment ? "T3 Code (Dev)" : "T3 Code (Alpha)";
+export const APP_DISPLAY_NAME = isDevelopment
+  ? `${productManifest.productName} (Dev)`
+  : productManifest.productName;
 export const APP_BUNDLE_ID = isDevelopment
-  ? `com.t3tools.t3code.dev.${devBundleIdSuffix || "local"}`
-  : "com.t3tools.t3code";
-const APP_PROTOCOL_SCHEMES = isDevelopment ? ["t3code-dev"] : ["t3code"];
+  ? `${productManifest.bundleIdentifiers.desktop}.dev.${devBundleIdSuffix || "local"}`
+  : productManifest.bundleIdentifiers.desktop;
+const APP_HELPER_BUNDLE_ID = isDevelopment
+  ? `${productManifest.bundleIdentifiers.desktopHelper}.dev.${devBundleIdSuffix || "local"}`
+  : productManifest.bundleIdentifiers.desktopHelper;
+const [productionProtocolScheme] = productManifest.urlSchemes;
+const APP_PROTOCOL_SCHEMES = isDevelopment
+  ? [`${productionProtocolScheme}-dev`]
+  : [productionProtocolScheme];
 const LAUNCHER_VERSION = 14;
 const defaultIconPath = NodePath.join(desktopDir, "resources", "icon.icns");
 const developmentMacIconPngPath = NodePath.join(
@@ -241,10 +250,10 @@ function patchMainBundleInfoPlist(appBundlePath, iconPath, executableName) {
 
 function patchHelperBundleInfoPlists(appBundlePath) {
   const helperBundleNames = [
-    ["Electron Helper.app", "helper", `${APP_DISPLAY_NAME} Helper`],
-    ["Electron Helper (GPU).app", "helper.gpu", `${APP_DISPLAY_NAME} Helper (GPU)`],
-    ["Electron Helper (Plugin).app", "helper.plugin", `${APP_DISPLAY_NAME} Helper (Plugin)`],
-    ["Electron Helper (Renderer).app", "helper.renderer", `${APP_DISPLAY_NAME} Helper (Renderer)`],
+    ["Electron Helper.app", "", `${APP_DISPLAY_NAME} Helper`],
+    ["Electron Helper (GPU).app", ".gpu", `${APP_DISPLAY_NAME} Helper (GPU)`],
+    ["Electron Helper (Plugin).app", ".plugin", `${APP_DISPLAY_NAME} Helper (Plugin)`],
+    ["Electron Helper (Renderer).app", ".renderer", `${APP_DISPLAY_NAME} Helper (Renderer)`],
   ];
 
   for (const [bundleName, bundleIdentifierSuffix, bundleDisplayName] of helperBundleNames) {
@@ -265,7 +274,7 @@ function patchHelperBundleInfoPlists(appBundlePath) {
     setPlistString(
       infoPlistPath,
       "CFBundleIdentifier",
-      `${APP_BUNDLE_ID}.${bundleIdentifierSuffix}`,
+      `${APP_HELPER_BUNDLE_ID}${bundleIdentifierSuffix}`,
     );
   }
 }
@@ -346,7 +355,7 @@ function buildMacLauncher(electronBinaryPath) {
   if (isDevelopment) {
     // Keep Electron's native executable inside the branded bundle. Launching the
     // node_modules copy makes macOS associate the process (and Dock label) with
-    // Electron.app even though this bundle's Info.plist has the T3 Code name.
+    // Electron.app even though this bundle's Info.plist has the product name.
     // Its conventional executable name also keeps Electron's default-app runtime
     // in development mode instead of making app.isPackaged report true.
     writeDevelopmentLauncherScript(launcherBinaryPath, runtimeElectronBinaryPath);

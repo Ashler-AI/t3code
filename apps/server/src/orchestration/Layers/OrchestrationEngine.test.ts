@@ -2,14 +2,18 @@ import {
   CheckpointRef,
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  EnvironmentId,
+  EventId,
   MessageId,
   ProjectId,
   ThreadId,
   TurnId,
   type OrchestrationEvent,
   ProviderInstanceId,
+  RuntimeSessionId,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -17,6 +21,7 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { describe, expect, it } from "vite-plus/test";
 
 import { PersistenceSqlError } from "../../persistence/Errors.ts";
@@ -27,6 +32,10 @@ import {
   OrchestrationEventStore,
   type OrchestrationEventStoreShape,
 } from "../../persistence/Services/OrchestrationEventStore.ts";
+import {
+  OrchestrationCommandReceiptRepository,
+  type OrchestrationCommandReceipt,
+} from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
@@ -45,6 +54,35 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
 const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(value);
 
 async function createOrchestrationSystem() {
+  let committedTransactionCount = 0;
+  const InstrumentedSqlClient = Layer.effect(
+    SqlClient.SqlClient,
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const withTransaction: SqlClient.SqlClient["withTransaction"] = (effect) =>
+        Effect.flatMap(Effect.serviceOption(sql.transactionService), (transaction) =>
+          sql.withTransaction(effect).pipe(
+            Effect.tap(() =>
+              Option.isNone(transaction)
+                ? Effect.sync(() => {
+                    committedTransactionCount += 1;
+                  })
+                : Effect.void,
+            ),
+          ),
+        );
+
+      return new Proxy(sql, {
+        apply: (target, thisArg, argumentsList) => Reflect.apply(target, thisArg, argumentsList),
+        get: (target, property, receiver) =>
+          property === "withTransaction"
+            ? withTransaction
+            : property === "safe"
+              ? receiver
+              : Reflect.get(target, property, receiver),
+      });
+    }),
+  ).pipe(Layer.provide(SqlitePersistenceMemory));
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
   });
@@ -56,21 +94,70 @@ async function createOrchestrationSystem() {
     OrchestrationProjectionSnapshotQueryLive,
   ).pipe(
     Layer.provide(OrchestrationEventStoreLive),
-    Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+    Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
-    Layer.provide(SqlitePersistenceMemory),
+    Layer.provide(InstrumentedSqlClient),
     Layer.provideMerge(ServerConfigLayer),
     Layer.provideMerge(NodeServices.layer),
   );
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
+  const commandReceipts = await runtime.runPromise(
+    Effect.service(OrchestrationCommandReceiptRepository),
+  );
   return {
+    committedTransactionCount: () => committedTransactionCount,
     engine,
+    getCommandReceipt: (commandId: CommandId) => commandReceipts.getByCommandId({ commandId }),
+    queryReadModel: () => snapshotQuery.getSnapshot(),
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
   };
+}
+
+type OrchestrationSystem = Awaited<ReturnType<typeof createOrchestrationSystem>>;
+
+async function createProjectAndThread(system: OrchestrationSystem, key: string) {
+  const createdAt = now();
+  const projectId = asProjectId(`project-${key}`);
+  const threadId = ThreadId.make(`thread-${key}`);
+
+  await system.run(
+    system.engine.dispatch({
+      type: "project.create",
+      commandId: CommandId.make(`cmd-project-${key}-create`),
+      projectId,
+      title: `Project ${key}`,
+      workspaceRoot: `/tmp/project-${key}`,
+      defaultModelSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5-codex",
+      },
+      createdAt,
+    }),
+  );
+  await system.run(
+    system.engine.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`cmd-thread-${key}-create`),
+      threadId,
+      projectId,
+      title: `Thread ${key}`,
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5-codex",
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      branch: null,
+      worktreePath: null,
+      createdAt,
+    }),
+  );
+
+  return { createdAt, projectId, threadId } as const;
 }
 
 function now() {
@@ -478,6 +565,218 @@ describe("OrchestrationEngine", () => {
     );
 
     expect(eventTypes).toEqual(["thread.created", "thread.meta-updated"]);
+    await system.dispose();
+  });
+
+  it("streams domain events only after the event, projection, and command receipt are queryable", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const { threadId } = await createProjectAndThread(system, "stream-commit");
+    const commandId = CommandId.make("cmd-thread-stream-commit-update");
+    const updatedTitle = "Committed before stream";
+    const canonicalMetadata: OrchestrationEvent["metadata"] = {
+      providerEventId: EventId.make("omp:session-stream-commit:7"),
+      providerEnvironmentId: EnvironmentId.make("environment-stream-commit"),
+      providerThreadId: threadId,
+      providerSourceSequence: 7,
+      providerResumeCursor: {
+        kind: "omp",
+        schemaVersion: 3,
+        sessionId: RuntimeSessionId.make("session-stream-commit"),
+        eventSequence: 7,
+      },
+      providerInstanceId: ProviderInstanceId.make("omp"),
+      providerRuntimeSessionId: RuntimeSessionId.make("session-stream-commit"),
+    };
+
+    const result = await system.run(
+      Effect.gen(function* () {
+        const subscriberReady = yield* Deferred.make<void>();
+        const observations = yield* Queue.unbounded<{
+          committedTransactionCount: number;
+          event: OrchestrationEvent;
+          persistedEvents: ReadonlyArray<OrchestrationEvent>;
+          readModel: Awaited<ReturnType<typeof system.readModel>>;
+          receipt: Option.Option<OrchestrationCommandReceipt>;
+        }>();
+
+        yield* Effect.forkScoped(
+          engine.streamDomainEvents.pipe(
+            Stream.filter((event) => event.commandId === commandId),
+            Stream.take(1),
+            Stream.onStart(Deferred.succeed(subscriberReady, undefined)),
+            Stream.runForEach((event) =>
+              Effect.gen(function* () {
+                const committedTransactionCount = system.committedTransactionCount();
+                const persistedEvents = yield* Stream.runCollect(
+                  engine.readEvents(event.sequence - 1, 1),
+                ).pipe(Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)));
+                const readModel = yield* system.queryReadModel();
+                const receipt = yield* system.getCommandReceipt(commandId);
+                yield* Queue.offer(observations, {
+                  committedTransactionCount,
+                  event,
+                  persistedEvents,
+                  readModel,
+                  receipt,
+                });
+              }),
+            ),
+          ),
+        );
+        yield* Deferred.await(subscriberReady);
+        yield* Effect.yieldNow;
+
+        const committedTransactionCountBeforeDispatch = system.committedTransactionCount();
+        const dispatchResult = yield* engine.dispatch(
+          {
+            type: "thread.meta.update",
+            commandId,
+            threadId,
+            title: updatedTitle,
+          },
+          { metadata: canonicalMetadata },
+        );
+        const observation = yield* Queue.take(observations);
+        return { committedTransactionCountBeforeDispatch, dispatchResult, observation } as const;
+      }).pipe(Effect.scoped),
+    );
+
+    expect(result.observation.event.type).toBe("thread.meta-updated");
+    expect(result.observation.committedTransactionCount).toBeGreaterThan(
+      result.committedTransactionCountBeforeDispatch,
+    );
+    expect(result.observation.event.sequence).toBe(result.dispatchResult.sequence);
+    expect(result.observation.event.metadata).toEqual(canonicalMetadata);
+    expect(result.observation.persistedEvents).toEqual([result.observation.event]);
+    expect(result.observation.readModel.snapshotSequence).toBe(result.dispatchResult.sequence);
+    expect(
+      result.observation.readModel.threads.find((thread) => thread.id === threadId)?.title,
+    ).toBe(updatedTitle);
+    expect(Option.isSome(result.observation.receipt)).toBe(true);
+    if (Option.isSome(result.observation.receipt)) {
+      expect(result.observation.receipt.value).toMatchObject({
+        commandId,
+        status: "accepted",
+        resultSequence: result.dispatchResult.sequence,
+      });
+    }
+
+    await system.dispose();
+  });
+
+  it("returns the original result for an identical commandId without a second event or projection side effect", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const { threadId } = await createProjectAndThread(system, "command-dedup");
+    const commandId = CommandId.make("cmd-thread-command-dedup-update");
+    const updatedTitle = "Updated once";
+    const command = {
+      type: "thread.meta.update" as const,
+      commandId,
+      threadId,
+      title: updatedTitle,
+    };
+    const barrierCommandId = CommandId.make("cmd-thread-command-dedup-barrier");
+
+    const result = await system.run(
+      Effect.gen(function* () {
+        const subscriberReady = yield* Deferred.make<void>();
+        const streamedEvents = yield* Queue.unbounded<OrchestrationEvent>();
+        yield* Effect.forkScoped(
+          engine.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) => event.commandId === commandId || event.commandId === barrierCommandId,
+            ),
+            Stream.onStart(Deferred.succeed(subscriberReady, undefined)),
+            Stream.runForEach((event) => Queue.offer(streamedEvents, event).pipe(Effect.asVoid)),
+          ),
+        );
+        yield* Deferred.await(subscriberReady);
+        yield* Effect.yieldNow;
+
+        const firstResult = yield* engine.dispatch(command);
+        const firstStreamEvent = yield* Queue.take(streamedEvents);
+        const readModelAfterFirst = yield* system.queryReadModel();
+        const duplicateResult = yield* engine.dispatch(command);
+        const readModelAfterDuplicate = yield* system.queryReadModel();
+        yield* engine.dispatch({
+          type: "thread.meta.update",
+          commandId: barrierCommandId,
+          threadId,
+          title: "Deduplication stream barrier",
+        });
+        const nextStreamEvent = yield* Queue.take(streamedEvents);
+        const trailingStreamEvent = yield* Queue.poll(streamedEvents);
+        const persistedEvents = yield* Stream.runCollect(engine.readEvents(0)).pipe(
+          Effect.map((chunk): OrchestrationEvent[] =>
+            Array.from(chunk).filter((event) => event.commandId === commandId),
+          ),
+        );
+        const receipt = yield* system.getCommandReceipt(commandId);
+        return {
+          duplicateResult,
+          firstResult,
+          firstStreamEvent,
+          nextStreamEvent,
+          persistedEvents,
+          readModelAfterDuplicate,
+          readModelAfterFirst,
+          receipt,
+          trailingStreamEvent,
+        } as const;
+      }).pipe(Effect.scoped),
+    );
+
+    expect(result.duplicateResult).toEqual(result.firstResult);
+    expect(result.firstStreamEvent.sequence).toBe(result.firstResult.sequence);
+    expect(result.nextStreamEvent.commandId).toBe(barrierCommandId);
+    expect(Option.isNone(result.trailingStreamEvent)).toBe(true);
+    expect(result.persistedEvents).toEqual([result.firstStreamEvent]);
+    const projectedThreadAfterFirst = result.readModelAfterFirst.threads.find(
+      (thread) => thread.id === threadId,
+    );
+    const projectedThreadAfterDuplicate = result.readModelAfterDuplicate.threads.find(
+      (thread) => thread.id === threadId,
+    );
+    expect(projectedThreadAfterDuplicate).toEqual(projectedThreadAfterFirst);
+    expect(projectedThreadAfterDuplicate?.title).toBe(updatedTitle);
+    expect(Option.isSome(result.receipt)).toBe(true);
+    if (Option.isSome(result.receipt)) {
+      expect(result.receipt.value.resultSequence).toBe(result.firstResult.sequence);
+    }
+
+    await system.dispose();
+  });
+
+  // Receipts currently persist only commandId and outcome metadata, not a canonical
+  // command payload fingerprint. Unskip once payload identity is stored and checked
+  // atomically with the accepted receipt.
+  it.skip("rejects reuse of a commandId with a different payload", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const { threadId } = await createProjectAndThread(system, "command-payload-conflict");
+    const commandId = CommandId.make("cmd-thread-command-payload-conflict-update");
+
+    await system.run(
+      engine.dispatch({
+        type: "thread.meta.update",
+        commandId,
+        threadId,
+        title: "First payload",
+      }),
+    );
+    await expect(
+      system.run(
+        engine.dispatch({
+          type: "thread.meta.update",
+          commandId,
+          threadId,
+          title: "Conflicting payload",
+        }),
+      ),
+    ).rejects.toThrow(/command.*payload|payload.*command/i);
+
     await system.dispose();
   });
 

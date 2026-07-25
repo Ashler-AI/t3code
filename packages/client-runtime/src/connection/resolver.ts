@@ -28,10 +28,16 @@ import type {
   PreparedConnection,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
+  SessionFabricConnectionTarget,
   SshConnectionTarget,
 } from "./model.ts";
 import { ConnectionBlockedError, type ConnectionAttemptError } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
+import {
+  prepareManagedScaffoldConnection,
+  ScaffoldLifecycleGateway,
+  scaffoldTargetFromBinding,
+} from "../scaffold/managedConnection.ts";
 
 export class ConnectionResolver extends Context.Service<
   ConnectionResolver,
@@ -241,11 +247,65 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
   });
 });
 
+const makeScaffoldBroker = Effect.fn("clientRuntime.connection.broker.makeScaffold")(function* () {
+  const gateway = yield* Effect.serviceOption(ScaffoldLifecycleGateway);
+  const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+  return Effect.fn("clientRuntime.connection.broker.scaffold")(function* (
+    target: import("./model.ts").ScaffoldConnectionTarget,
+  ) {
+    if (Option.isNone(gateway)) {
+      return yield* new ConnectionBlockedError({
+        reason: "unsupported",
+        detail: "Scaffold environments are unavailable in this client.",
+      });
+    }
+    const prepared = yield* prepareManagedScaffoldConnection({
+      prepare: gateway.value.prepare(target),
+      targetForBinding: (binding) => scaffoldTargetFromBinding(binding, target.label),
+    }).pipe(
+      Effect.provideService(RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization, remote),
+    );
+    return prepared.connection;
+  });
+});
+
+export function prepareSessionFabricConnection(
+  target: SessionFabricConnectionTarget,
+): Effect.Effect<PreparedConnection, ConnectionBlockedError> {
+  return Effect.try({
+    try: () => {
+      const httpBaseUrl = new URL(target.relayBaseUrl);
+      if (httpBaseUrl.protocol !== "http:" && httpBaseUrl.protocol !== "https:") {
+        throw new Error("Session fabric Relay URLs must use http or https.");
+      }
+      const socketUrl = new URL(httpBaseUrl);
+      socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
+      socketUrl.pathname = `${socketUrl.pathname.replace(/\/$/, "")}/v1/session-fabric/sessions/${encodeURIComponent(target.sessionId)}/connect`;
+      socketUrl.search = "";
+      socketUrl.hash = "";
+      return {
+        environmentId: target.environmentId,
+        label: target.label,
+        httpBaseUrl: httpBaseUrl.toString(),
+        socketUrl: socketUrl.toString(),
+        httpAuthorization: null,
+        target,
+      } satisfies PreparedConnection;
+    },
+    catch: (cause) =>
+      new ConnectionBlockedError({
+        reason: "configuration",
+        detail: cause instanceof Error ? cause.message : "The session fabric Relay URL is invalid.",
+      }),
+  });
+}
+
 export const make = Effect.gen(function* () {
   const primary = yield* makePrimaryBroker();
   const bearer = yield* makeBearerBroker();
   const relay = yield* makeRelayBroker();
   const ssh = yield* makeSshBroker();
+  const scaffold = yield* makeScaffoldBroker();
 
   const prepare = Effect.fn("clientRuntime.connection.broker.prepare")(function* (
     entry: ConnectionCatalogEntry,
@@ -262,8 +322,12 @@ export const make = Effect.gen(function* () {
         return yield* bearer({ ...entry, target });
       case "RelayConnectionTarget":
         return yield* relay(target);
+      case "SessionFabricConnectionTarget":
+        return yield* prepareSessionFabricConnection(target);
       case "SshConnectionTarget":
         return yield* ssh({ ...entry, target });
+      case "ScaffoldConnectionTarget":
+        return yield* scaffold(target);
     }
   });
 

@@ -660,6 +660,9 @@ describe("workEntryIndicatesToolFailure", () => {
       }),
     ).toBe(false);
     expect(workEntryIndicatesToolSuccess({ ...base, tone: "thinking", detail: "…" })).toBe(false);
+    expect(workEntryIndicatesToolNeutralStatus({ ...base, tone: "thinking", detail: "…" })).toBe(
+      false,
+    );
     expect(
       workEntryIndicatesToolNeutralStatus({
         ...base,
@@ -691,6 +694,66 @@ describe("workEntryIndicatesToolFailure", () => {
 });
 
 describe("deriveWorkLogEntries", () => {
+  it("coalesces adjacent reasoning deltas from one item into one live entry", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "reasoning-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "reasoning.delta",
+        summary: "Thinking",
+        tone: "info",
+        turnId: "turn-1",
+        payload: { reasoningItemId: "item-1", detail: "Inspecting " },
+      }),
+      makeActivity({
+        id: "reasoning-2",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "reasoning.delta",
+        summary: "Thinking",
+        tone: "info",
+        turnId: "turn-1",
+        payload: { reasoningItemId: "item-1", detail: "the repository." },
+      }),
+    ];
+
+    expect(deriveWorkLogEntries(activities)).toEqual([
+      expect.objectContaining({
+        id: "reasoning-1",
+        label: "Thinking",
+        tone: "thinking",
+        detail: "Inspecting the repository.",
+        sourceActivityKind: "reasoning.delta",
+      }),
+    ]);
+  });
+
+  it("keeps separate reasoning items distinct", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "reasoning-1",
+        kind: "reasoning.delta",
+        summary: "Thinking",
+        tone: "info",
+        turnId: "turn-1",
+        payload: { reasoningItemId: "item-1", detail: "First thought." },
+      }),
+      makeActivity({
+        id: "reasoning-2",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "reasoning.delta",
+        summary: "Thinking",
+        tone: "info",
+        turnId: "turn-1",
+        payload: { reasoningItemId: "item-2", detail: "Second thought." },
+      }),
+    ];
+
+    expect(deriveWorkLogEntries(activities).map((entry) => entry.detail)).toEqual([
+      "First thought.",
+      "Second thought.",
+    ]);
+  });
+
   it("omits tool started entries and keeps completed entries", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
@@ -738,6 +801,50 @@ describe("deriveWorkLogEntries", () => {
 
     const entries = deriveWorkLogEntries(activities);
     expect(entries.map((entry) => entry.id)).toEqual(["task-progress", "task-complete"]);
+  });
+
+  it("collapses subagent task events and preserves task, model, effort, and status", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "subagent-started",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "task.started",
+        summary: "Task started",
+        payload: {
+          taskId: "agent-1",
+          taskType: "subagent",
+          detail: "Review the authentication changes",
+          model: "gpt-5.6-terra",
+          effort: "high",
+        },
+      }),
+      makeActivity({
+        id: "subagent-progress",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "task.progress",
+        summary: "Reviewing",
+        payload: { taskId: "agent-1", detail: "Checking OAuth boundaries" },
+      }),
+      makeActivity({
+        id: "subagent-completed",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "task.completed",
+        summary: "Task completed",
+        payload: { taskId: "agent-1", status: "completed", summary: "Review complete" },
+      }),
+    ];
+
+    expect(deriveWorkLogEntries(activities)).toEqual([
+      expect.objectContaining({
+        id: "subagent-completed",
+        taskId: "agent-1",
+        taskType: "subagent",
+        subagentTask: "Review the authentication changes",
+        subagentModel: "gpt-5.6-terra",
+        subagentEffort: "high",
+        subagentStatus: "completed",
+      }),
+    ]);
   });
 
   it("uses payload summary as label for task entries when available", () => {

@@ -8,6 +8,7 @@
  */
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
+import type { ProviderRuntimeEventEnvelope } from "@t3tools/contracts";
 import type * as Scope from "effect/Scope";
 
 /**
@@ -30,6 +31,9 @@ export interface ProviderRuntimeIngestionShape {
    * Intended for test use to replace timing-sensitive sleeps.
    */
   readonly drain: Effect.Effect<void>;
+  readonly ingestCanonical?: (
+    envelope: ProviderRuntimeEventEnvelope,
+  ) => Effect.Effect<void, unknown>;
 }
 
 /**

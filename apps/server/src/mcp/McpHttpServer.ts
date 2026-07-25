@@ -22,6 +22,13 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import * as SessionReferenceAuthority from "./toolkits/session-references/authority.ts";
+import { SessionReferenceToolkitHandlersLive } from "./toolkits/session-references/handlers.ts";
+import {
+  SessionMessageSendTool,
+  SessionReferenceResolveTool,
+  SessionReferenceToolkit,
+} from "./toolkits/session-references/tools.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -208,10 +215,134 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
   PreviewSnapshotRegistrationLive,
 );
 
+const sessionReferenceFailure = <E>(operation: "resolve" | "send", cause: Cause.Cause<E>) => {
+  if (Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason)) {
+    return Effect.failCause(cause).pipe(Effect.orDie);
+  }
+  const firstFailure = cause.reasons.find(Cause.isFailReason)?.error;
+  const reason =
+    typeof firstFailure === "object" &&
+    firstFailure !== null &&
+    "_tag" in firstFailure &&
+    firstFailure._tag === "SessionReferenceToolError" &&
+    "reason" in firstFailure &&
+    typeof firstFailure.reason === "string"
+      ? firstFailure.reason
+      : "unknown";
+  return Effect.succeed(
+    new McpSchema.CallToolResult({
+      isError: true,
+      structuredContent: {
+        error: { _tag: "SessionReferenceToolError", operation, reason },
+      },
+      content: [{ type: "text", text: `Session reference ${operation} failed: ${reason}.` }],
+    }),
+  );
+};
+
+const sessionReferenceAnnotations = (tool: Tool.Any) => ({
+  ...Context.getOption(tool.annotations, Tool.Title).pipe(
+    Option.map((title) => ({ title })),
+    Option.getOrUndefined,
+  ),
+  readOnlyHint: Context.get(tool.annotations, Tool.Readonly),
+  destructiveHint: Context.get(tool.annotations, Tool.Destructive),
+  idempotentHint: Context.get(tool.annotations, Tool.Idempotent),
+  openWorldHint: Context.get(tool.annotations, Tool.OpenWorld),
+});
+
+const registerSessionReferenceTools = Effect.fn("McpHttpServer.registerSessionReferenceTools")(
+  function* () {
+    const server = yield* McpServer.McpServer;
+    const authority = yield* SessionReferenceAuthority.SessionReferenceAuthority;
+    const built = yield* SessionReferenceToolkit;
+
+    yield* server.addTool({
+      tool: new McpSchema.Tool({
+        name: SessionReferenceResolveTool.name,
+        description: Tool.getDescription(SessionReferenceResolveTool),
+        inputSchema: Tool.getJsonSchema(SessionReferenceResolveTool),
+        annotations: sessionReferenceAnnotations(SessionReferenceResolveTool),
+      }),
+      annotations: SessionReferenceResolveTool.annotations,
+      handle: (payload) =>
+        Effect.withFiber((fiber) => {
+          const invocation = Context.getUnsafe(
+            fiber.context,
+            McpInvocationContext.McpInvocationContext,
+          );
+          return built.handle("session_reference_resolve", payload).pipe(
+            Stream.unwrap,
+            Stream.run(Sink.last()),
+            Effect.flatMap(Effect.fromOption),
+            Effect.provideService(SessionReferenceAuthority.SessionReferenceAuthority, authority),
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.matchCauseEffect({
+              onFailure: (cause) => sessionReferenceFailure("resolve", cause),
+              onSuccess: ({ encodedResult }) =>
+                Effect.succeed(
+                  new McpSchema.CallToolResult({
+                    isError: false,
+                    structuredContent: encodedResult,
+                    content: [{ type: "text", text: JSON.stringify(encodedResult) }],
+                  }),
+                ),
+            }),
+          );
+        }),
+    });
+
+    yield* server.addTool({
+      tool: new McpSchema.Tool({
+        name: SessionMessageSendTool.name,
+        description: Tool.getDescription(SessionMessageSendTool),
+        inputSchema: Tool.getJsonSchema(SessionMessageSendTool),
+        annotations: sessionReferenceAnnotations(SessionMessageSendTool),
+      }),
+      annotations: SessionMessageSendTool.annotations,
+      handle: (payload) =>
+        Effect.withFiber((fiber) => {
+          const invocation = Context.getUnsafe(
+            fiber.context,
+            McpInvocationContext.McpInvocationContext,
+          );
+          return built.handle("session_message_send", payload).pipe(
+            Stream.unwrap,
+            Stream.run(Sink.last()),
+            Effect.flatMap(Effect.fromOption),
+            Effect.provideService(SessionReferenceAuthority.SessionReferenceAuthority, authority),
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.matchCauseEffect({
+              onFailure: (cause) => sessionReferenceFailure("send", cause),
+              onSuccess: ({ encodedResult }) =>
+                Effect.succeed(
+                  new McpSchema.CallToolResult({
+                    isError: false,
+                    structuredContent: encodedResult,
+                    content: [{ type: "text", text: JSON.stringify(encodedResult) }],
+                  }),
+                ),
+            }),
+          );
+        }),
+    });
+  },
+);
+
+export const SessionReferenceToolkitRegistrationLive = Layer.effectDiscard(
+  registerSessionReferenceTools(),
+).pipe(Layer.provide(SessionReferenceToolkitHandlersLive));
+
+const SessionReferenceToolkitRegistrationWithAuthorityLive =
+  SessionReferenceToolkitRegistrationLive.pipe(Layer.provide(SessionReferenceAuthority.layer));
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
   path: "/mcp",
 }).pipe(Layer.provide(McpAuthMiddlewareLive));
 
-export const layer = PreviewToolkitRegistrationLive.pipe(Layer.provideMerge(McpTransportLive));
+export const layer = Layer.mergeAll(
+  PreviewToolkitRegistrationLive,
+  SessionReferenceToolkitRegistrationWithAuthorityLive,
+).pipe(Layer.provideMerge(McpTransportLive));

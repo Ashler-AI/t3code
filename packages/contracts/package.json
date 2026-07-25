@@ -18,6 +18,10 @@
     "./relay": {
       "types": "./src/relay.ts",
       "import": "./src/relay.ts"
+    },
+    "./session-fabric": {
+      "types": "./src/sessionFabric.ts",
+      "import": "./src/sessionFabric.ts"
     }
   },
   "scripts": {

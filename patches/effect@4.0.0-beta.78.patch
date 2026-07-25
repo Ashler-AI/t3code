@@ -320,3 +320,28 @@ index a3161eb..0cb81f3 100644
 -//# sourceMappingURL=RpcClient.js.map
 \ No newline at end of file
 +//# sourceMappingURL=RpcClient.js.map
+diff --git a/dist/unstable/rpc/RpcMessage.js b/dist/unstable/rpc/RpcMessage.js
+index 60b375a..64ac29e 100644
+--- a/dist/unstable/rpc/RpcMessage.js
++++ b/dist/unstable/rpc/RpcMessage.js
+@@ -5,7 +5,7 @@ import * as Schema from "../../Schema.js";
+  * @category request
+  * @since 4.0.0
+  */
+-export const RequestId = id => typeof id === "bigint" ? id : BigInt(id);
++export const RequestId = id => typeof id === "bigint" ? id : BigInt(/^[0-9a-f]+$/i.test(id) && /[a-f]/i.test(id) ? `0x${id}` : id);
+ /**
+  * Represents the reusable `Eof` message value.
+  *
+diff --git a/src/unstable/rpc/RpcMessage.ts b/src/unstable/rpc/RpcMessage.ts
+index a4562d1..9e2ecff 100644
+--- a/src/unstable/rpc/RpcMessage.ts
++++ b/src/unstable/rpc/RpcMessage.ts
+@@ -75,4 +75,6 @@ export type RequestId = Branded<bigint, "~effect/rpc/RpcMessage/RequestId">
+  * @since 4.0.0
+  */
+ export const RequestId = (id: bigint | string): RequestId =>
+-  typeof id === "bigint" ? id as RequestId : BigInt(id) as RequestId
++  typeof id === "bigint"
++    ? id as RequestId
++    : BigInt(/^[0-9a-f]+$/i.test(id) && /[a-f]/i.test(id) ? `0x${id}` : id) as RequestId

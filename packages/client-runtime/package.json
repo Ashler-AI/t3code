@@ -39,6 +39,14 @@
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"
     },
+    "./scaffold": {
+      "types": "./src/scaffold/index.ts",
+      "default": "./src/scaffold/index.ts"
+    },
+    "./session-source": {
+      "types": "./src/session-source/index.ts",
+      "default": "./src/session-source/index.ts"
+    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Logger from "effect/Logger";
@@ -18,6 +19,7 @@ import {
 import { resolveCatalogDependencies } from "../../../scripts/lib/resolve-catalog.ts";
 import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 import { fromYaml } from "@t3tools/shared/schemaYaml";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import serverPackageJson from "../package.json" with { type: "json" };
 import {
@@ -28,6 +30,11 @@ import {
   ServerCliPublishIconSourceMissingError,
   ServerCliPublishIconTargetMissingError,
 } from "./cliErrors.ts";
+import {
+  type TemporaryFileReplacement,
+  withTemporaryFileReplacements,
+  withTemporaryPackageStage,
+} from "./temporaryFileReplacements.ts";
 
 interface PackageJson {
   name: string;
@@ -42,11 +49,22 @@ interface PackageJson {
   engines: Record<string, string>;
   files: string[];
   dependencies: Record<string, string>;
-  overrides: Record<string, string>;
+  overrides?: Record<string, string>;
 }
 
 const PackageJsonPrettyJson = fromJsonStringPretty(Schema.Unknown);
 const encodePackageJson = Schema.encodeEffect(PackageJsonPrettyJson);
+const VerifyInstallPackageJson = Schema.Struct({ private: Schema.Literal(true) });
+const encodeVerifyInstallPackageJson = Schema.encodeEffect(
+  Schema.fromJsonString(VerifyInstallPackageJson),
+);
+const PackedArtifactDescriptor = Schema.Struct({
+  artifactPath: Schema.String,
+  sha256: Schema.String,
+});
+const encodePackedArtifactDescriptor = Schema.encodeEffect(
+  Schema.fromJsonString(PackedArtifactDescriptor),
+);
 
 const WorkspaceConfig = Schema.Struct({
   catalog: Schema.optional(Schema.Record(Schema.String, Schema.String)),
@@ -105,12 +123,64 @@ const preparePublishIcons = Effect.fn("preparePublishIcons")(function* (
   }
 
   return yield* Effect.forEach(icons, (icon) =>
-    Effect.all({
-      original: fs.readFile(icon.targetPath),
-      publish: fs.readFile(icon.sourcePath),
-    }).pipe(Effect.map((contents) => ({ ...icon, ...contents }))),
+    fs
+      .readFile(icon.sourcePath)
+      .pipe(Effect.map((publish) => ({ targetPath: icon.targetPath, publish }))),
   );
 });
+
+const assertBuildAssets = Effect.fn("assertBuildAssets")(function* (serverDir: string) {
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  for (const relPath of ["dist/bin.mjs", "dist/client/index.html"]) {
+    const abs = path.join(serverDir, relPath);
+    if (!(yield* fs.exists(abs))) {
+      return yield* new ServerCliBuildAssetMissingError({ assetPath: abs });
+    }
+  }
+});
+
+const prepareProductionPackageReplacements = Effect.fn("prepareProductionPackageReplacements")(
+  function* (repoRoot: string, serverDir: string, version: string, includeOverrides = true) {
+    const path = yield* Path.Path;
+    const workspaceConfig = yield* readWorkspaceConfig();
+    const workspaceCatalog = workspaceConfig.catalog ?? {};
+    const workspaceOverrides = workspaceConfig.overrides ?? {};
+    const pkg: PackageJson = {
+      name: serverPackageJson.name,
+      repository: serverPackageJson.repository,
+      bin: serverPackageJson.bin,
+      type: serverPackageJson.type,
+      version,
+      engines: serverPackageJson.engines,
+      files: serverPackageJson.files,
+      dependencies: resolveCatalogDependencies(
+        serverPackageJson.dependencies,
+        workspaceCatalog,
+        "apps/server",
+      ),
+      ...(includeOverrides
+        ? {
+            overrides: resolveCatalogDependencies(
+              workspaceOverrides,
+              workspaceCatalog,
+              "apps/server",
+            ),
+          }
+        : {}),
+    };
+    const packageJsonString = yield* encodePackageJson(pkg);
+    const icons = yield* preparePublishIcons(repoRoot, serverDir, version);
+    const replacements: TemporaryFileReplacement[] = [
+      {
+        path: path.join(serverDir, "package.json"),
+        contents: new TextEncoder().encode(`${packageJsonString}\n`),
+      },
+      ...icons.map((icon) => ({ path: icon.targetPath, contents: icon.publish })),
+    ];
+    return replacements;
+  },
+);
 
 const applyDevelopmentIconOverrides = Effect.fn("applyDevelopmentIconOverrides")(function* (
   repoRoot: string,
@@ -140,39 +210,60 @@ const applyDevelopmentIconOverrides = Effect.fn("applyDevelopmentIconOverrides")
 // build subcommand
 // ---------------------------------------------------------------------------
 
+const buildServer = Effect.fn("buildServer")(function* (verbose: boolean) {
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const repoRoot = yield* RepoRoot;
+  const serverDir = path.join(repoRoot, "apps/server");
+
+  yield* Effect.log("[cli] Running tsdown...");
+  yield* runCommand(
+    ChildProcess.make(process.execPath, ["--run", "build:bundle"], {
+      cwd: serverDir,
+      stdout: verbose ? "inherit" : "ignore",
+      stderr: "inherit",
+      shell: false,
+    }),
+  );
+
+  const webDist = path.join(repoRoot, "apps/web/dist");
+  const clientTarget = path.join(serverDir, "dist/client");
+
+  if (yield* fs.exists(webDist)) {
+    yield* fs.copy(webDist, clientTarget);
+    yield* applyDevelopmentIconOverrides(repoRoot, serverDir);
+    yield* Effect.log("[cli] Bundled web app into dist/client");
+  } else {
+    yield* Effect.logWarning("[cli] Web dist not found — skipping client bundle.");
+  }
+});
+
+const buildPackAssets = Effect.fn("buildPackAssets")(function* (verbose: boolean) {
+  const path = yield* Path.Path;
+  const repoRoot = yield* RepoRoot;
+  const webBuildCommand = yield* resolveSpawnCommand(path.join(repoRoot, "node_modules/.bin/vp"), [
+    "run",
+    "--filter",
+    "@t3tools/web",
+    "build",
+  ]);
+  yield* runCommand(
+    ChildProcess.make(webBuildCommand.command, webBuildCommand.args, {
+      cwd: repoRoot,
+      stdout: verbose ? "inherit" : "ignore",
+      stderr: "inherit",
+      shell: webBuildCommand.shell,
+    }),
+  );
+  yield* buildServer(verbose);
+});
+
 const buildCmd = Command.make(
   "build",
   {
     verbose: Flag.boolean("verbose").pipe(Flag.withDefault(false)),
   },
-  (config) =>
-    Effect.gen(function* () {
-      const path = yield* Path.Path;
-      const fs = yield* FileSystem.FileSystem;
-      const repoRoot = yield* RepoRoot;
-      const serverDir = path.join(repoRoot, "apps/server");
-
-      yield* Effect.log("[cli] Running tsdown...");
-      yield* runCommand(
-        ChildProcess.make(process.execPath, ["--run", "build:bundle"], {
-          cwd: serverDir,
-          stdout: config.verbose ? "inherit" : "ignore",
-          stderr: "inherit",
-          shell: false,
-        }),
-      );
-
-      const webDist = path.join(repoRoot, "apps/web/dist");
-      const clientTarget = path.join(serverDir, "dist/client");
-
-      if (yield* fs.exists(webDist)) {
-        yield* fs.copy(webDist, clientTarget);
-        yield* applyDevelopmentIconOverrides(repoRoot, serverDir);
-        yield* Effect.log("[cli] Bundled web app into dist/client");
-      } else {
-        yield* Effect.logWarning("[cli] Web dist not found — skipping client bundle.");
-      }
-    }),
+  (config) => buildServer(config.verbose),
 ).pipe(Command.withDescription("Build the server package (tsdown + bundle web client)."));
 
 // ---------------------------------------------------------------------------
@@ -217,60 +308,22 @@ const publishCmd = Command.make(
   (config) =>
     Effect.gen(function* () {
       const path = yield* Path.Path;
-      const fs = yield* FileSystem.FileSystem;
       const repoRoot = yield* RepoRoot;
       const serverDir = path.join(repoRoot, "apps/server");
-      const packageJsonPath = path.join(serverDir, "package.json");
+      yield* assertBuildAssets(serverDir);
+      const version = Option.getOrElse(config.appVersion, () => serverPackageJson.version);
+      const replacements = yield* prepareProductionPackageReplacements(
+        repoRoot,
+        serverDir,
+        version,
+      );
 
-      // Assert build assets exist
-      for (const relPath of ["dist/bin.mjs", "dist/client/index.html"]) {
-        const abs = path.join(serverDir, relPath);
-        if (!(yield* fs.exists(abs))) {
-          return yield* new ServerCliBuildAssetMissingError({ assetPath: abs });
-        }
-      }
-
-      yield* Effect.acquireUseRelease(
-        // Acquire: resolve publish metadata and read every original before mutation.
-        Effect.gen(function* () {
-          const version = Option.getOrElse(config.appVersion, () => serverPackageJson.version);
-          const workspaceConfig = yield* readWorkspaceConfig();
-          const workspaceCatalog = workspaceConfig.catalog ?? {};
-          const workspaceOverrides = workspaceConfig.overrides ?? {};
-          const pkg: PackageJson = {
-            name: serverPackageJson.name,
-            repository: serverPackageJson.repository,
-            bin: serverPackageJson.bin,
-            type: serverPackageJson.type,
-            version,
-            engines: serverPackageJson.engines,
-            files: serverPackageJson.files,
-            dependencies: resolveCatalogDependencies(
-              serverPackageJson.dependencies,
-              workspaceCatalog,
-              "apps/server",
-            ),
-            overrides: resolveCatalogDependencies(
-              workspaceOverrides,
-              workspaceCatalog,
-              "apps/server",
-            ),
-          };
-
-          return {
-            packageJsonString: yield* encodePackageJson(pkg),
-            originalPackageJson: yield* fs.readFile(packageJsonPath),
-            icons: yield* preparePublishIcons(repoRoot, serverDir, version),
-          };
-        }),
-        // Use: pnpm publish from the workspace root so pnpm-only workspace
-        // config, including override selectors, is interpreted correctly.
-        (resource) =>
+      yield* withTemporaryFileReplacements(
+        replacements,
+        // Publish from the workspace root so pnpm-only workspace config,
+        // including override selectors, is interpreted correctly.
+        () =>
           Effect.gen(function* () {
-            yield* fs.writeFileString(packageJsonPath, `${resource.packageJsonString}\n`);
-            for (const icon of resource.icons) {
-              yield* fs.writeFile(icon.targetPath, icon.publish);
-            }
             yield* Effect.log("[cli] Applied package metadata and publish icon overrides");
 
             const args = createVpPmPublishArgs(config);
@@ -286,26 +339,134 @@ const publishCmd = Command.make(
               }),
             );
           }),
-        // Release: restore every file even if applying overrides or publishing fails.
-        (resource) =>
-          Effect.gen(function* () {
-            yield* fs.writeFile(packageJsonPath, resource.originalPackageJson);
-            for (const icon of resource.icons) {
-              yield* fs.writeFile(icon.targetPath, icon.original);
-            }
-            if (config.verbose) yield* Effect.log("[cli] Restored original publish assets");
-          }),
       );
+      if (config.verbose) yield* Effect.log("[cli] Restored original publish assets");
     }),
 ).pipe(Command.withDescription("Publish the server package to npm."));
+
+// ---------------------------------------------------------------------------
+// pack subcommand
+// ---------------------------------------------------------------------------
+
+const sha256File = Effect.fn("sha256File")(function* (artifactPath: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const contents = yield* fs.readFile(artifactPath);
+  const digest = yield* Effect.promise(() => crypto.subtle.digest("SHA-256", contents));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+});
+
+const verifyPackedArtifact = Effect.fn("verifyPackedArtifact")(function* (artifactPath: string) {
+  const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
+  const hostPlatform = yield* HostProcessPlatform;
+  const installDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-server-pack-verify-" });
+  const installPackageJson = yield* encodeVerifyInstallPackageJson({ private: true });
+  yield* fs.writeFileString(path.join(installDir, "package.json"), `${installPackageJson}\n`);
+
+  const installCommand = yield* resolveSpawnCommand("npm", [
+    "install",
+    "--no-audit",
+    "--no-fund",
+    "--no-save",
+    artifactPath,
+  ]);
+  yield* runCommand(
+    ChildProcess.make(installCommand.command, installCommand.args, {
+      cwd: installDir,
+      stdout: "ignore",
+      stderr: "inherit",
+      shell: installCommand.shell,
+    }),
+  );
+
+  const binPath = path.join(
+    installDir,
+    "node_modules",
+    ".bin",
+    hostPlatform === "win32" ? "t3.cmd" : "t3",
+  );
+  if (!(yield* fs.exists(binPath))) {
+    return yield* new ServerCliBuildAssetMissingError({ assetPath: binPath });
+  }
+  yield* runCommand(
+    ChildProcess.make(binPath, ["--version"], {
+      cwd: installDir,
+      stdout: "ignore",
+      stderr: "inherit",
+      shell: hostPlatform === "win32",
+    }),
+  );
+});
+
+const packCmd = Command.make(
+  "pack",
+  {
+    outputDir: Flag.string("output-dir").pipe(Flag.withDefault("artifacts/server")),
+    appVersion: Flag.string("app-version").pipe(Flag.optional),
+    verbose: Flag.boolean("verbose").pipe(Flag.withDefault(false)),
+  },
+  (config) =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const fs = yield* FileSystem.FileSystem;
+      const repoRoot = yield* RepoRoot;
+      const serverDir = path.join(repoRoot, "apps/server");
+      const outputDir = path.resolve(repoRoot, config.outputDir);
+      const version = Option.getOrElse(config.appVersion, () => serverPackageJson.version);
+      const artifactPath = path.join(outputDir, `t3-${version}.tgz`);
+
+      yield* buildPackAssets(config.verbose);
+      yield* assertBuildAssets(serverDir);
+      yield* fs.makeDirectory(outputDir, { recursive: true });
+      if (yield* fs.exists(artifactPath)) {
+        yield* fs.remove(artifactPath);
+      }
+
+      const replacements = yield* prepareProductionPackageReplacements(
+        repoRoot,
+        serverDir,
+        version,
+        false,
+      );
+      yield* withTemporaryPackageStage(serverDir, replacements, (stageDirectory) =>
+        Effect.gen(function* () {
+          const packCommand = yield* resolveSpawnCommand("npm", [
+            "pack",
+            "--silent",
+            "--pack-destination",
+            outputDir,
+          ]);
+          yield* runCommand(
+            ChildProcess.make(packCommand.command, packCommand.args, {
+              cwd: stageDirectory,
+              stdout: config.verbose ? "inherit" : "ignore",
+              stderr: "inherit",
+              shell: packCommand.shell,
+            }),
+          );
+        }),
+      );
+
+      if (!(yield* fs.exists(artifactPath))) {
+        return yield* new ServerCliBuildAssetMissingError({ assetPath: artifactPath });
+      }
+      yield* verifyPackedArtifact(artifactPath);
+      const sha256 = yield* sha256File(artifactPath);
+      yield* Console.log(yield* encodePackedArtifactDescriptor({ artifactPath, sha256 }));
+    }),
+).pipe(
+  Command.withDescription(
+    "Build, pack, clean-install, and verify an immutable server tarball for deployment.",
+  ),
+);
 
 // ---------------------------------------------------------------------------
 // root command
 // ---------------------------------------------------------------------------
 
 const cli = Command.make("cli").pipe(
-  Command.withDescription("T3 server build & publish CLI."),
-  Command.withSubcommands([buildCmd, publishCmd]),
+  Command.withDescription("T3 server build, pack, and publish CLI."),
+  Command.withSubcommands([buildCmd, packCmd, publishCmd]),
 );
 
 Command.run(cli, { version: "0.0.0" }).pipe(

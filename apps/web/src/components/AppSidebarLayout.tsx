@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import * as Schema from "effect/Schema";
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
@@ -28,8 +29,135 @@ import {
   useSidebarVisibility,
 } from "./ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
+import { ThreadAttentionNotifications } from "./ThreadAttentionNotifications";
+import { useScaffoldSessionUiStore } from "../scaffoldSessionUiStore";
+import { useComposerDraftStore } from "../composerDraftStore";
+import { useProjects } from "../state/entities";
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { useAtomCommand } from "../state/use-atom-command";
+import { connectScaffoldEnvironment } from "../connection/scaffoldOnboarding";
+import {
+  browserScaffoldLifecycleActionStore,
+  drainScaffoldLifecycleActions,
+  subscribeScaffoldLifecycleDrain,
+} from "../connection/scaffoldLifecycleOutbox";
 
 const MACOS_TRAFFIC_LIGHTS_LEFT_INSET = "90px";
+
+function ScaffoldSessionCoordinator() {
+  const entriesByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
+  const projects = useProjects();
+  const connectScaffold = useAtomCommand(connectScaffoldEnvironment, { reportFailure: false });
+
+  useEffect(() => {
+    let disposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let running: Promise<void> | null = null;
+
+    const drain = () => {
+      if (disposed || running !== null) return;
+      running = drainScaffoldLifecycleActions({
+        store: browserScaffoldLifecycleActionStore,
+        execute: async (action) => {
+          if (action.kind !== "create") {
+            return { _tag: "blocked", errorCode: "unsupported_lifecycle_action" };
+          }
+          const scaffoldUi = useScaffoldSessionUiStore.getState();
+          const entry = Object.values(scaffoldUi.entriesByDraftId).find(
+            (candidate) => candidate.actionId === action.actionId,
+          );
+          if (!entry) return { _tag: "blocked", errorCode: "missing_scaffold_draft" };
+          const result = await connectScaffold({
+            deployment: entry.deployment,
+            operationId: action.actionId,
+            sessionId: action.sessionId,
+            create: action.create,
+            label: `Scaffold ${entry.deployment}`,
+          });
+          if (result._tag === "Failure") {
+            const error = squashAtomCommandFailure(result);
+            return {
+              _tag: "retry",
+              retryAfterMs: 1_000,
+              errorCode:
+                error instanceof Error
+                  ? error.name || "scaffold_create_failed"
+                  : "scaffold_create_failed",
+            };
+          }
+          scaffoldUi.connected(entry.draftId, result.value.binding);
+          useComposerDraftStore.getState().setDraftThreadContext(entry.draftId, {
+            projectRef: scopeProjectRef(result.value.target.environmentId, entry.sourceProjectId),
+            envMode: "local",
+            worktreePath: null,
+          });
+          return { _tag: "acknowledged" };
+        },
+        onBlocked: (action) => {
+          const scaffoldUi = useScaffoldSessionUiStore.getState();
+          const entry = Object.values(scaffoldUi.entriesByDraftId).find(
+            (candidate) => candidate.actionId === action.actionId,
+          );
+          if (entry) scaffoldUi.fail(entry.draftId, "Scaffold session could not be created.");
+        },
+      })
+        .catch((error: unknown) => {
+          console.error("Could not drain the Scaffold lifecycle outbox.", error);
+        })
+        .finally(async () => {
+          running = null;
+          if (disposed) return;
+          try {
+            const pending = await browserScaffoldLifecycleActionStore.list();
+            const readyAt = pending
+              .filter((action) => !action.blocked)
+              .map((action) => action.nextAttemptAt ?? Date.now())
+              .sort((left, right) => left - right)[0];
+            if (readyAt !== undefined) {
+              retryTimer = setTimeout(drain, Math.max(0, readyAt - Date.now()));
+            }
+          } catch (error) {
+            console.error("Could not schedule the Scaffold lifecycle retry.", error);
+          }
+        });
+    };
+
+    const unsubscribe = subscribeScaffoldLifecycleDrain(drain);
+    drain();
+    return () => {
+      disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      unsubscribe();
+    };
+  }, [connectScaffold]);
+
+  useEffect(() => {
+    const draftStore = useComposerDraftStore.getState();
+    for (const entry of Object.values(entriesByDraftId)) {
+      if (entry.environmentId === null || entry.phase === "creating" || entry.phase === "failed") {
+        continue;
+      }
+      const draft = draftStore.getDraftSession(entry.draftId);
+      if (!draft) continue;
+      const currentProjectExists = projects.some(
+        (project) =>
+          project.environmentId === draft.environmentId && project.id === draft.projectId,
+      );
+      if (currentProjectExists) continue;
+      const remoteProject = projects.find(
+        (project) => project.environmentId === entry.environmentId,
+      );
+      if (!remoteProject) continue;
+      draftStore.setDraftThreadContext(entry.draftId, {
+        projectRef: scopeProjectRef(remoteProject.environmentId, remoteProject.id),
+        envMode: "local",
+        worktreePath: null,
+      });
+    }
+  }, [entriesByDraftId, projects]);
+
+  return null;
+}
 
 function readInitialThreadSidebarWidth(): number {
   try {
@@ -162,6 +290,8 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
 
   return (
     <SidebarProvider className="h-dvh! min-h-0!" defaultOpen style={sidebarProviderStyle}>
+      <ThreadAttentionNotifications />
+      <ScaffoldSessionCoordinator />
       <Sidebar
         side="left"
         collapsible="offcanvas"

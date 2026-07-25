@@ -10,7 +10,10 @@ import {
   type DesktopWslState,
   type EnvironmentId,
   type FilesystemBrowseResult,
+  type OmpAccountOverview,
+  type OmpLoginChallenge,
   type ProjectId,
+  type ScaffoldDeployment,
   type SourceControlDiscoveryResult,
   type SourceControlProviderKind,
   type SourceControlRepositoryInfo,
@@ -22,13 +25,18 @@ import {
   ArrowDownIcon,
   ArrowLeftIcon,
   ArrowUpIcon,
+  CloudIcon,
+  Clock3Icon,
   CornerLeftUpIcon,
   FolderIcon,
   FolderPlusIcon,
   LinkIcon,
-  MessageSquareIcon,
-  SettingsIcon,
+  RefreshCwIcon,
   SquarePenIcon,
+  TriangleAlertIcon,
+  UserRoundIcon,
+  UserRoundPlusIcon,
+  UserRoundXIcon,
 } from "lucide-react";
 import {
   useCallback,
@@ -45,8 +53,20 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
+import {
+  browserOmpAccountOverviewCache,
+  cacheOmpAccountOverview,
+  mergeRefreshedOmpAccountOverview,
+} from "../connection/ompAccountOverviewCache";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
+import { useScaffoldSessionUiStore } from "../scaffoldSessionUiStore";
+import {
+  browserScaffoldLifecycleActionStore,
+  enqueueScaffoldLifecycleAction,
+  makeScaffoldCreateAction,
+  requestScaffoldLifecycleDrain,
+} from "../connection/scaffoldLifecycleOutbox";
 import { useClientSettings } from "../hooks/useSettings";
 import { readLocalApi } from "../localApi";
 import { desktopLocalBackendId } from "../connection/desktopLocal";
@@ -58,7 +78,7 @@ import { useAtomCommand } from "../state/use-atom-command";
 import { useAtomQueryRunner } from "../state/use-atom-query-runner";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
 import { useProjects, useThreadShells } from "../state/entities";
-import { resolveThreadActionProjectRef, startNewThreadFromContext } from "../lib/chatThreadActions";
+import { resolveThreadActionProjectRef } from "../lib/chatThreadActions";
 import {
   appendBrowsePathSegment,
   canNavigateUp,
@@ -76,7 +96,7 @@ import {
 } from "../lib/projectPaths";
 import { onOpenCommandPalette } from "../commandPaletteBus";
 import { isTerminalFocused } from "../lib/terminalFocus";
-import { getLatestThreadForProject, sortThreads } from "../lib/threadSort";
+import { getLatestThreadForProject } from "../lib/threadSort";
 import { cn, isMacPlatform, isWindowsPlatform, newProjectId } from "../lib/utils";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { buildThreadRouteParams, resolveThreadRouteTarget } from "../threadRoutes";
@@ -88,10 +108,9 @@ import {
 } from "../wslPaths";
 import {
   ADDON_ICON_CLASS,
+  buildAshlerRootGroups,
   buildBrowseGroups,
   buildProjectActionItems,
-  buildRootGroups,
-  buildThreadActionItems,
   enumerateCommandPaletteItems,
   type CommandPaletteActionItem,
   type CommandPaletteSubmenuItem,
@@ -101,15 +120,29 @@ import {
   getCommandPaletteInputPlaceholder,
   getCommandPaletteMode,
   ITEM_ICON_CLASS,
-  RECENT_THREAD_LIMIT,
+  shouldRefreshOmpOverviewOnOpen,
 } from "./CommandPalette.logic";
 import { orderItemsByPreferredIds, sortLogicalProjectsForSidebar } from "./Sidebar.logic";
 import { resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
 import { CommandPaletteResults } from "./CommandPaletteResults";
+import {
+  buildOmpOverviewStatusPresentation,
+  buildOmpAccountRowPresentation,
+  buildOmpUsageDisplayRows,
+  completeOmpLoginFlow,
+  describeOmpLoginFailure,
+  getOmpLoginActionPresentation,
+  preserveOmpOverviewAfterRefreshFailure,
+  providerDisplayName,
+} from "./OmpAccountPalette.logic";
+import { OmpLoginChallengePanel } from "./OmpLoginChallengePanel";
 import { AzureDevOpsIcon, BitbucketIcon, GitHubIcon, GitLabIcon } from "./Icons";
 import { ProjectFavicon } from "./ProjectFavicon";
-import { ThreadRowLeadingStatus, ThreadRowTrailingStatus } from "./ThreadStatusIndicators";
-import { primaryServerKeybindingsAtom, primaryServerProvidersAtom } from "../state/server";
+import {
+  primaryServerKeybindingsAtom,
+  primaryServerProvidersAtom,
+  serverEnvironment,
+} from "../state/server";
 import { resolveDefaultProviderModelSelection } from "../providerInstances";
 import { resolveShortcutCommand, threadJumpIndexFromCommand } from "../keybindings";
 import {
@@ -388,6 +421,38 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   const clearOpenIntent = useCallback(() => dispatch({ _tag: "ClearOpenIntent" }), []);
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const composerHandleRef = useRef<ChatComposerHandle | null>(null);
+  const [pendingOmpLoginInput, setPendingOmpLoginInput] = useState<{
+    readonly challenge: OmpLoginChallenge;
+    readonly resolve: (response: string | null) => void;
+  } | null>(null);
+  const [ompLoginAuthorizationUrl, setOmpLoginAuthorizationUrl] = useState<string | null>(null);
+  const pendingOmpLoginInputRef = useRef(pendingOmpLoginInput);
+  pendingOmpLoginInputRef.current = pendingOmpLoginInput;
+  const requestOmpLoginInput = useCallback(
+    (challenge: OmpLoginChallenge) =>
+      new Promise<string | null>((resolve) => {
+        pendingOmpLoginInputRef.current?.resolve(null);
+        const pending = { challenge, resolve };
+        pendingOmpLoginInputRef.current = pending;
+        setPendingOmpLoginInput(pending);
+      }),
+    [],
+  );
+  const settleOmpLoginInput = useCallback((response: string | null) => {
+    const pending = pendingOmpLoginInputRef.current;
+    if (pending === null) return;
+    pendingOmpLoginInputRef.current = null;
+    setPendingOmpLoginInput(null);
+    pending.resolve(response);
+  }, []);
+
+  useEffect(
+    () => () => {
+      pendingOmpLoginInputRef.current?.resolve(null);
+      pendingOmpLoginInputRef.current = null;
+    },
+    [],
+  );
   const routeTarget = useParams({
     strict: false,
     select: (params) => resolveThreadRouteTarget(params),
@@ -442,8 +507,17 @@ export function CommandPalette({ children }: { children: ReactNode }) {
           openIntent={state.openIntent}
           setOpen={setOpen}
           clearOpenIntent={clearOpenIntent}
+          requestOmpLoginInput={requestOmpLoginInput}
+          setOmpLoginAuthorizationUrl={setOmpLoginAuthorizationUrl}
         />
       </CommandDialog>
+      <OmpLoginChallengePanel
+        key={pendingOmpLoginInput?.challenge.flowId ?? "no-omp-login-challenge"}
+        challenge={pendingOmpLoginInput?.challenge ?? null}
+        authorizationUrl={ompLoginAuthorizationUrl}
+        onSubmit={(response) => settleOmpLoginInput(response)}
+        onCancel={() => settleOmpLoginInput(null)}
+      />
     </ComposerHandleContext>
   );
 }
@@ -453,6 +527,8 @@ function CommandPaletteDialog(props: {
   readonly openIntent: CommandPaletteOpenIntent | null;
   readonly setOpen: (open: boolean) => void;
   readonly clearOpenIntent: () => void;
+  readonly requestOmpLoginInput: (challenge: OmpLoginChallenge) => Promise<string | null>;
+  readonly setOmpLoginAuthorizationUrl: (url: string | null) => void;
 }) {
   if (!props.open) {
     return null;
@@ -463,6 +539,8 @@ function CommandPaletteDialog(props: {
       openIntent={props.openIntent}
       setOpen={props.setOpen}
       clearOpenIntent={props.clearOpenIntent}
+      requestOmpLoginInput={props.requestOmpLoginInput}
+      setOmpLoginAuthorizationUrl={props.setOmpLoginAuthorizationUrl}
     />
   );
 }
@@ -471,9 +549,17 @@ function OpenCommandPaletteDialog(props: {
   readonly openIntent: CommandPaletteOpenIntent | null;
   readonly setOpen: (open: boolean) => void;
   readonly clearOpenIntent: () => void;
+  readonly requestOmpLoginInput: (challenge: OmpLoginChallenge) => Promise<string | null>;
+  readonly setOmpLoginAuthorizationUrl: (url: string | null) => void;
 }) {
   const navigate = useNavigate();
-  const { clearOpenIntent, openIntent, setOpen } = props;
+  const {
+    clearOpenIntent,
+    openIntent,
+    requestOmpLoginInput,
+    setOmpLoginAuthorizationUrl,
+    setOpen,
+  } = props;
   const composerHandleRef = useComposerHandleContext();
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
@@ -492,6 +578,275 @@ function OpenCommandPaletteDialog(props: {
   const { environments } = useEnvironments();
   const desktopLocalBootstraps = useDesktopLocalBootstraps();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const ompSnapshotQuery = useEnvironmentQuery<OmpAccountOverview, unknown>(
+    primaryEnvironmentId === null
+      ? null
+      : serverEnvironment.ompAccountsSnapshot({ environmentId: primaryEnvironmentId, input: {} }),
+  );
+  const refreshOmpAccounts = useAtomCommand(serverEnvironment.refreshOmpAccounts, {
+    reportFailure: false,
+  });
+  const beginOmpAccountLogin = useAtomCommand(serverEnvironment.beginOmpAccountLogin, {
+    reportFailure: false,
+  });
+  const respondOmpAccountLogin = useAtomCommand(serverEnvironment.respondOmpAccountLogin, {
+    reportFailure: false,
+  });
+  const cancelOmpAccountLogin = useAtomCommand(serverEnvironment.cancelOmpAccountLogin, {
+    reportFailure: false,
+  });
+  const removeOmpAccount = useAtomCommand(serverEnvironment.removeOmpAccount, {
+    reportFailure: false,
+  });
+  const [ompOverview, setOmpOverview] = useState<OmpAccountOverview | null>(null);
+  const [ompOverviewCachedAt, setOmpOverviewCachedAt] = useState<number | null>(null);
+  const [ompRefreshWarning, setOmpRefreshWarning] = useState<string | null>(null);
+  const [isOmpCacheHydrated, setIsOmpCacheHydrated] = useState(false);
+  const [isRefreshingOmpAccounts, setIsRefreshingOmpAccounts] = useState(false);
+  const ompOverviewRef = useRef(ompOverview);
+  const ompOverviewCachedAtRef = useRef(ompOverviewCachedAt);
+  ompOverviewRef.current = ompOverview;
+  ompOverviewCachedAtRef.current = ompOverviewCachedAt;
+  const ompRefreshInFlightRef = useRef(false);
+  const refreshOmpSnapshot = ompSnapshotQuery.refresh;
+
+  useEffect(() => {
+    let cancelled = false;
+    setOmpOverview(null);
+    setOmpOverviewCachedAt(null);
+    setOmpRefreshWarning(null);
+    setIsOmpCacheHydrated(false);
+    if (primaryEnvironmentId === null) {
+      setIsOmpCacheHydrated(true);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void browserOmpAccountOverviewCache
+      .get(primaryEnvironmentId)
+      .then((cached) => {
+        if (!cancelled && cached !== null) {
+          setOmpOverview(cached.overview);
+          setOmpOverviewCachedAt(cached.updatedAt);
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setIsOmpCacheHydrated(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [primaryEnvironmentId]);
+
+  useEffect(() => {
+    if (!isOmpCacheHydrated || ompOverview !== null || ompSnapshotQuery.data === null) return;
+    const cachedAt = Date.now();
+    setOmpOverview(ompSnapshotQuery.data);
+    setOmpOverviewCachedAt(cachedAt);
+    if (primaryEnvironmentId !== null) {
+      void cacheOmpAccountOverview(
+        browserOmpAccountOverviewCache,
+        primaryEnvironmentId,
+        ompSnapshotQuery.data,
+        cachedAt,
+      ).catch(() => undefined);
+    }
+  }, [isOmpCacheHydrated, ompOverview, ompSnapshotQuery.data, primaryEnvironmentId]);
+
+  const refreshOmpOverview = useCallback(async () => {
+    if (primaryEnvironmentId === null || ompRefreshInFlightRef.current) return;
+    ompRefreshInFlightRef.current = true;
+    setIsRefreshingOmpAccounts(true);
+    const result = await refreshOmpAccounts({
+      environmentId: primaryEnvironmentId,
+      input: {},
+    });
+    ompRefreshInFlightRef.current = false;
+    setIsRefreshingOmpAccounts(false);
+    if (result._tag === "Success") {
+      const cachedAt = Date.now();
+      const mergedOverview = mergeRefreshedOmpAccountOverview({
+        previous: ompOverviewRef.current,
+        refreshed: result.value,
+      });
+      setOmpOverview(mergedOverview);
+      setOmpOverviewCachedAt(cachedAt);
+      setOmpRefreshWarning(null);
+      void cacheOmpAccountOverview(
+        browserOmpAccountOverviewCache,
+        primaryEnvironmentId,
+        mergedOverview,
+        cachedAt,
+      ).catch(() => undefined);
+      refreshOmpSnapshot();
+      return;
+    }
+    if (!isAtomCommandInterrupted(result)) {
+      const failureState = preserveOmpOverviewAfterRefreshFailure({
+        overview: ompOverviewRef.current,
+        cachedAt: ompOverviewCachedAtRef.current,
+        warning: "Showing the last cached account and usage data.",
+      });
+      setOmpOverview(failureState.overview);
+      setOmpOverviewCachedAt(failureState.cachedAt);
+      setOmpRefreshWarning(failureState.refreshWarning);
+      toastManager.add(
+        stackedThreadToast({
+          type: "warning",
+          title: "Plan usage could not be refreshed",
+          description: "Showing the last cached account and usage data.",
+        }),
+      );
+    }
+  }, [primaryEnvironmentId, refreshOmpAccounts, refreshOmpSnapshot]);
+
+  useEffect(() => {
+    if (
+      !shouldRefreshOmpOverviewOnOpen({
+        cacheHydrated: isOmpCacheHydrated,
+        hasEnvironment: primaryEnvironmentId !== null,
+      })
+    ) {
+      return;
+    }
+    void refreshOmpOverview();
+  }, [isOmpCacheHydrated, primaryEnvironmentId, refreshOmpOverview]);
+
+  const runOmpAccountLogin = useCallback(
+    async (provider: "openai" | "anthropic") => {
+      if (primaryEnvironmentId === null) return;
+      setOmpLoginAuthorizationUrl(null);
+      try {
+        const begun = await beginOmpAccountLogin({
+          environmentId: primaryEnvironmentId,
+          input: { provider },
+        });
+        if (begun._tag === "Failure") {
+          if (!isAtomCommandInterrupted(begun)) {
+            const error = squashAtomCommandFailure(begun);
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: `Could not add ${providerDisplayName(provider)}`,
+                description: describeOmpLoginFailure(error),
+              }),
+            );
+          }
+          return;
+        }
+
+        if (begun.value.kind === "browser") {
+          toastManager.add(
+            stackedThreadToast({
+              type: "info",
+              title: `Finish adding ${providerDisplayName(provider)}`,
+              description: begun.value.message ?? "Complete sign-in in the browser.",
+            }),
+          );
+        }
+
+        let challenge: OmpLoginChallenge | null;
+        try {
+          challenge = await completeOmpLoginFlow(begun.value, {
+            openBrowser: (url) => {
+              setOmpLoginAuthorizationUrl(url);
+              window.open(url, "_blank", "noopener,noreferrer");
+            },
+            requestInput: requestOmpLoginInput,
+            respond: async (flowId, response) => {
+              const next = await respondOmpAccountLogin({
+                environmentId: primaryEnvironmentId,
+                input: { provider, flowId, response },
+              });
+              if (next._tag === "Failure") throw squashAtomCommandFailure(next);
+              return next.value;
+            },
+            cancel: async (flowId) => {
+              await cancelOmpAccountLogin({
+                environmentId: primaryEnvironmentId,
+                input: { flowId },
+              });
+            },
+          });
+        } catch (error) {
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: `Could not add ${providerDisplayName(provider)}`,
+              description: describeOmpLoginFailure(error),
+            }),
+          );
+          return;
+        }
+
+        if (challenge === null) return;
+        if (challenge.kind !== "complete") {
+          await cancelOmpAccountLogin({
+            environmentId: primaryEnvironmentId,
+            input: { flowId: challenge.flowId },
+          });
+          toastManager.add(
+            stackedThreadToast({
+              type: "warning",
+              title: `Could not add ${providerDisplayName(provider)}`,
+              description: "The sign-in flow did not finish. Existing accounts are unchanged.",
+            }),
+          );
+          return;
+        }
+
+        if (challenge.outcome === "failure") {
+          toastManager.add(
+            stackedThreadToast({
+              type: "warning",
+              title: `${providerDisplayName(provider)} was not added`,
+              description: challenge.message ?? "Existing accounts are unchanged.",
+            }),
+          );
+        }
+        await refreshOmpOverview();
+      } finally {
+        setOmpLoginAuthorizationUrl(null);
+      }
+    },
+    [
+      beginOmpAccountLogin,
+      cancelOmpAccountLogin,
+      primaryEnvironmentId,
+      refreshOmpOverview,
+      requestOmpLoginInput,
+      respondOmpAccountLogin,
+      setOmpLoginAuthorizationUrl,
+    ],
+  );
+
+  const runRemoveOmpAccount = useCallback(
+    async (
+      accountRef: OmpAccountOverview["accounts"]["accounts"][number]["accountRef"],
+      label: string,
+    ) => {
+      if (primaryEnvironmentId === null || !window.confirm(`Remove ${label}?`)) return;
+      const result = await removeOmpAccount({
+        environmentId: primaryEnvironmentId,
+        input: { accountRef },
+      });
+      if (result._tag === "Failure") {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Unable to remove account",
+            description:
+              error instanceof Error ? error.message : "OMP could not remove the account.",
+          }),
+        );
+        return;
+      }
+      await refreshOmpOverview();
+    },
+    [primaryEnvironmentId, refreshOmpOverview, removeOmpAccount],
+  );
   const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
     useHandleNewThread();
   const projects = useProjects();
@@ -570,6 +925,46 @@ function OpenCommandPaletteDialog(props: {
       }),
     [activeDraftThread, activeThread, defaultProjectRef, handleNewThread],
   );
+  const startScaffoldThread = useCallback(
+    async (deployment: ScaffoldDeployment) => {
+      if (contextualProjectRef === null) return;
+      const sourceProject = projects.find(
+        (project) =>
+          project.environmentId === contextualProjectRef.environmentId &&
+          project.id === contextualProjectRef.projectId,
+      );
+      await handleNewThread(contextualProjectRef, {
+        envMode: "local",
+        forceNew: true,
+        onDraftCreated: (draftId) => {
+          const scaffoldUi = useScaffoldSessionUiStore.getState();
+          const action = makeScaffoldCreateAction({
+            draftId,
+            create: sourceProject?.title ? { name: sourceProject.title } : {},
+          });
+          scaffoldUi.begin({
+            draftId,
+            deployment,
+            actionId: action.actionId,
+            sourceEnvironmentId: contextualProjectRef.environmentId,
+            sourceProjectId: contextualProjectRef.projectId,
+            sessionId: action.sessionId,
+            createdAt: new Date().toISOString(),
+          });
+          void enqueueScaffoldLifecycleAction(browserScaffoldLifecycleActionStore, action).then(
+            requestScaffoldLifecycleDrain,
+            (error: unknown) => {
+              scaffoldUi.fail(
+                draftId,
+                error instanceof Error ? error.message : "Scaffold session could not be queued.",
+              );
+            },
+          );
+        },
+      });
+    },
+    [contextualProjectRef, handleNewThread, projects],
+  );
   const projectPickerEntries = useMemo(
     () =>
       buildSidebarProjectPickerEntries({
@@ -621,18 +1016,6 @@ function OpenCommandPaletteDialog(props: {
     return options;
   }, [environments]);
   const defaultAddProjectEnvironmentId = addProjectEnvironmentOptions[0]?.environmentId ?? null;
-  const wslAddProjectEnvironmentOption = useMemo(
-    () =>
-      addProjectEnvironmentOptions.find((option) => {
-        const environment = environments.find(
-          (candidate) => candidate.environmentId === option.environmentId,
-        );
-        return environment
-          ? desktopLocalBackendId(environment.entry.target)?.startsWith("wsl:") === true
-          : false;
-      }) ?? null,
-    [addProjectEnvironmentOptions, environments],
-  );
   const browseEnvironmentId = addProjectEnvironmentId ?? defaultAddProjectEnvironmentId;
   const browseEnvironment =
     environments.find((environment) => environment.environmentId === browseEnvironmentId) ?? null;
@@ -694,12 +1077,6 @@ function OpenCommandPaletteDialog(props: {
       new Map<ProjectId, string>(projects.map((project) => [project.id, project.workspaceRoot])),
     [projects],
   );
-  const projectTitleById = useMemo(
-    () => new Map<ProjectId, string>(projects.map((project) => [project.id, project.title])),
-    [projects],
-  );
-
-  const activeThreadId = activeThread?.id;
   const currentProjectEnvironmentId =
     activeThread?.environmentId ?? activeDraftThread?.environmentId ?? null;
   const currentProjectId = activeThread?.projectId ?? activeDraftThread?.projectId ?? null;
@@ -735,74 +1112,6 @@ function OpenCommandPaletteDialog(props: {
   const { filteredEntries: filteredBrowseEntries, exactEntry: exactBrowseEntry } = useMemo(
     () => filterBrowseEntries({ browseEntries, browseFilterQuery, highlightedItemValue }),
     [browseEntries, browseFilterQuery, highlightedItemValue],
-  );
-
-  const openProjectFromSearch = useMemo(
-    () => async (project: (typeof projects)[number]) => {
-      const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
-      const groupedProjectKeys = group
-        ? new Set(
-            group.memberProjectRefs.map(
-              (projectRef) => `${projectRef.environmentId}:${projectRef.projectId}`,
-            ),
-          )
-        : null;
-      const latestThread = groupedProjectKeys
-        ? (sortThreads(
-            threads.filter(
-              (thread) =>
-                thread.archivedAt === null &&
-                groupedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`),
-            ),
-            clientSettings.sidebarThreadSortOrder,
-          )[0] ?? null)
-        : getLatestThreadForProject(
-            threads.filter((thread) => thread.environmentId === project.environmentId),
-            project.id,
-            clientSettings.sidebarThreadSortOrder,
-          );
-      if (latestThread) {
-        await navigate({
-          to: "/$environmentId/$threadId",
-          params: buildThreadRouteParams(
-            scopeThreadRef(latestThread.environmentId, latestThread.id),
-          ),
-        });
-        return;
-      }
-
-      await handleNewThread(scopeProjectRef(project.environmentId, project.id));
-    },
-    [
-      clientSettings.sidebarThreadSortOrder,
-      handleNewThread,
-      navigate,
-      projectGroupByTargetKey,
-      threads,
-    ],
-  );
-
-  const projectSearchItems = useMemo(
-    () =>
-      buildProjectActionItems({
-        projects: pickerProjects,
-        valuePrefix: "project",
-        searchTerms: (project) => {
-          const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
-          return (
-            group?.memberProjects.flatMap((member) => [member.title, member.workspaceRoot]) ?? []
-          );
-        },
-        icon: (project) => (
-          <ProjectFavicon
-            environmentId={project.environmentId}
-            cwd={project.workspaceRoot}
-            className={ITEM_ICON_CLASS}
-          />
-        ),
-        runProject: openProjectFromSearch,
-      }),
-    [openProjectFromSearch, pickerProjects, projectGroupByTargetKey],
   );
 
   const projectThreadItems = useMemo(
@@ -843,27 +1152,6 @@ function OpenCommandPaletteDialog(props: {
       ),
     [contextualProjectRef, handleNewThread, pickerProjects, projectGroupByTargetKey],
   );
-
-  const allThreadItems = useMemo(
-    () =>
-      buildThreadActionItems({
-        threads,
-        ...(activeThreadId ? { activeThreadId } : {}),
-        projectTitleById,
-        sortOrder: clientSettings.sidebarThreadSortOrder,
-        icon: <MessageSquareIcon className={ITEM_ICON_CLASS} />,
-        renderLeadingContent: (thread) => <ThreadRowLeadingStatus thread={thread} />,
-        renderTrailingContent: (thread) => <ThreadRowTrailingStatus thread={thread} />,
-        runThread: async (thread) => {
-          await navigate({
-            to: "/$environmentId/$threadId",
-            params: buildThreadRouteParams(scopeThreadRef(thread.environmentId, thread.id)),
-          });
-        },
-      }),
-    [activeThreadId, clientSettings.sidebarThreadSortOrder, navigate, projectTitleById, threads],
-  );
-  const recentThreadItems = allThreadItems.slice(0, RECENT_THREAD_LIMIT);
 
   function pushPaletteView(view: CommandPaletteView): void {
     setViewStack((previousViews) => [
@@ -1145,103 +1433,177 @@ function OpenCommandPaletteDialog(props: {
     projectThreadItems,
   ]);
 
-  const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
+  const newSessionItem: CommandPaletteSubmenuItem = {
+    kind: "submenu",
+    value: "action:new-session",
+    searchTerms: ["new session", "local", "scaffold", "sandbox", "cloud"],
+    title: "New Session",
+    icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
+    addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
+    disabled: projects.length === 0,
+    groups: [
+      {
+        value: "session-location",
+        label: "Run on",
+        items: [
+          {
+            kind: "submenu",
+            value: "action:new-session:local",
+            searchTerms: ["local", "worktree", "project"],
+            title: "Local",
+            description: "New worktree",
+            icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
+            addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
+            groups: [{ value: "projects", label: "Project", items: projectThreadItems }],
+          },
+          {
+            kind: "action",
+            value: "action:new-session:scaffold:staging",
+            searchTerms: ["staging", "scaffold", "cloud"],
+            title: "Scaffold staging",
+            icon: <CloudIcon className={ITEM_ICON_CLASS} />,
+            run: async () => startScaffoldThread("staging"),
+          },
+          {
+            kind: "action",
+            value: "action:new-session:scaffold:production",
+            searchTerms: ["production", "scaffold", "cloud"],
+            title: "Scaffold production",
+            icon: <CloudIcon className={ITEM_ICON_CLASS} />,
+            run: async () => startScaffoldThread("production"),
+          },
+        ],
+      },
+    ],
+  };
 
-  if (projects.length > 0) {
-    const activeProjectTitle =
-      projectPickerEntries.find((entry) => entry.isPreferred)?.group.displayName ??
-      (currentProjectId ? (projectTitleById.get(currentProjectId) ?? null) : null);
+  const visibleOmpOverview = ompOverview ?? ompSnapshotQuery.data;
+  const hasActiveTurn = activeThread?.session?.activeTurnId != null;
+  const ompLoginActionPresentation = getOmpLoginActionPresentation({ hasActiveTurn });
+  const ompAccountItems: CommandPaletteActionItem[] = [];
+  if (visibleOmpOverview !== null) {
+    for (const account of visibleOmpOverview.accounts.accounts) {
+      const providerName = providerDisplayName(account.provider);
+      const accountLabel = account.maskedEmail ?? account.displayName;
+      const presentation = buildOmpAccountRowPresentation(account);
+      if (!presentation.connected) {
+        ompAccountItems.push({
+          kind: "action",
+          value: `omp-account:unavailable:${account.accountRef}`,
+          searchTerms: ["reconnect", "not connected", providerName, accountLabel],
+          title: presentation.title,
+          description: presentation.description,
+          icon: <TriangleAlertIcon className="size-4 text-amber-500" />,
+          disabled: true,
+          run: async () => undefined,
+        });
+      } else if (!visibleOmpOverview.accounts.managed) {
+        ompAccountItems.push({
+          kind: "action",
+          value: `omp-account:remove:${account.accountRef}`,
+          searchTerms: ["remove", providerName, account.displayName, account.maskedEmail ?? ""],
+          title: `Remove ${presentation.title}`,
+          description: presentation.description,
+          icon: <UserRoundXIcon className={ITEM_ICON_CLASS} />,
+          keepOpen: true,
+          run: async () => runRemoveOmpAccount(account.accountRef, accountLabel),
+        });
+      }
+    }
+  }
 
-    if (activeProjectTitle) {
-      actionItems.push({
+  if (visibleOmpOverview?.accounts.managed !== true) {
+    ompAccountItems.push(
+      {
         kind: "action",
-        value: "action:new-thread",
-        searchTerms: ["new thread", "chat", "create", "draft"],
-        title: (
-          <>
-            New thread in <span className="font-semibold">{activeProjectTitle}</span>
-          </>
-        ),
-        icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
-        shortcutCommand: "chat.new",
-        run: async () => {
-          await startNewThreadFromContext({
-            activeDraftThread,
-            activeThread: activeThread ?? undefined,
-            defaultProjectRef,
-            handleNewThread,
-          });
-        },
+        value: "omp-account:add:openai",
+        searchTerms: ["add", "connect", "chatgpt", "openai", "account"],
+        title: "Add ChatGPT",
+        description: ompLoginActionPresentation.description,
+        icon: <UserRoundPlusIcon className={ITEM_ICON_CLASS} />,
+        disabled: ompLoginActionPresentation.disabled,
+        keepOpen: true,
+        run: async () => runOmpAccountLogin("openai"),
+      },
+      {
+        kind: "action",
+        value: "omp-account:add:anthropic",
+        searchTerms: ["add", "connect", "claude", "anthropic", "account"],
+        title: "Add Claude",
+        description: ompLoginActionPresentation.description,
+        icon: <UserRoundPlusIcon className={ITEM_ICON_CLASS} />,
+        disabled: ompLoginActionPresentation.disabled,
+        keepOpen: true,
+        run: async () => runOmpAccountLogin("anthropic"),
+      },
+    );
+  }
+
+  const refreshOmpUsageItem: CommandPaletteActionItem = {
+    kind: "action",
+    value: "omp-account:refresh",
+    searchTerms: ["refresh", "usage", "plan", "account", "quota"],
+    title: isRefreshingOmpAccounts ? "Refreshing accounts and plan usage..." : "Refresh plan usage",
+    icon: (
+      <RefreshCwIcon className={cn(ITEM_ICON_CLASS, isRefreshingOmpAccounts && "animate-spin")} />
+    ),
+    disabled: isRefreshingOmpAccounts,
+    keepOpen: true,
+    run: refreshOmpOverview,
+  };
+
+  const ompUsageItems: CommandPaletteActionItem[] =
+    visibleOmpOverview === null
+      ? []
+      : buildOmpUsageDisplayRows(visibleOmpOverview.usage.reports).map((row) => ({
+          kind: "action" as const,
+          value: `omp-usage:${row.key}`,
+          searchTerms: ["usage", "plan", "quota", row.title, row.description],
+          title: row.title,
+          description: row.description,
+          icon: row.stale ? (
+            <TriangleAlertIcon className="size-4 text-amber-500" />
+          ) : (
+            <UserRoundIcon className={ITEM_ICON_CLASS} />
+          ),
+          disabled: true,
+          run: async () => undefined,
+        }));
+  const ompUsageStatusItems: CommandPaletteActionItem[] = [];
+  if (visibleOmpOverview !== null) {
+    const status = buildOmpOverviewStatusPresentation({
+      overview: visibleOmpOverview,
+      cachedAt: ompOverviewCachedAt,
+      refreshWarning: ompRefreshWarning,
+    });
+    ompUsageStatusItems.push({
+      kind: "action",
+      value: "omp-usage:freshness",
+      searchTerms: ["usage", "plan", "cached", "last refreshed", status.freshnessTitle],
+      title: status.freshnessTitle,
+      description: status.freshnessDescription,
+      icon: <Clock3Icon className={ITEM_ICON_CLASS} />,
+      disabled: true,
+      run: async () => undefined,
+    });
+    if (status.warning) {
+      ompUsageStatusItems.push({
+        kind: "action",
+        value: "omp-usage:warning",
+        searchTerms: ["usage", "plan", "warning", "stale", status.warning],
+        title: "Account and plan usage may be out of date",
+        description: status.warning,
+        icon: <TriangleAlertIcon className="size-4 text-amber-500" />,
+        disabled: true,
+        run: async () => undefined,
       });
     }
-
-    actionItems.push({
-      kind: "submenu",
-      value: "action:new-thread-in",
-      searchTerms: ["new thread", "project", "pick", "choose", "select"],
-      title: "New thread in...",
-      icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
-      addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
-      groups: [{ value: "projects", label: "Projects", items: projectThreadItems }],
-    });
   }
-
-  actionItems.push({
-    kind: "action",
-    value: "action:add-project",
-    searchTerms: [
-      "add project",
-      "folder",
-      "directory",
-      "browse",
-      "clone",
-      "remote",
-      "repository",
-      "repo",
-      "git",
-      "github",
-      "gitlab",
-      "bitbucket",
-      "azure",
-      "devops",
-      "url",
-      "environment",
-    ],
-    title: "Add project",
-    icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
-    keepOpen: true,
-    run: async () => {
-      openAddProjectFlow();
-    },
+  const rootGroups = buildAshlerRootGroups({
+    newSessionItem,
+    accountItems: ompAccountItems,
+    planUsageItems: [refreshOmpUsageItem, ...ompUsageStatusItems, ...ompUsageItems],
   });
-
-  if (wslAddProjectEnvironmentOption) {
-    actionItems.push({
-      kind: "action",
-      value: "action:add-project:wsl-folder",
-      searchTerms: ["add project", "open", "wsl", "linux", "folder", "directory"],
-      title: "Open WSL folder",
-      description: wslAddProjectEnvironmentOption.label,
-      icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
-      keepOpen: true,
-      run: async () => {
-        startAddProjectBrowse(wslAddProjectEnvironmentOption.environmentId);
-      },
-    });
-  }
-
-  actionItems.push({
-    kind: "action",
-    value: "action:settings",
-    searchTerms: ["settings", "preferences", "configuration", "keybindings"],
-    title: "Open settings",
-    icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
-    run: async () => {
-      await navigate({ to: "/settings" });
-    },
-  });
-
-  const rootGroups = buildRootGroups({ actionItems, recentThreadItems });
   const sourceSelectionViewValue =
     addProjectEnvironmentId === null ? null : `sources:${addProjectEnvironmentId}`;
   const activeGroups =
@@ -1258,8 +1620,8 @@ function OpenCommandPaletteDialog(props: {
     activeGroups,
     query: deferredQuery,
     isInSubmenu: currentView !== null,
-    projectSearchItems: projectSearchItems,
-    threadSearchItems: allThreadItems,
+    projectSearchItems: [],
+    threadSearchItems: [],
   });
 
   const handleAddProjectForEnvironment = useCallback(

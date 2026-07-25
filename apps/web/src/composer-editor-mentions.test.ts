@@ -120,6 +120,31 @@ describe("splitPromptIntoComposerSegments", () => {
     ]);
   });
 
+  it("preserves typed metadata for @ skill and session segments", () => {
+    expect(
+      splitPromptIntoComposerSegments(
+        "Use @[skill|omp|review] with @[session|local|thread-2|%2Ftmp%2Fworktree] please",
+      ),
+    ).toEqual([
+      { type: "text", text: "Use " },
+      {
+        type: "skill",
+        name: "review",
+        provider: "omp",
+        source: "@[skill|omp|review]",
+      },
+      { type: "text", text: " with " },
+      {
+        type: "session",
+        environmentId: "local",
+        threadId: "thread-2",
+        worktreePath: "/tmp/worktree",
+        source: "@[session|local|thread-2|%2Ftmp%2Fworktree]",
+      },
+      { type: "text", text: " please" },
+    ]);
+  });
+
   it("does not convert an incomplete trailing skill token", () => {
     expect(splitPromptIntoComposerSegments("Use $review-follow-up")).toEqual([
       { type: "text", text: "Use $review-follow-up" },

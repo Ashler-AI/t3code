@@ -1,10 +1,16 @@
 import {
   ChatAttachment,
   CheckpointRef,
+  CommandId,
+  EventId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
+  OrchestrationAggregateKind,
   OrchestrationCheckpointFile,
+  OrchestrationEvent,
+  OrchestrationEventMetadata,
+  OrchestrationEventType,
   OrchestrationProposedPlanId,
   OrchestrationReadModel,
   OrchestrationShellSnapshot,
@@ -52,6 +58,9 @@ import { ProjectionThread } from "../../persistence/Services/ProjectionThreads.t
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "./ProjectionPipeline.ts";
 import {
+  PendingTurnStartRecoveryQuery,
+  type PendingTurnStartEvent,
+  type PendingTurnStartRecoveryQueryShape,
   ProjectionSnapshotQuery,
   type ProjectionFullThreadDiffContext,
   type ProjectionSnapshotCounts,
@@ -62,6 +71,9 @@ import {
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const decodeShellSnapshot = Schema.decodeUnknownEffect(OrchestrationShellSnapshot);
 const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
+const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
+const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
+const EventMetadataFromJsonString = Schema.fromJsonString(OrchestrationEventMetadata);
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
     defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
@@ -138,6 +150,19 @@ const ProjectionFullThreadDiffContextRowSchema = Schema.Struct({
   worktreePath: Schema.NullOr(Schema.String),
   latestCheckpointTurnCount: Schema.NullOr(NonNegativeInt),
   toCheckpointRef: Schema.NullOr(CheckpointRef),
+});
+const PendingTurnStartEventRowSchema = Schema.Struct({
+  sequence: NonNegativeInt,
+  eventId: EventId,
+  type: OrchestrationEventType,
+  aggregateKind: OrchestrationAggregateKind,
+  aggregateId: Schema.Union([ProjectId, ThreadId]),
+  occurredAt: IsoDateTime,
+  commandId: Schema.NullOr(CommandId),
+  causationEventId: Schema.NullOr(EventId),
+  correlationId: Schema.NullOr(CommandId),
+  payload: UnknownFromJsonString,
+  metadata: EventMetadataFromJsonString,
 });
 
 const REQUIRED_SNAPSHOT_PROJECTORS = [
@@ -260,6 +285,70 @@ function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: st
       ? toPersistenceDecodeError(decodeOperation)(cause)
       : toPersistenceSqlError(sqlOperation)(cause);
 }
+
+const makePendingTurnStartRecoveryQuery = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const listPendingTurnStartEventRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: PendingTurnStartEventRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          events.sequence,
+          events.event_id AS "eventId",
+          events.event_type AS "type",
+          events.aggregate_kind AS "aggregateKind",
+          events.stream_id AS "aggregateId",
+          events.occurred_at AS "occurredAt",
+          events.command_id AS "commandId",
+          events.causation_event_id AS "causationEventId",
+          events.correlation_id AS "correlationId",
+          events.payload_json AS "payload",
+          events.metadata_json AS "metadata"
+        FROM projection_turns AS pending_turns
+        INNER JOIN orchestration_events AS events
+          ON events.aggregate_kind = 'thread'
+          AND events.stream_id = pending_turns.thread_id
+          AND events.event_type = 'thread.turn-start-requested'
+          AND json_extract(events.payload_json, '$.messageId') = pending_turns.pending_message_id
+        WHERE pending_turns.turn_id IS NULL
+          AND pending_turns.pending_message_id IS NOT NULL
+          AND pending_turns.state = 'pending'
+        ORDER BY events.sequence ASC
+      `,
+  });
+
+  const listPendingTurnStartEvents: PendingTurnStartRecoveryQueryShape["listPendingTurnStartEvents"] =
+    () =>
+      listPendingTurnStartEventRows(undefined).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "PendingTurnStartRecoveryQuery.listPendingTurnStartEvents:query",
+            "PendingTurnStartRecoveryQuery.listPendingTurnStartEvents:decodeRows",
+          ),
+        ),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) =>
+            decodeOrchestrationEvent(row).pipe(
+              Effect.mapError(
+                toPersistenceDecodeError(
+                  "PendingTurnStartRecoveryQuery.listPendingTurnStartEvents:decodeEvent",
+                ),
+              ),
+            ),
+          ),
+        ),
+        Effect.map((events) =>
+          events.filter(
+            (event): event is PendingTurnStartEvent => event.type === "thread.turn-start-requested",
+          ),
+        ),
+      );
+
+  return {
+    listPendingTurnStartEvents,
+  } satisfies PendingTurnStartRecoveryQueryShape;
+});
 
 const makeProjectionSnapshotQuery = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -2121,7 +2210,17 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
   } satisfies ProjectionSnapshotQueryShape;
 });
 
-export const OrchestrationProjectionSnapshotQueryLive = Layer.effect(
+const ProjectionSnapshotQueryLive = Layer.effect(
   ProjectionSnapshotQuery,
   makeProjectionSnapshotQuery,
+);
+
+const PendingTurnStartRecoveryQueryLive = Layer.effect(
+  PendingTurnStartRecoveryQuery,
+  makePendingTurnStartRecoveryQuery,
+);
+
+export const OrchestrationProjectionSnapshotQueryLive = Layer.merge(
+  ProjectionSnapshotQueryLive,
+  PendingTurnStartRecoveryQueryLive,
 );

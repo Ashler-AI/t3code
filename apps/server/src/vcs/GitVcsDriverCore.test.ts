@@ -1,18 +1,25 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, describe } from "@effect/vitest";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { GitCommandError } from "@t3tools/contracts";
 import { ServerConfig } from "../config.ts";
-import { splitNullSeparatedGitStdoutPaths } from "./GitVcsDriverCore.ts";
+import {
+  splitNullSeparatedGitStdoutPaths,
+  WORKTREE_CREATE_TIMEOUT_MS,
+} from "./GitVcsDriverCore.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 
 const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
@@ -37,6 +44,37 @@ const makeNonRepositoryHandle = () =>
     getInputFd: () => Sink.drain,
     getOutputFd: () => Stream.empty,
   });
+
+const makeGitHandle = (input: {
+  readonly exitCode: Effect.Effect<ChildProcessSpawner.ExitCode>;
+  readonly running: Ref.Ref<boolean>;
+  readonly stdout?: string;
+  readonly stderr?: string;
+  readonly onKill?: Effect.Effect<void>;
+}) =>
+  ChildProcessSpawner.makeHandle({
+    pid: ChildProcessSpawner.ProcessId(2),
+    exitCode: input.exitCode,
+    isRunning: Ref.get(input.running),
+    kill: () => (input.onKill ?? Effect.void).pipe(Effect.andThen(Ref.set(input.running, false))),
+    unref: Effect.succeed(Effect.void),
+    stdin: Sink.drain,
+    stdout: Stream.encodeText(Stream.make(input.stdout ?? "")),
+    stderr: Stream.encodeText(Stream.make(input.stderr ?? "")),
+    all: Stream.empty,
+    getInputFd: () => Sink.drain,
+    getOutputFd: () => Stream.empty,
+  });
+
+const scopedGitHandle = (
+  handle: ChildProcessSpawner.ChildProcessHandle,
+): Effect.Effect<ChildProcessSpawner.ChildProcessHandle, never, Scope.Scope> =>
+  Effect.acquireRelease(Effect.succeed(handle), () =>
+    handle.isRunning.pipe(
+      Effect.flatMap((running) => (running ? handle.kill() : Effect.void)),
+      Effect.ignore,
+    ),
+  );
 
 const makeTmpDir = (
   prefix = "git-vcs-driver-test-",
@@ -94,6 +132,325 @@ const initRepoWithCommit = (
     const initialBranch = yield* git(cwd, ["branch", "--show-current"]);
     return { initialBranch };
   });
+
+const gitDriverLayerWithSpawner = (spawner: ChildProcessSpawner.ChildProcessSpawner["Service"]) =>
+  GitVcsDriver.layer.pipe(
+    Layer.provide(ServerConfigLayer),
+    Layer.provideMerge(
+      Layer.merge(
+        NodeServices.layer,
+        Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      ),
+    ),
+  );
+
+describe("worktree materialization timeout", () => {
+  it.effect("allows a large worktree to materialize beyond the default Git timeout", () =>
+    Effect.gen(function* () {
+      const killed = yield* Ref.make(false);
+      const started = yield* Ref.make(false);
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          if (!ChildProcess.isStandardCommand(command)) {
+            return assert.fail("expected a standard Git command");
+          }
+          if (command.args[0] === "show-ref") {
+            const running = yield* Ref.make(false);
+            return yield* scopedGitHandle(
+              makeGitHandle({
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+                running,
+              }),
+            );
+          }
+          assert.deepEqual(command.args.slice(0, 3), ["worktree", "add", "-b"]);
+          const running = yield* Ref.make(true);
+          const exitCode = Ref.set(started, true).pipe(
+            Effect.andThen(Effect.sleep(Duration.millis(WORKTREE_CREATE_TIMEOUT_MS - 1_000))),
+            Effect.andThen(Ref.set(running, false)),
+            Effect.as(ChildProcessSpawner.ExitCode(0)),
+          );
+          return yield* scopedGitHandle(
+            makeGitHandle({
+              exitCode,
+              running,
+              onKill: Ref.set(killed, true),
+            }),
+          );
+        }),
+      );
+
+      const fiber = yield* Effect.service(GitVcsDriver.GitVcsDriver).pipe(
+        Effect.flatMap((driver) =>
+          driver.createWorktree({
+            cwd: "/repo",
+            path: "/worktrees/large",
+            refName: "main",
+            newRefName: "t3code/large",
+          }),
+        ),
+        Effect.provide(gitDriverLayerWithSpawner(spawner)),
+        Effect.forkScoped,
+      );
+      while (!(yield* Ref.get(started))) {
+        yield* Effect.yieldNow;
+      }
+      yield* TestClock.adjust(Duration.millis(WORKTREE_CREATE_TIMEOUT_MS - 1_000));
+
+      const result = yield* Fiber.join(fiber);
+      assert.equal(result.worktree.path, "/worktrees/large");
+      assert.isFalse(yield* Ref.get(killed));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("reconciles a worktree that completes while timeout cleanup is running", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const repoPath = yield* fileSystem.makeTempDirectoryScoped({ prefix: "git-reconcile-repo-" });
+      const worktreePath = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "git-reconcile-worktree-",
+      });
+      const worktreeStopped = yield* Ref.make(false);
+      const materialized = yield* Ref.make(false);
+      const started = yield* Ref.make(false);
+      const commands = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
+      const sha = "0123456789abcdef0123456789abcdef01234567";
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          if (!ChildProcess.isStandardCommand(command)) {
+            return assert.fail("expected a standard Git command");
+          }
+          yield* Ref.update(commands, (current) => [...current, command.args]);
+          if (command.args[0] === "show-ref") {
+            const running = yield* Ref.make(false);
+            return yield* scopedGitHandle(
+              makeGitHandle({
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+                running,
+              }),
+            );
+          }
+          const running = yield* Ref.make(
+            command.args[0] === "worktree" && command.args[1] === "add",
+          );
+          if (yield* Ref.get(running)) {
+            return yield* scopedGitHandle(
+              makeGitHandle({
+                exitCode: Ref.set(started, true).pipe(Effect.andThen(Effect.never)),
+                running,
+                onKill: Ref.set(worktreeStopped, true).pipe(
+                  Effect.andThen(Ref.set(materialized, true)),
+                ),
+              }),
+            );
+          }
+
+          assert.isTrue(yield* Ref.get(materialized));
+          const stdout =
+            command.args[0] === "worktree"
+              ? `worktree ${worktreePath}\nHEAD ${sha}\nbranch refs/heads/t3code/boundary\n\n`
+              : command.args[0] === "rev-parse"
+                ? `${sha}\n`
+                : "";
+          return yield* scopedGitHandle(
+            makeGitHandle({
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+              running,
+              stdout,
+            }),
+          );
+        }),
+      );
+
+      const fiber = yield* Effect.service(GitVcsDriver.GitVcsDriver).pipe(
+        Effect.flatMap((driver) =>
+          driver.createWorktree({
+            cwd: repoPath,
+            path: worktreePath,
+            refName: "main",
+            newRefName: "t3code/boundary",
+          }),
+        ),
+        Effect.provide(gitDriverLayerWithSpawner(spawner)),
+        Effect.forkScoped,
+      );
+      while (!(yield* Ref.get(started))) {
+        yield* Effect.yieldNow;
+      }
+      yield* TestClock.adjust(Duration.millis(WORKTREE_CREATE_TIMEOUT_MS));
+
+      const result = yield* Fiber.join(fiber);
+      assert.equal(result.worktree.path, worktreePath);
+      assert.isTrue(yield* Ref.get(worktreeStopped));
+      assert.sameDeepMembers(
+        Array.from(yield* Ref.get(commands)).filter(
+          (args) => !(args[0] === "worktree" && args[1] === "add") && args[0] !== "show-ref",
+        ),
+        [
+          ["worktree", "list", "--porcelain"],
+          ["rev-parse", "t3code/boundary^{commit}"],
+          ["rev-parse", "HEAD"],
+          ["status", "--porcelain=v1", "--untracked-files=no"],
+        ],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("cleans only the incomplete target so the same branch can be retried", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const pathService = yield* Path.Path;
+      const repoPath = yield* fileSystem.makeTempDirectoryScoped({ prefix: "git-cleanup-repo-" });
+      const worktreeParent = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "git-cleanup-worktrees-",
+      });
+      const worktreePath = pathService.join(worktreeParent, "retryable");
+      const started = yield* Ref.make(false);
+      const addAttempts = yield* Ref.make(0);
+      const branchExists = yield* Ref.make(false);
+      const commands = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
+      const targetBranch = "t3code/retryable";
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          if (!ChildProcess.isStandardCommand(command)) {
+            return assert.fail("expected a standard Git command");
+          }
+          yield* Ref.update(commands, (current) => [...current, command.args]);
+          const running = yield* Ref.make(false);
+          let exitCode: Effect.Effect<ChildProcessSpawner.ExitCode>;
+          let stdout = "";
+
+          if (command.args[0] === "show-ref") {
+            exitCode = Ref.get(branchExists).pipe(
+              Effect.map((exists) => ChildProcessSpawner.ExitCode(exists ? 0 : 1)),
+            );
+          } else if (command.args[0] === "worktree" && command.args[1] === "add") {
+            const attempt = yield* Ref.updateAndGet(addAttempts, (current) => current + 1);
+            if (attempt === 1) {
+              yield* Ref.set(running, true);
+              exitCode = fileSystem
+                .makeDirectory(worktreePath, { recursive: true })
+                .pipe(
+                  Effect.orDie,
+                  Effect.andThen(Ref.set(branchExists, true)),
+                  Effect.andThen(Ref.set(started, true)),
+                  Effect.andThen(Effect.never),
+                );
+            } else {
+              exitCode = Effect.succeed(ChildProcessSpawner.ExitCode(0));
+            }
+          } else if (command.args[0] === "worktree" && command.args[1] === "list") {
+            stdout = `worktree ${worktreePath}\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/${targetBranch}\n\n`;
+            exitCode = Effect.succeed(ChildProcessSpawner.ExitCode(0));
+          } else if (command.args[0] === "rev-parse") {
+            stdout = command.args[1] === "HEAD" ? `${"b".repeat(40)}\n` : `${"a".repeat(40)}\n`;
+            exitCode = Effect.succeed(ChildProcessSpawner.ExitCode(0));
+          } else if (command.args[0] === "branch" && command.args[1] === "-D") {
+            exitCode = Ref.set(branchExists, false).pipe(
+              Effect.as(ChildProcessSpawner.ExitCode(0)),
+            );
+          } else {
+            exitCode = Effect.succeed(ChildProcessSpawner.ExitCode(0));
+          }
+
+          return yield* scopedGitHandle(makeGitHandle({ exitCode, running, stdout }));
+        }),
+      );
+      const runCreate = Effect.service(GitVcsDriver.GitVcsDriver).pipe(
+        Effect.flatMap((driver) =>
+          driver.createWorktree({
+            cwd: repoPath,
+            path: worktreePath,
+            refName: "main",
+            newRefName: targetBranch,
+          }),
+        ),
+        Effect.provide(gitDriverLayerWithSpawner(spawner)),
+      );
+      const firstFiber = yield* runCreate.pipe(Effect.flip, Effect.forkScoped);
+      while (!(yield* Ref.get(started))) {
+        yield* Effect.yieldNow;
+      }
+      yield* TestClock.adjust(Duration.millis(WORKTREE_CREATE_TIMEOUT_MS));
+
+      const error = yield* Fiber.join(firstFiber);
+      assert.equal(error._tag, "GitCommandError");
+      if (error._tag !== "GitCommandError") {
+        return assert.fail("expected GitCommandError");
+      }
+      assert.include(error.detail, "exact-target cleanup completed");
+      assert.isFalse(yield* fileSystem.exists(worktreePath));
+      assert.isFalse(yield* Ref.get(branchExists));
+      const firstCommands = Array.from(yield* Ref.get(commands));
+      assert.deepInclude(firstCommands, ["worktree", "remove", "--force", worktreePath]);
+      assert.deepInclude(firstCommands, ["branch", "-D", "--", targetBranch]);
+      assert.notDeepInclude(firstCommands, ["worktree", "prune"]);
+
+      const retried = yield* runCreate;
+      assert.equal(retried.worktree.refName, targetBranch);
+      assert.equal(yield* Ref.get(addAttempts), 2);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("stops the worktree Git process when creation is cancelled", () =>
+    Effect.gen(function* () {
+      const killed = yield* Ref.make(false);
+      const started = yield* Ref.make(false);
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          if (!ChildProcess.isStandardCommand(command)) {
+            return assert.fail("expected a standard Git command");
+          }
+          if (command.args[0] === "show-ref") {
+            const running = yield* Ref.make(false);
+            return yield* scopedGitHandle(
+              makeGitHandle({
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+                running,
+              }),
+            );
+          }
+          if (!(command.args[0] === "worktree" && command.args[1] === "add")) {
+            const running = yield* Ref.make(false);
+            return yield* scopedGitHandle(
+              makeGitHandle({
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                running,
+              }),
+            );
+          }
+          const running = yield* Ref.make(true);
+          return yield* scopedGitHandle(
+            makeGitHandle({
+              exitCode: Ref.set(started, true).pipe(Effect.andThen(Effect.never)),
+              running,
+              onKill: Ref.set(killed, true),
+            }),
+          );
+        }),
+      );
+      const fiber = yield* Effect.service(GitVcsDriver.GitVcsDriver).pipe(
+        Effect.flatMap((driver) =>
+          driver.createWorktree({
+            cwd: "/repo",
+            path: "/worktrees/cancelled",
+            refName: "main",
+            newRefName: "t3code/cancelled",
+          }),
+        ),
+        Effect.provide(gitDriverLayerWithSpawner(spawner)),
+        Effect.forkScoped,
+      );
+      while (!(yield* Ref.get(started))) {
+        yield* Effect.yieldNow;
+      }
+
+      yield* Fiber.interrupt(fiber);
+
+      assert.isTrue(yield* Ref.get(killed));
+    }).pipe(Effect.scoped),
+  );
+});
 
 it.effect("uses stable diagnostics for every parsed non-repository command", () => {
   const commands: Array<{ readonly args: ReadonlyArray<string>; readonly lcAll?: string }> = [];
@@ -686,6 +1043,78 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* driver.removeWorktree({ cwd, path: worktreePath });
         const fileSystem = yield* FileSystem.FileSystem;
         assert.equal(yield* fileSystem.exists(worktreePath), false);
+      }),
+    );
+
+    it.effect("inherits the source branch PR base for session worktree reviews", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "session-from-feature",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["checkout", "-b", "feature/existing-pr"]);
+        yield* writeTextFile(cwd, "feature.txt", "feature change\n");
+        yield* git(cwd, ["add", "feature.txt"]);
+        yield* git(cwd, ["commit", "-m", "feature change"]);
+        yield* git(cwd, ["config", "branch.feature/existing-pr.gh-merge-base", initialBranch]);
+
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: "feature/existing-pr",
+          newRefName: "t3code/1234abcd",
+          baseRefName: "feature/existing-pr",
+        });
+        yield* writeTextFile(worktreePath, "session.txt", "session change\n");
+        yield* git(worktreePath, ["add", "session.txt"]);
+        yield* git(worktreePath, ["commit", "-m", "session change"]);
+
+        assert.equal(
+          yield* driver.readConfigValue(worktreePath, "branch.t3code/1234abcd.gh-merge-base"),
+          initialBranch,
+        );
+        const preview = yield* driver.getReviewDiffPreview({ cwd: worktreePath });
+        const branchRange = preview.sources.find((source) => source.kind === "branch-range");
+        assert.equal(branchRange?.baseRef, initialBranch);
+        assert.include(branchRange?.diff ?? "", "feature.txt");
+        assert.include(branchRange?.diff ?? "", "session.txt");
+      }),
+    );
+
+    it.effect("falls back to the default branch when source PR metadata is unavailable", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "session-without-pr-metadata",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["checkout", "-b", "feature/no-pr-metadata"]);
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: "feature/no-pr-metadata",
+          newRefName: "t3code/5678abcd",
+          baseRefName: "feature/no-pr-metadata",
+        });
+
+        assert.equal(
+          yield* driver.readConfigValue(worktreePath, "branch.t3code/5678abcd.gh-merge-base"),
+          initialBranch,
+        );
+        const preview = yield* driver.getReviewDiffPreview({ cwd: worktreePath });
+        assert.equal(
+          preview.sources.find((source) => source.kind === "branch-range")?.baseRef,
+          initialBranch,
+        );
       }),
     );
   });

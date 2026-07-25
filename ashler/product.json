@@ -1,0 +1,39 @@
+{
+  "$schema": "./product.schema.json",
+  "schemaVersion": 1,
+  "productName": "Ashler Code",
+  "defaultRepositoryBasename": "ashler-platform",
+  "bundleIdentifiers": {
+    "desktop": "ai.ashler.code",
+    "desktopHelper": "ai.ashler.code.helper",
+    "desktopLoginHelper": "ai.ashler.code.login-helper"
+  },
+  "urlSchemes": ["ashler-code"],
+  "dataDirectories": {
+    "home": ".ashler-code",
+    "userData": "ashler-code",
+    "developmentUserData": "ashler-code-dev"
+  },
+  "domains": {
+    "webOrigin": "${ASHLER_CODE_WEB_ORIGIN}",
+    "oauthCallbackOrigin": "${ASHLER_CODE_OAUTH_CALLBACK_ORIGIN}",
+    "scaffoldOrigin": "${ASHLER_SCAFFOLD_ORIGIN}"
+  },
+  "updateFeed": "${ASHLER_CODE_UPDATE_FEED_URL}",
+  "telemetry": {
+    "enabledByDefault": false
+  },
+  "runtimeProfile": {
+    "default": "local",
+    "profiles": {
+      "local": {
+        "allowedHarnesses": ["omp", "codex", "claude-code"],
+        "defaultHarness": "omp"
+      },
+      "scaffold": {
+        "allowedHarnesses": ["omp"],
+        "defaultHarness": "omp"
+      }
+    }
+  }
+}

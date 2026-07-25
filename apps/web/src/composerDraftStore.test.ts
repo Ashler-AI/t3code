@@ -14,8 +14,11 @@ import {
   ThreadId,
   type ModelSelection,
   type ProviderOptionSelection,
+  type ServerProvider,
 } from "@t3tools/contracts";
+import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import { createModelSelection } from "@t3tools/shared/model";
+import { getComposerProviderState } from "./components/chat/composerProviderState";
 
 // The composer draft's `modelSelectionByProvider` and
 // `stickyModelSelectionByProvider` maps are keyed by `ProviderInstanceId`
@@ -24,9 +27,11 @@ const CODEX_INSTANCE = ProviderInstanceId.make("codex");
 const CODEX_SECONDARY_INSTANCE = ProviderInstanceId.make("codex_secondary");
 const CLAUDE_AGENT_INSTANCE = ProviderInstanceId.make("claudeAgent");
 const CURSOR_INSTANCE = ProviderInstanceId.make("cursor");
+const OMP_INSTANCE = ProviderInstanceId.make("omp");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
+const OMP_DRIVER = ProviderDriverKind.make("omp");
 
 type ProviderOptionSelectionBag = ReadonlyArray<ProviderOptionSelection>;
 type ProviderOptionSelectionsByProvider = Partial<Record<string, ProviderOptionSelectionBag>>;
@@ -65,6 +70,7 @@ import {
   markPromotedDraftThreadByRef,
   markPromotedDraftThreads,
   markPromotedDraftThreadsByRef,
+  deriveEffectiveComposerModelState,
   type ComposerImageAttachment,
   useComposerDraftStore,
   DraftId,
@@ -146,6 +152,40 @@ function providerModelOptions(
   options: Partial<Record<string, Record<string, string | boolean | undefined>>>,
 ): ProviderOptionSelectionsByProvider {
   return selectionsByProvider(options);
+}
+
+function ompProvider(): ServerProvider {
+  return {
+    instanceId: OMP_INSTANCE,
+    driver: OMP_DRIVER,
+    enabled: true,
+    installed: true,
+    version: null,
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: "2026-07-24T00:00:00.000Z",
+    models: ["openai/gpt-5.6", "anthropic/claude-sonnet-5"].map((slug) => ({
+      slug,
+      name: slug,
+      isCustom: false,
+      capabilities: {
+        optionDescriptors: [
+          {
+            id: "reasoningEffort",
+            label: "Effort",
+            type: "select" as const,
+            currentValue: "medium",
+            options: [
+              { id: "medium", label: "Medium" },
+              { id: "high", label: "High" },
+            ],
+          },
+        ],
+      },
+    })),
+    slashCommands: [],
+    skills: [],
+  };
 }
 
 const TEST_ENVIRONMENT_ID = EnvironmentId.make("environment-local");
@@ -679,6 +719,61 @@ describe("composerDraftStore review comments", () => {
   });
 });
 
+describe("composerDraftStore transcript annotations", () => {
+  const threadId = ThreadId.make("thread-transcript-annotation");
+  const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+  const annotation = {
+    id: "selection-1",
+    messageId: "message-1",
+    role: "assistant" as const,
+    selectedText: "Selected response text",
+    comment: "Use this in the next turn.",
+  };
+
+  beforeEach(() => resetComposerDraftStore());
+
+  it("upserts, persists, and clears one-turn transcript context", () => {
+    const store = useComposerDraftStore.getState();
+    store.addTranscriptAnnotation(threadRef, annotation);
+    store.addTranscriptAnnotation(threadRef, { ...annotation, comment: "Updated." });
+
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.transcriptAnnotations).toEqual([
+      { ...annotation, comment: "Updated." },
+    ]);
+
+    const persistApi = useComposerDraftStore.persist as unknown as {
+      getOptions: () => {
+        partialize: (state: ReturnType<typeof useComposerDraftStore.getState>) => unknown;
+      };
+    };
+    const persisted = persistApi.getOptions().partialize(useComposerDraftStore.getState()) as {
+      draftsByThreadKey?: Record<
+        string,
+        { transcriptAnnotations?: Array<Record<string, unknown>> }
+      >;
+    };
+    expect(
+      persisted.draftsByThreadKey?.[threadKeyFor(threadId, TEST_ENVIRONMENT_ID)]
+        ?.transcriptAnnotations?.[0],
+    ).toMatchObject({ ...annotation, comment: "Updated." });
+
+    store.clearComposerContent(threadRef);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)).toBeUndefined();
+  });
+
+  it("removes transcript context without touching the prompt", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "Keep this draft");
+    store.addTranscriptAnnotation(threadRef, annotation);
+    store.removeTranscriptAnnotation(threadRef, annotation.id);
+
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)).toMatchObject({
+      prompt: "Keep this draft",
+      transcriptAnnotations: [],
+    });
+  });
+});
+
 describe("composerDraftStore project draft thread mapping", () => {
   const projectId = ProjectId.make("project-a");
   const otherProjectId = ProjectId.make("project-b");
@@ -1154,6 +1249,35 @@ describe("composerDraftStore modelSelection", () => {
 
   beforeEach(() => {
     resetComposerDraftStore();
+  });
+
+  it("rehydrates OMP's runtime-authoritative model and effort", () => {
+    const provider = ompProvider();
+    const runtimeSelection = createModelSelection(OMP_INSTANCE, "anthropic/claude-sonnet-5", [
+      { id: "reasoningEffort", value: "high" },
+    ]);
+    const state = deriveEffectiveComposerModelState({
+      draft: undefined,
+      providers: [provider],
+      selectedProvider: OMP_DRIVER,
+      selectedInstanceId: OMP_INSTANCE,
+      threadModelSelection: runtimeSelection,
+      projectModelSelection: createModelSelection(OMP_INSTANCE, "openai/gpt-5.6"),
+      settings: DEFAULT_UNIFIED_SETTINGS,
+    });
+
+    expect(state.selectedModel).toBe("anthropic/claude-sonnet-5");
+    expect(
+      getComposerProviderState({
+        provider: OMP_DRIVER,
+        model: state.selectedModel,
+        models: provider.models,
+        modelOptions: state.modelOptions?.[OMP_INSTANCE],
+      }),
+    ).toMatchObject({
+      promptEffort: "high",
+      modelOptionsForDispatch: [{ id: "reasoningEffort", value: "high" }],
+    });
   });
 
   it("stores a model selection in the draft", () => {

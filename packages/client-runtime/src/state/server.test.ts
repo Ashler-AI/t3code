@@ -7,10 +7,12 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import { Atom } from "effect/unstable/reactivity";
 
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -18,11 +20,13 @@ import {
   type PreparedConnection,
 } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import type { EnvironmentRegistry } from "../connection/registry.ts";
 import * as Persistence from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
   applyServerConfigProjection,
+  createServerEnvironmentAtoms,
   makeEnvironmentServerConfigState,
   projectServerWelcome,
   resolveServerConfigValue,
@@ -62,6 +66,19 @@ function session(client: WsRpcProtocolClient): RpcSession {
 }
 
 describe("server state projection", () => {
+  it("exposes Scaffold pause without duplicating HTTP connection preparation", () => {
+    const runtime = Atom.runtime(Layer.empty) as unknown as Atom.AtomRuntime<
+      EnvironmentRegistry | Persistence.EnvironmentCacheStore,
+      never
+    >;
+    const atoms = createServerEnvironmentAtoms(runtime, {
+      initialConfigValueAtom: () => Atom.make<ServerConfig | null>(null),
+    });
+
+    expect(atoms).toHaveProperty("pauseScaffold");
+    expect(atoms).not.toHaveProperty("prepareScaffoldConnection");
+  });
+
   it("applies every config category to the projected snapshot", () => {
     const snapshot = applyServerConfigProjection(Option.none(), {
       version: 1,

@@ -332,9 +332,80 @@ describe("getDefaultProviderInstanceModel", () => {
       getDefaultProviderInstanceModel([], ProviderInstanceId.make("removed_instance")),
     ).toBeUndefined();
   });
+
+  it("does not fabricate an OMP model before its live catalog is available", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("omp"),
+        instanceId: "omp",
+        status: "warning",
+        models: [],
+      }),
+    ];
+    expect(
+      getDefaultProviderInstanceModel(providers, ProviderInstanceId.make("omp")),
+    ).toBeUndefined();
+    expect(resolveDefaultProviderModelSelection(providers, null)).toBeNull();
+  });
 });
 
 describe("resolveDefaultProviderModelSelection", () => {
+  it("prefers the registered OMP harness over earlier native providers", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent",
+        models: [model("claude-fable-5", false, true)],
+      }),
+      provider({
+        provider: ProviderDriverKind.make("omp"),
+        instanceId: "omp",
+        models: [model("openai-codex/gpt-5.6-sol", false, true)],
+      }),
+    ];
+
+    expect(resolveDefaultProviderModelSelection(providers, null)).toEqual({
+      instanceId: "omp",
+      model: "openai-codex/gpt-5.6-sol",
+    });
+  });
+
+  it("waits for the registered OMP catalog instead of defaulting to a native provider", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent",
+        models: [model("claude-fable-5", false, true)],
+      }),
+      provider({
+        provider: ProviderDriverKind.make("omp"),
+        instanceId: "omp",
+        status: "warning",
+        models: [],
+      }),
+    ];
+
+    expect(resolveDefaultProviderModelSelection(providers, null)).toBeNull();
+  });
+
+  it("does not reuse an OMP catalog from a failed probe", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent",
+        models: [model("claude-fable-5", false, true)],
+      }),
+      provider({
+        provider: ProviderDriverKind.make("omp"),
+        instanceId: "omp",
+        status: "error",
+        models: [model("openai-codex/gpt-5.6-sol", false, true)],
+      }),
+    ];
+
+    expect(resolveDefaultProviderModelSelection(providers, null)).toBeNull();
+  });
+
   it.each([
     ["codex", "codex", "gpt-5.6"],
     ["claudeAgent", "claudeAgent", "claude-fable-5"],
@@ -360,6 +431,11 @@ describe("resolveDefaultProviderModelSelection", () => {
         provider: ProviderDriverKind.make("claudeAgent"),
         instanceId: "claudeAgent",
         models: [model("claude-opus-4-8")],
+      }),
+      provider({
+        provider: ProviderDriverKind.make("omp"),
+        instanceId: "omp",
+        models: [model("openai-codex/gpt-5.6-sol", false, true)],
       }),
     ];
     const stored = {

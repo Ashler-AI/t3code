@@ -492,6 +492,24 @@ export const OpenAI: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+/** Ashler's OMP harness mark: a compact pi glyph inside a terminal frame. */
+export const OmpIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.8"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={cn("text-foreground", className)}
+  >
+    <rect x="2.5" y="3.5" width="19" height="17" rx="3" />
+    <path d="m6.5 8 2.5 2.5L6.5 13" />
+    <path d="M12 9h5M13 9v6M16 9v6" />
+  </svg>
+);
+
 export const ClaudeAI: Icon = ({ className, ...props }) => (
   <svg
     {...props}

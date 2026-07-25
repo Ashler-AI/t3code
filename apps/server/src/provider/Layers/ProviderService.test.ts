@@ -12,10 +12,12 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
+  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionStartInput,
+  RuntimeSessionId,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -585,28 +587,132 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
 
 const routing = makeProviderServiceLayer();
 
-it.effect("ProviderServiceLive writes canonical events to the emitting thread segment", () =>
+it.effect(
+  "ProviderServiceLive checkpoints OMP identity only after durable ingestion acknowledgment",
+  () =>
+    Effect.gen(function* () {
+      const ompDriver = ProviderDriverKind.make("omp");
+      const omp = makeFakeCodexAdapter(ompDriver);
+      const canonicalEvents: ProviderRuntimeEvent[] = [];
+      const canonicalThreadIds: Array<string | null> = [];
+      const registry = makeAdapterRegistryMock({
+        [ompDriver]: omp.adapter,
+      });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerServiceLayer = makeProviderServiceLive({
+        environmentId: EnvironmentId.make("environment-canonical"),
+        canonicalEventLogger: {
+          filePath: "memory://provider-canonical-events",
+          write: (event, threadId) => {
+            canonicalEvents.push(event as ProviderRuntimeEvent);
+            canonicalThreadIds.push(threadId ?? null);
+            return Effect.void;
+          },
+          close: () => Effect.void,
+        },
+      }).pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      const providerLayer = Layer.merge(providerServiceLayer, directoryLayer);
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        const envelopeStream = provider.streamCanonicalEvents;
+        const deliveryStream = provider.streamCanonicalDeliveries;
+        assert.isDefined(envelopeStream);
+        assert.isDefined(deliveryStream);
+        const envelopeFiber = yield* Stream.runHead(envelopeStream!).pipe(Effect.forkChild);
+        const deliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
+        yield* advanceTestClock(10);
+        omp.emit({
+          eventId: asEventId("evt-canonical-thread-segment"),
+          provider: ompDriver,
+          threadId: asThreadId("thread-canonical-thread-segment"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          type: "turn.completed",
+          resumeCursor: {
+            schemaVersion: 3,
+            sessionId: "provider-checkpoint",
+            eventSequence: 7,
+            acpSequence: 5,
+          },
+          payload: {
+            state: "completed",
+          },
+        });
+        yield* advanceTestClock(20);
+        const envelope = Option.getOrThrow(yield* Fiber.join(envelopeFiber));
+        const delivery = Option.getOrThrow(yield* Fiber.join(deliveryFiber));
+        assert.equal(envelope.eventId, asEventId("evt-canonical-thread-segment"));
+        assert.equal(envelope.environmentId, EnvironmentId.make("environment-canonical"));
+        assert.equal(envelope.threadId, asThreadId("thread-canonical-thread-segment"));
+        assert.equal(envelope.sourceSequence, 7);
+        assert.equal(envelope.runtimeSessionId, RuntimeSessionId.make("provider-checkpoint"));
+        assert.deepEqual(envelope.resumeCursor, {
+          kind: "omp",
+          schemaVersion: 3,
+          sessionId: RuntimeSessionId.make("provider-checkpoint"),
+          eventSequence: 7,
+          acpSequence: 5,
+        });
+        const beforeAcknowledgment = yield* directory.getBinding(
+          asThreadId("thread-canonical-thread-segment"),
+        );
+        assert.isTrue(Option.isNone(beforeAcknowledgment));
+
+        assert.equal(delivery.envelope.eventId, envelope.eventId);
+        yield* delivery.acknowledge;
+
+        const afterAcknowledgment = yield* directory.getBinding(
+          asThreadId("thread-canonical-thread-segment"),
+        );
+        assert.isTrue(Option.isSome(afterAcknowledgment));
+        if (Option.isSome(afterAcknowledgment)) {
+          assert.deepEqual(afterAcknowledgment.value.resumeCursor, {
+            schemaVersion: 3,
+            sessionId: "provider-checkpoint",
+            eventSequence: 7,
+            acpSequence: 5,
+          });
+          assert.deepInclude(afterAcknowledgment.value.runtimePayload as Record<string, unknown>, {
+            canonicalSourceSequence: 7,
+            canonicalEventId: asEventId("evt-canonical-thread-segment"),
+          });
+        }
+      }).pipe(Effect.provide(providerLayer));
+
+      assert.equal(canonicalEvents.length, 1);
+      assert.equal(canonicalEvents[0]?.threadId, "thread-canonical-thread-segment");
+      assert.deepEqual(canonicalThreadIds, ["thread-canonical-thread-segment"]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive republishes rejected deliveries without advancing the cursor", () =>
   Effect.gen(function* () {
-    const codex = makeFakeCodexAdapter();
-    const canonicalEvents: ProviderRuntimeEvent[] = [];
-    const canonicalThreadIds: Array<string | null> = [];
-    const registry = makeAdapterRegistryMock({
-      [ProviderDriverKind.make("codex")]: codex.adapter,
-    });
+    const ompDriver = ProviderDriverKind.make("omp");
+    const omp = makeFakeCodexAdapter(ompDriver);
+    const registry = makeAdapterRegistryMock({ [ompDriver]: omp.adapter });
     const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
       Layer.provide(SqlitePersistenceMemory),
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = makeProviderServiceLive({
-      canonicalEventLogger: {
-        filePath: "memory://provider-canonical-events",
-        write: (event, threadId) => {
-          canonicalEvents.push(event as ProviderRuntimeEvent);
-          canonicalThreadIds.push(threadId ?? null);
-          return Effect.void;
-        },
-        close: () => Effect.void,
-      },
+    const providerServiceLayer = makeProviderServiceLive({
+      environmentId: EnvironmentId.make("environment-retry"),
     }).pipe(
       Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
       Layer.provide(directoryLayer),
@@ -619,26 +725,136 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
         ),
       ),
     );
+    const providerLayer = Layer.merge(providerServiceLayer, directoryLayer);
 
     yield* Effect.gen(function* () {
-      yield* ProviderService.ProviderService;
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const deliveryStream = provider.streamCanonicalDeliveries;
+      assert.isDefined(deliveryStream);
+
+      const firstDeliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
       yield* advanceTestClock(10);
-      codex.emit({
-        eventId: asEventId("evt-canonical-thread-segment"),
-        provider: ProviderDriverKind.make("codex"),
-        threadId: asThreadId("thread-canonical-thread-segment"),
+      omp.emit({
+        eventId: asEventId("evt-retry-stable"),
+        provider: ompDriver,
+        threadId: asThreadId("thread-retry-stable"),
         createdAt: "2026-01-01T00:00:00.000Z",
         type: "turn.completed",
-        payload: {
-          state: "completed",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "provider-retry",
+          eventSequence: 11,
+          acpSequence: 9,
         },
+        payload: { state: "completed" },
       });
       yield* advanceTestClock(20);
-    }).pipe(Effect.provide(providerLayer));
+      const firstDelivery = Option.getOrThrow(yield* Fiber.join(firstDeliveryFiber));
 
-    assert.equal(canonicalEvents.length, 1);
-    assert.equal(canonicalEvents[0]?.threadId, "thread-canonical-thread-segment");
-    assert.deepEqual(canonicalThreadIds, ["thread-canonical-thread-segment"]);
+      yield* firstDelivery.retry(new Error("projection commit failed"));
+      yield* advanceTestClock(10);
+      const afterRetry = yield* directory.getBinding(asThreadId("thread-retry-stable"));
+      assert.isTrue(Option.isNone(afterRetry));
+
+      const secondDelivery = Option.getOrThrow(
+        yield* Stream.runHead(deliveryStream!).pipe(Effect.timeout("2 seconds")),
+      );
+      assert.equal(secondDelivery.envelope.eventId, firstDelivery.envelope.eventId);
+      assert.equal(secondDelivery.envelope.sourceSequence, firstDelivery.envelope.sourceSequence);
+      assert.deepEqual(secondDelivery.envelope.resumeCursor, firstDelivery.envelope.resumeCursor);
+
+      yield* secondDelivery.acknowledge;
+      const afterAcknowledgment = yield* directory.getBinding(asThreadId("thread-retry-stable"));
+      assert.isTrue(Option.isSome(afterAcknowledgment));
+      if (Option.isSome(afterAcknowledgment)) {
+        assert.deepInclude(afterAcknowledgment.value.runtimePayload as Record<string, unknown>, {
+          canonicalSourceSequence: 11,
+          canonicalEventId: asEventId("evt-retry-stable"),
+        });
+      }
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive resumes synthesized non-OMP source sequences after restart", () =>
+  Effect.gen(function* () {
+    const tempDir = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-provider-sequence-restart-"),
+    );
+    const dbPath = NodePath.join(tempDir, "orchestration.sqlite");
+    const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(persistenceLayer),
+    );
+    const makeRuntimeLayer = (adapter: ReturnType<typeof makeFakeCodexAdapter>) => {
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: adapter.adapter });
+      const providerLayer = makeProviderServiceLive({
+        environmentId: EnvironmentId.make("environment-sequence-restart"),
+      }).pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      return Layer.merge(providerLayer, directoryLayer);
+    };
+    const threadId = asThreadId("thread-sequence-restart");
+
+    const firstAdapter = makeFakeCodexAdapter();
+    const firstSequence = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const deliveryStream = provider.streamCanonicalDeliveries;
+      assert.isDefined(deliveryStream);
+      const deliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
+      yield* advanceTestClock(10);
+      firstAdapter.emit({
+        eventId: asEventId("evt-sequence-before-restart"),
+        provider: CODEX_DRIVER,
+        threadId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        type: "turn.completed",
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+      const delivery = Option.getOrThrow(yield* Fiber.join(deliveryFiber));
+      yield* delivery.acknowledge;
+      return delivery.envelope.sourceSequence;
+    }).pipe(Effect.provide(makeRuntimeLayer(firstAdapter)));
+    assert.equal(firstSequence, 1);
+
+    const secondAdapter = makeFakeCodexAdapter();
+    const secondSequence = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const deliveryStream = provider.streamCanonicalDeliveries;
+      assert.isDefined(deliveryStream);
+      const deliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
+      yield* advanceTestClock(10);
+      secondAdapter.emit({
+        eventId: asEventId("evt-sequence-after-restart"),
+        provider: CODEX_DRIVER,
+        threadId,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        type: "turn.completed",
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+      const delivery = Option.getOrThrow(yield* Fiber.join(deliveryFiber));
+      yield* delivery.acknowledge;
+      return delivery.envelope.sourceSequence;
+    }).pipe(Effect.provide(makeRuntimeLayer(secondAdapter)));
+    assert.equal(secondSequence, 2);
+
+    NodeFS.rmSync(tempDir, { recursive: true, force: true });
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 

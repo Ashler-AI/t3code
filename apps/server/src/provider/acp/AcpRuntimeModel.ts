@@ -5,7 +5,11 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import type * as EffectAcpSchema from "effect-acp/schema";
 import { deriveToolActivityPresentation } from "@t3tools/shared/toolActivity";
-import type { ToolLifecycleItemType } from "@t3tools/contracts";
+import type {
+  RuntimeContentStreamKind,
+  ThreadTokenUsageSnapshot,
+  ToolLifecycleItemType,
+} from "@t3tools/contracts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -80,7 +84,7 @@ export interface AcpPermissionRequest {
   readonly toolCall?: AcpToolCallState;
 }
 
-export type AcpParsedSessionEvent =
+export type AcpParsedSessionEvent = (
   | {
       readonly _tag: "ModeChanged";
       readonly modeId: string;
@@ -88,10 +92,12 @@ export type AcpParsedSessionEvent =
   | {
       readonly _tag: "AssistantItemStarted";
       readonly itemId: string;
+      readonly itemType: "assistant_message" | "reasoning";
     }
   | {
       readonly _tag: "AssistantItemCompleted";
       readonly itemId: string;
+      readonly itemType: "assistant_message" | "reasoning";
     }
   | {
       readonly _tag: "PlanUpdated";
@@ -106,9 +112,29 @@ export type AcpParsedSessionEvent =
   | {
       readonly _tag: "ContentDelta";
       readonly itemId?: string;
+      readonly streamKind: Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
       readonly text: string;
       readonly rawPayload: unknown;
-    };
+    }
+  | {
+      readonly _tag: "TokenUsageUpdated";
+      readonly usage: ThreadTokenUsageSnapshot;
+      readonly rawPayload: unknown;
+    }
+  | {
+      readonly _tag: "ConfigOptionsUpdated";
+      readonly configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+    }
+  | {
+      readonly _tag: "SessionInfoUpdated";
+      readonly title?: string;
+      readonly updatedAt?: string;
+      readonly rawPayload: unknown;
+    }
+) & {
+  /** Stable ordinal of the source `session/update` notification. */
+  readonly sourceSequence?: number;
+};
 
 type AcpSessionSetupResponse =
   | EffectAcpSchema.LoadSessionResponse
@@ -566,9 +592,63 @@ export function parseSessionUpdateEvent(params: EffectAcpSchema.SessionNotificat
     }
     case "agent_message_chunk": {
       if (upd.content.type === "text" && upd.content.text.length > 0) {
+        const itemId = upd.messageId?.trim() || undefined;
         events.push({
           _tag: "ContentDelta",
+          ...(itemId ? { itemId } : {}),
+          streamKind: "assistant_text",
           text: upd.content.text,
+          rawPayload: params,
+        });
+      }
+      break;
+    }
+    case "agent_thought_chunk": {
+      if (upd.content.type === "text" && upd.content.text.length > 0) {
+        const itemId = upd.messageId?.trim() || undefined;
+        events.push({
+          _tag: "ContentDelta",
+          ...(itemId ? { itemId } : {}),
+          streamKind: "reasoning_text",
+          text: upd.content.text,
+          rawPayload: params,
+        });
+      }
+      break;
+    }
+    case "usage_update": {
+      if (
+        Number.isSafeInteger(upd.used) &&
+        upd.used >= 0 &&
+        Number.isSafeInteger(upd.size) &&
+        upd.size > 0
+      ) {
+        events.push({
+          _tag: "TokenUsageUpdated",
+          usage: {
+            usedTokens: upd.used,
+            maxTokens: upd.size,
+          },
+          rawPayload: params,
+        });
+      }
+      break;
+    }
+    case "config_option_update": {
+      events.push({
+        _tag: "ConfigOptionsUpdated",
+        configOptions: upd.configOptions,
+      });
+      break;
+    }
+    case "session_info_update": {
+      const title = upd.title?.trim() || undefined;
+      const updatedAt = upd.updatedAt?.trim() || undefined;
+      if (title || updatedAt) {
+        events.push({
+          _tag: "SessionInfoUpdated",
+          ...(title ? { title } : {}),
+          ...(updatedAt ? { updatedAt } : {}),
           rawPayload: params,
         });
       }

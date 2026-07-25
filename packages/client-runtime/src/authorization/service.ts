@@ -49,6 +49,8 @@ export class RemoteEnvironmentAuthorization extends Context.Service<
     }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
     readonly authorizeDpop: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
+      /** Disable persistent access-token reuse for one-time managed bootstraps. */
+      readonly persistAccessToken?: boolean;
       readonly obtainBootstrap: Effect.Effect<
         RelayEnvironmentAuthorization,
         ConnectionAttemptError
@@ -172,6 +174,7 @@ export const make = Effect.gen(function* () {
       readonly obtainBootstrap: Parameters<
         RemoteEnvironmentAuthorization["Service"]["authorizeDpop"]
       >[0]["obtainBootstrap"];
+      readonly persistAccessToken?: boolean;
     }) {
       const thumbprint = yield* signer.thumbprint.pipe(
         Effect.mapError(
@@ -184,9 +187,12 @@ export const make = Effect.gen(function* () {
         Effect.withSpan("environment.authorization.dpopKey.resolve"),
       );
       const now = yield* Clock.currentTimeMillis;
-      const cached = yield* tokenStore
-        .get(input.expectedEnvironmentId)
-        .pipe(Effect.withSpan("environment.authorization.accessToken.cache"));
+      const persistAccessToken = input.persistAccessToken !== false;
+      const cached = persistAccessToken
+        ? yield* tokenStore
+            .get(input.expectedEnvironmentId)
+            .pipe(Effect.withSpan("environment.authorization.accessToken.cache"))
+        : Option.none<TokenStore.RemoteDpopAccessToken>();
       if (
         Option.isSome(cached) &&
         cached.value.environmentId === input.expectedEnvironmentId &&
@@ -276,9 +282,11 @@ export const make = Effect.gen(function* () {
         dpopThumbprint: thumbprint,
       });
       const socketUrl = yield* createDpopSocketUrl(token).pipe(Effect.mapError(mapDpopSocketError));
-      yield* tokenStore
-        .put(token)
-        .pipe(Effect.withSpan("environment.authorization.accessToken.persist"));
+      if (persistAccessToken) {
+        yield* tokenStore
+          .put(token)
+          .pipe(Effect.withSpan("environment.authorization.accessToken.persist"));
+      }
       return {
         environmentId: descriptor.environmentId,
         label: descriptor.label,

@@ -58,6 +58,7 @@ import {
   type DesktopSecondaryBootstrapsRead,
 } from "./desktopLocal";
 import { connectionStorageLayer } from "./storage";
+import { scaffoldLifecycleGatewayLayer } from "./scaffold";
 
 let nextObservedRpcRequestId = 0;
 
@@ -605,7 +606,8 @@ type ConnectionPlatformLayerSource =
   | typeof capabilitiesLayer
   | typeof platformConnectionSourceLayer
   | typeof environmentOwnedDataCleanupLayer
-  | typeof rpcRequestObserverLayer;
+  | typeof rpcRequestObserverLayer
+  | typeof scaffoldLifecycleGatewayLayer;
 
 export const connectionPlatformLayer: Layer.Layer<
   Layer.Success<ConnectionPlatformLayerSource>,
@@ -619,4 +621,5 @@ export const connectionPlatformLayer: Layer.Layer<
   platformConnectionSourceLayer,
   environmentOwnedDataCleanupLayer,
   rpcRequestObserverLayer,
+  scaffoldLifecycleGatewayLayer,
 );

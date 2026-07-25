@@ -1,10 +1,10 @@
 import {
   CommandId,
-  DEFAULT_MODEL,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   type ModelSelection,
   ProjectId,
   ProviderInstanceId,
+  type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
@@ -34,6 +34,8 @@ import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReaper.ts";
+import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import { resolveAshlerOmpDefaultModel } from "./ashler/OmpModelPolicy.ts";
 import {
   formatHeadlessServeOutput,
   formatHostForUrl,
@@ -161,10 +163,22 @@ export const launchStartupHeartbeat = recordStartupHeartbeat.pipe(
   Effect.asVoid,
 );
 
-export const getAutoBootstrapDefaultModelSelection = (): ModelSelection => ({
-  instanceId: ProviderInstanceId.make("codex"),
-  model: DEFAULT_MODEL,
-});
+const OMP_INSTANCE_ID = ProviderInstanceId.make("omp");
+
+export const getAutoBootstrapDefaultModelSelection = (
+  providers: ReadonlyArray<ServerProvider>,
+): ModelSelection | null => {
+  const omp = providers.find(
+    (provider) =>
+      provider.instanceId === OMP_INSTANCE_ID &&
+      provider.driver === "omp" &&
+      provider.enabled &&
+      provider.availability !== "unavailable" &&
+      provider.status !== "error",
+  );
+  const model = omp ? resolveAshlerOmpDefaultModel(omp.models) : undefined;
+  return model ? { instanceId: OMP_INSTANCE_ID, model: model.slug } : null;
+};
 
 export const resolveWelcomeBase = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
@@ -183,7 +197,10 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const projectionReadModelQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
+  const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const path = yield* Path.Path;
+  const providers = yield* providerRegistry.refreshInstance(OMP_INSTANCE_ID);
+  const liveDefaultModelSelection = getAutoBootstrapDefaultModelSelection(providers);
 
   let bootstrapProjectId: ProjectId | undefined;
   let bootstrapThreadId: ThreadId | undefined;
@@ -194,13 +211,13 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
         serverConfig.cwd,
       );
       let nextProjectId: ProjectId;
-      let nextProjectDefaultModelSelection: ModelSelection;
+      let nextProjectDefaultModelSelection: ModelSelection | null;
 
       if (Option.isNone(existingProject)) {
         const createdAt = DateTime.formatIso(yield* DateTime.now);
         nextProjectId = ProjectId.make(yield* randomUUID);
         const bootstrapProjectTitle = path.basename(serverConfig.cwd) || "project";
-        nextProjectDefaultModelSelection = getAutoBootstrapDefaultModelSelection();
+        nextProjectDefaultModelSelection = liveDefaultModelSelection;
         yield* orchestrationEngine.dispatch({
           type: "project.create",
           commandId: CommandId.make(yield* randomUUID),
@@ -213,12 +230,16 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
       } else {
         nextProjectId = existingProject.value.id;
         nextProjectDefaultModelSelection =
-          existingProject.value.defaultModelSelection ?? getAutoBootstrapDefaultModelSelection();
+          existingProject.value.defaultModelSelection ?? liveDefaultModelSelection;
       }
 
       const existingThreadId =
         yield* projectionReadModelQuery.getFirstActiveThreadIdByProjectId(nextProjectId);
       if (Option.isNone(existingThreadId)) {
+        if (nextProjectDefaultModelSelection === null) {
+          bootstrapProjectId = nextProjectId;
+          return;
+        }
         const createdAt = DateTime.formatIso(yield* DateTime.now);
         const createdThreadId = ThreadId.make(yield* randomUUID);
         yield* orchestrationEngine.dispatch({

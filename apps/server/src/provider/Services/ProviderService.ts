@@ -17,6 +17,7 @@ import type {
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
   ProviderRuntimeEvent,
+  ProviderRuntimeEventEnvelope,
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
@@ -111,6 +112,31 @@ export interface ProviderServiceShape {
    * Fan-out is owned by ProviderService (not by a standalone event-bus service).
    */
   readonly streamEvents: Stream.Stream<ProviderRuntimeEvent>;
+
+  /**
+   * Raw provider envelope fan-out. This stream is published before durable
+   * orchestration ingestion and must never be used as transcript, Relay, or
+   * multiplayer authority. Those consumers subscribe to committed
+   * `OrchestrationEngine.streamDomainEvents` (or replay `readEvents`) instead.
+   * Optional so test and third-party service implementations can migrate
+   * additively.
+   */
+  readonly streamCanonicalEvents?: Stream.Stream<ProviderRuntimeEventEnvelope>;
+
+  /**
+   * Single-consumer durable delivery stream for orchestration ingestion.
+   *
+   * The consumer must acknowledge only after its event store, projections,
+   * and command receipt are committed. Retrying republishes the same envelope
+   * identity and source sequence without advancing provider resume state.
+   */
+  readonly streamCanonicalDeliveries?: Stream.Stream<ProviderRuntimeEventDelivery>;
+}
+
+export interface ProviderRuntimeEventDelivery {
+  readonly envelope: ProviderRuntimeEventEnvelope;
+  readonly acknowledge: Effect.Effect<void, ProviderServiceError>;
+  readonly retry: (cause?: unknown) => Effect.Effect<void>;
 }
 
 /**

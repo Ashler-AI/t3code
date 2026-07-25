@@ -1,0 +1,118 @@
+import { EnvironmentId } from "@t3tools/contracts";
+import { describe, expect, it } from "vite-plus/test";
+
+import type { ScaffoldLifecycleAction } from "./model.ts";
+import {
+  makeScaffoldLifecycleAction,
+  makeScaffoldLifecycleOutbox,
+  type ScaffoldLifecycleActionStore,
+} from "./outbox.ts";
+
+function action(actionId: string, kind: "create" | "resume" | "pause" = "resume") {
+  return makeScaffoldLifecycleAction({
+    actionId,
+    kind,
+    environmentId: EnvironmentId.make("env-1"),
+    connectionId: "connection-1",
+    sessionId: `session-${actionId}`,
+    expectedLifecycleEpoch: 1,
+    createdAt: `2026-07-24T19:00:0${actionId.at(-1) ?? "0"}.000Z`,
+  });
+}
+
+function memoryStore(initial: ReadonlyArray<ScaffoldLifecycleAction> = []) {
+  const values = new Map(initial.map((item) => [item.actionId, item]));
+  const store: ScaffoldLifecycleActionStore = {
+    list: async () => [...values.values()],
+    put: async (item) => {
+      values.set(item.actionId, item);
+    },
+    remove: async (actionId) => {
+      values.delete(actionId);
+    },
+  };
+  return { store, values };
+}
+
+describe("Scaffold lifecycle outbox", () => {
+  it("does not let a retry or blocked action starve later ready actions", async () => {
+    const first = action("1");
+    const second = action("2");
+    const third = action("3");
+    const { store, values } = memoryStore([first, second, third]);
+    const calls: string[] = [];
+    const outbox = makeScaffoldLifecycleOutbox({
+      store,
+      execute: async (item) => {
+        calls.push(item.actionId);
+        if (item.actionId === "1") {
+          return { _tag: "retry", retryAfterMs: 1_000, errorCode: "starting" };
+        }
+        if (item.actionId === "2") {
+          return { _tag: "blocked", errorCode: "agent_turn_running" };
+        }
+        return { _tag: "acknowledged" };
+      },
+      now: () => 100,
+    });
+
+    await outbox.drain();
+
+    expect(calls).toEqual(["1", "2", "3"]);
+    expect(values.has("3")).toBe(false);
+    expect(values.get("1")).toMatchObject({ blocked: false, nextAttemptAt: 1_100 });
+    expect(values.get("2")).toMatchObject({ blocked: true, nextAttemptAt: null });
+  });
+
+  it("never retries terminal blocked records", async () => {
+    const blocked = makeScaffoldLifecycleAction({
+      actionId: "blocked",
+      kind: "pause",
+      environmentId: EnvironmentId.make("env-1"),
+      connectionId: "connection-1",
+      sessionId: "session-blocked",
+      expectedLifecycleEpoch: 1,
+      createdAt: "2026-07-24T19:00:00.000Z",
+    });
+    const terminal = { ...blocked, blocked: true } as ScaffoldLifecycleAction;
+    const { store } = memoryStore([terminal]);
+    let executions = 0;
+    const outbox = makeScaffoldLifecycleOutbox({
+      store,
+      execute: async () => {
+        executions += 1;
+        return { _tag: "acknowledged" };
+      },
+    });
+
+    await outbox.drain();
+    expect(executions).toBe(0);
+  });
+
+  it("serializes enqueue and drain store mutations", async () => {
+    const values = new Map<string, ScaffoldLifecycleAction>([["1", action("1")]]);
+    let activeMutations = 0;
+    let maxActiveMutations = 0;
+    const mutation = async (run: () => void) => {
+      activeMutations += 1;
+      maxActiveMutations = Math.max(maxActiveMutations, activeMutations);
+      await Promise.resolve();
+      run();
+      activeMutations -= 1;
+    };
+    const store: ScaffoldLifecycleActionStore = {
+      list: async () => [...values.values()],
+      put: (item) => mutation(() => values.set(item.actionId, item)),
+      remove: (actionId) => mutation(() => values.delete(actionId)),
+    };
+    const outbox = makeScaffoldLifecycleOutbox({
+      store,
+      execute: async () => ({ _tag: "acknowledged" }),
+    });
+
+    await Promise.all([outbox.drain(), outbox.enqueue(action("2"))]);
+
+    expect(maxActiveMutations).toBe(1);
+    expect(values.has("2")).toBe(true);
+  });
+});
