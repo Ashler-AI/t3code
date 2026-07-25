@@ -1,0 +1,81 @@
+name: Deploy session fabric proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Deploy or destroy the isolated proof Worker
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - destroy
+
+permissions:
+  contents: read
+  id-token: none
+
+concurrency:
+  group: session-fabric-proof
+  cancel-in-progress: false
+
+jobs:
+  session_fabric:
+    name: ${{ inputs.operation == 'deploy' && 'Deploy' || 'Destroy' }} session fabric proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: session-fabric-proof
+    env:
+      ALCHEMY_TELEMETRY_DISABLED: "1"
+      CI: "true"
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    outputs:
+      relay_url: ${{ steps.endpoint.outputs.relay_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Apply isolated proof stack
+        if: inputs.operation == 'deploy'
+        run: vp run --filter @t3tools/session-fabric-worker deploy --stage proof --yes
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - id: endpoint
+        name: Resolve and verify public Relay endpoint
+        if: inputs.operation == 'deploy'
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          response="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain")"
+          subdomain="$(node -e '
+            const response = JSON.parse(process.argv[1]);
+            if (response.success !== true || typeof response.result?.subdomain !== "string") {
+              throw new Error("Cloudflare did not return a workers.dev subdomain");
+            }
+            process.stdout.write(response.result.subdomain);
+          ' "$response")"
+          relay_url="https://ashler-session-fabric-proof.${subdomain}.workers.dev"
+          curl --fail-with-body --silent --show-error "${relay_url}/health"
+          echo "relay_url=${relay_url}" >> "$GITHUB_OUTPUT"
+          echo "### Session fabric proof" >> "$GITHUB_STEP_SUMMARY"
+          echo "Relay URL: ${relay_url}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Destroy isolated proof stack
+        if: inputs.operation == 'destroy'
+        run: vp run --filter @t3tools/session-fabric-worker destroy --stage proof --yes
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
