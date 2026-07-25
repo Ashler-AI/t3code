@@ -286,6 +286,25 @@ describe("ConnectionResolver", () => {
     }),
   );
 
+  it.effect("preserves the explicit websocket route beneath a primary environment mount", () =>
+    Effect.gen(function* () {
+      const brokerLayer = yield* makeDependencies();
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+      const target = new PrimaryConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Mounted primary",
+        httpBaseUrl: "https://platform.example.test/sessions/session-123/agent/",
+        wsBaseUrl: "wss://platform.example.test/sessions/session-123/agent/ws",
+      });
+
+      expect(yield* broker.prepare(catalogEntry(target))).toMatchObject({
+        httpBaseUrl: "https://platform.example.test/sessions/session-123/agent/",
+        socketUrl: "wss://platform.example.test/sessions/session-123/agent/ws",
+        httpAuthorization: null,
+      });
+    }),
+  );
+
   it.effect("authorizes a desktop primary environment with its platform bearer token", () =>
     Effect.gen(function* () {
       const bearerInputs = yield* Ref.make<ReadonlyArray<string>>([]);

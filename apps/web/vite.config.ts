@@ -91,6 +91,9 @@ const devProxyTarget = resolveDevProxyTarget(configuredWsUrl);
 
 export default defineConfig(() => {
   return {
+    // Keep production bootstrap assets relative to the document so the same
+    // build can be served at `/` or beneath a Scaffold session mount.
+    base: "./",
     plugins: [
       {
         name: "ashler-web-product-identity",

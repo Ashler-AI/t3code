@@ -1,6 +1,8 @@
 import { PRIMARY_LOCAL_ENVIRONMENT_ID, type DesktopEnvironmentBootstrap } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
+import { readRuntimeBasePath, resolveRuntimePathname } from "../../runtimeBasePath";
+
 const PrimaryEnvironmentTargetSource = Schema.Literals([
   "configured",
   "window-origin",
@@ -210,11 +212,13 @@ function resolveConfiguredPrimaryTarget(): PrimaryEnvironmentTarget | null {
 }
 
 function resolveWindowOriginPrimaryTarget(): PrimaryEnvironmentTarget {
+  const runtimeBasePath = readRuntimeBasePath();
   const url = parseTargetUrl({
     rawValue: window.location.origin,
     source: "window-origin",
     urlKind: "http-base-url",
   });
+  url.pathname = `${runtimeBasePath}/`;
   const httpBaseUrl = url.toString();
   if (url.protocol === "http:") {
     url.protocol = "ws:";
@@ -226,6 +230,7 @@ function resolveWindowOriginPrimaryTarget(): PrimaryEnvironmentTarget {
       protocol: url.protocol,
     });
   }
+  url.pathname = `${runtimeBasePath}/ws`;
   return {
     source: "window-origin",
     target: {
@@ -278,7 +283,8 @@ export function resolvePrimaryEnvironmentHttpUrl(
     source: primaryTarget.source,
     urlKind: "http-base-url",
   });
-  url.pathname = pathname;
+  url.pathname =
+    primaryTarget.source === "window-origin" ? resolveRuntimePathname(pathname) : pathname;
   if (searchParams) {
     url.search = new URLSearchParams(searchParams).toString();
   }

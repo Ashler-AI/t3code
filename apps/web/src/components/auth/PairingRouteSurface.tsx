@@ -10,6 +10,7 @@ import {
   submitServerAuthCredential,
 } from "../../environments/primary";
 import { readHostedPairingRequest } from "../../hostedPairing";
+import { resolveRuntimePathname } from "../../runtimeBasePath";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -277,7 +278,11 @@ export function HostedPairingRouteSurface() {
             </Button>
           ) : null}
           {status === "paired" ? (
-            <Button size="sm" variant="outline" onClick={() => (window.location.href = "/")}>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => (window.location.href = resolveRuntimePathname("/"))}
+            >
               Open app
             </Button>
           ) : null}

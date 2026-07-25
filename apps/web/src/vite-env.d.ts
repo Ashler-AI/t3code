@@ -22,6 +22,7 @@ interface ImportMeta {
 
 declare global {
   interface Window {
+    __T3CODE_BASE_PATH__?: string;
     nativeApi?: LocalApi;
     desktopBridge?: DesktopBridge;
   }
