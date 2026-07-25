@@ -100,7 +100,7 @@ describe("environmentBootstrap", () => {
       environmentId: "environment-local",
       target: {
         httpBaseUrl: "http://localhost:3773/",
-        wsBaseUrl: "ws://localhost:3773/",
+        wsBaseUrl: "ws://localhost:3773/ws",
       },
     });
   });
@@ -162,6 +162,27 @@ describe("environmentBootstrap", () => {
     await expect(resolveInitialPrimaryEnvironmentDescriptor()).resolves.toEqual(BASE_ENVIRONMENT);
     expect(resolvePrimaryEnvironmentHttpUrl("/.well-known/t3/environment")).toBe(
       "http://localhost:5735/.well-known/t3/environment",
+    );
+  });
+
+  it("keeps same-origin HTTP and websocket targets under the runtime session mount", () => {
+    vi.stubGlobal("window", {
+      __T3CODE_BASE_PATH__: "/sessions/session-123/agent",
+      location: new URL("https://platform.example.test/sessions/session-123/agent/"),
+      history: {
+        replaceState: vi.fn(),
+      },
+    });
+
+    expect(readPrimaryEnvironmentTarget()).toEqual({
+      source: "window-origin",
+      target: {
+        httpBaseUrl: "https://platform.example.test/sessions/session-123/agent/",
+        wsBaseUrl: "wss://platform.example.test/sessions/session-123/agent/ws",
+      },
+    });
+    expect(resolvePrimaryEnvironmentHttpUrl("/api/auth/session")).toBe(
+      "https://platform.example.test/sessions/session-123/agent/api/auth/session",
     );
   });
 

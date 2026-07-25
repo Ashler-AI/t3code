@@ -338,6 +338,74 @@ describe("remote environment authorization", () => {
     }),
   );
 
+  it.effect("keeps descriptor, auth, and websocket requests beneath a non-root mount", () =>
+    Effect.gen(function* () {
+      const fetch = recordedFetch(
+        Response.json(
+          {
+            environmentId: "environment-session",
+            label: "Session environment",
+            platform: { os: "linux", arch: "x64" },
+            serverVersion: "0.0.0-test",
+            capabilities: { repositoryIdentity: true },
+          },
+          { status: 200 },
+        ),
+        Response.json(
+          {
+            authenticated: true,
+            auth: {
+              policy: "remote-reachable",
+              bootstrapMethods: ["one-time-token"],
+              sessionMethods: ["browser-session-cookie", "bearer-access-token"],
+              sessionCookieName: "t3_session",
+            },
+            scopes: ["orchestration:read"],
+            sessionMethod: "bearer-access-token",
+            expiresAt: "2026-05-01T12:00:00.000Z",
+          },
+          { status: 200 },
+        ),
+        Response.json(
+          {
+            ticket: "session-ticket",
+            expiresAt: "2026-05-01T12:05:00.000Z",
+          },
+          { status: 200 },
+        ),
+      );
+      const httpBaseUrl = "https://platform.example.test/sessions/session-123/agent/";
+
+      yield* fetchRemoteEnvironmentDescriptor({ httpBaseUrl }).pipe(
+        provideRemoteHttp(fetch.fetchFn),
+      );
+      yield* fetchRemoteSessionState({ httpBaseUrl, bearerToken: "bearer-token" }).pipe(
+        provideRemoteHttp(fetch.fetchFn),
+      );
+      const socketUrl = yield* resolveRemoteWebSocketConnectionUrl({
+        httpBaseUrl,
+        wsBaseUrl: "wss://platform.example.test/sessions/session-123/agent/ws",
+        bearerToken: "bearer-token",
+      }).pipe(provideRemoteHttp(fetch.fetchFn));
+
+      expectFetchCall(fetch.calls, 1, {
+        url: "https://platform.example.test/sessions/session-123/agent/.well-known/t3/environment",
+        method: "GET",
+      });
+      expectFetchCall(fetch.calls, 2, {
+        url: "https://platform.example.test/sessions/session-123/agent/api/auth/session",
+        method: "GET",
+      });
+      expectFetchCall(fetch.calls, 3, {
+        url: "https://platform.example.test/sessions/session-123/agent/api/auth/websocket-ticket",
+        method: "POST",
+      });
+      expect(socketUrl).toBe(
+        "wss://platform.example.test/sessions/session-123/agent/ws?wsTicket=session-ticket",
+      );
+    }),
+  );
+
   it.effect("loads remote session state with a DPoP-bound access token", () =>
     Effect.gen(function* () {
       const fetch = recordedFetch(
