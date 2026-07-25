@@ -3,6 +3,8 @@ import {
   MessageId,
   type SessionFabricClientId,
   type SessionFabricCommand,
+  type SessionFabricSearchResponse,
+  type SessionFabricSearchResult,
   type SessionFabricServerFrame,
   type SessionFabricSnapshot,
 } from "@t3tools/contracts";
@@ -61,6 +63,35 @@ export function scaffoldSessionProofMetadata(
     scaffoldSessionUrl: location.scaffoldSessionUrl,
     threadId: location.threadId,
   };
+}
+
+const semanticProofTokens = (value: string): ReadonlySet<string> =>
+  new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}_-]+/gu) ?? []);
+
+export function scaffoldSessionSemanticSearchResult(input: {
+  readonly snapshot: SessionFabricSnapshot;
+  readonly query: string;
+  readonly response: SessionFabricSearchResponse;
+}): SessionFabricSearchResult {
+  const queryTokens = semanticProofTokens(input.query);
+  if (queryTokens.size === 0) {
+    throw new Error("The semantic proof query must contain at least one searchable token.");
+  }
+  const sessionTokens = semanticProofTokens(input.snapshot.session.searchableText);
+  const overlap = [...queryTokens].filter((token) => sessionTokens.has(token));
+  if (overlap.length > 0) {
+    throw new Error(
+      `The semantic proof query has lexical overlap with the target session: ${overlap.join(", ")}.`,
+    );
+  }
+
+  const result = input.response.results.find(
+    (candidate) => candidate.session.sessionId === input.snapshot.session.sessionId,
+  );
+  if (result === undefined || result.score <= 0) {
+    throw new Error("The zero-overlap semantic search did not return the target Scaffold session.");
+  }
+  return result;
 }
 
 export function buildScaffoldSessionProofCommand(input: {

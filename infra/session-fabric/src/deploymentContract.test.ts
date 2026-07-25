@@ -24,7 +24,7 @@ describe("session fabric proof deployment", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("keeps the manual workflow isolated from Relay and product credentials", () =>
+  it.effect("binds only the credentials required for semantic proof deployment", () =>
     Effect.gen(function* () {
       const workflow = yield* readFile(
         new URL("../../../.github/workflows/deploy-session-fabric-proof.yml", import.meta.url),
@@ -36,6 +36,8 @@ describe("session fabric proof deployment", () => {
       expect(workflow).toContain("id-token: none");
       expect(workflow).toContain("CLOUDFLARE_ACCOUNT_ID");
       expect(workflow).toContain("CLOUDFLARE_API_TOKEN");
+      expect(workflow).toContain("BASETEN_API_KEY: ${{ secrets.BASETEN_API_KEY }}");
+      expect(workflow).toContain("BASETEN_EMBEDDING_URL: ${{ vars.BASETEN_EMBEDDING_URL }}");
       expect(workflow).toContain("--stage proof --yes");
       expect(workflow).toContain("ashler-session-fabric-proof");
 
