@@ -55,6 +55,37 @@ describe("ServerProvider", () => {
     expect(parsed.versionAdvisory?.canUpdate).toBe(false);
   });
 
+  it("decodes ACP command skills without fabricating filesystem paths", () => {
+    const parsed = decodeServerProvider({
+      instanceId: "omp",
+      driver: "omp",
+      enabled: true,
+      installed: true,
+      version: "17.1.2",
+      status: "ready",
+      auth: { status: "unknown" },
+      checkedAt: "2026-07-24T00:00:00.000Z",
+      models: [],
+      skills: [
+        {
+          name: "skill:review",
+          description: "Review the current changes.",
+          enabled: true,
+          scope: "omp",
+        },
+      ],
+    });
+
+    expect(parsed.skills).toEqual([
+      {
+        name: "skill:review",
+        description: "Review the current changes.",
+        enabled: true,
+        scope: "omp",
+      },
+    ]);
+  });
+
   it("decodes continuation group metadata", () => {
     const parsed = decodeServerProvider({
       instanceId: "codex_personal",

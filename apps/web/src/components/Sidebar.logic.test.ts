@@ -18,8 +18,11 @@ import {
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveSidebarV2Status,
+  resolveAshlerSidebarIndicator,
+  isScaffoldEnvironmentLabel,
   resolveThreadStatusPill,
   resolveWorkingStartedAt,
+  selectProvisionalDraftRows,
   formatWorkingDurationLabel,
   shouldNavigateAfterProjectRemoval,
   shouldClearThreadSelectionOnMouseDown,
@@ -44,8 +47,56 @@ import {
   type Project,
   type Thread,
 } from "../types";
+import { DraftId, type DraftThreadState } from "../composerDraftStore";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
+
+describe("selectProvisionalDraftRows", () => {
+  const localDraftId = DraftId.make("draft-local");
+  const scaffoldDraftId = DraftId.make("draft-scaffold");
+  const localThreadId = ThreadId.make("thread-local");
+  const projectId = ProjectId.make("project-local");
+  const draftThread: DraftThreadState = {
+    threadId: localThreadId,
+    environmentId: localEnvironmentId,
+    projectId,
+    logicalProjectKey: "local-project",
+    createdAt: "2026-07-24T12:00:00.000Z",
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    interactionMode: DEFAULT_INTERACTION_MODE,
+    branch: "main",
+    worktreePath: null,
+    envMode: "worktree",
+    startFromOrigin: false,
+    promotedTo: null,
+  };
+
+  it("keeps a local draft row visible until its server thread materializes", () => {
+    const draftThreadsByDraftId = {
+      [localDraftId]: draftThread,
+      [scaffoldDraftId]: { ...draftThread, threadId: ThreadId.make("thread-scaffold") },
+    };
+    const baseInput = {
+      draftThreadsByDraftId,
+      scaffoldDraftIds: new Set<string>([scaffoldDraftId]),
+      scopedProjectKeys: null,
+    };
+
+    expect(selectProvisionalDraftRows({ ...baseInput, materializedThreadKeys: new Set() })).toEqual(
+      [{ draftId: localDraftId, draftThread }],
+    );
+
+    expect(
+      selectProvisionalDraftRows({
+        ...baseInput,
+        materializedThreadKeys: new Set([
+          scopedThreadKey(scopeThreadRef(localEnvironmentId, localThreadId)),
+        ]),
+      }),
+    ).toEqual([]);
+  });
+});
 
 describe("shouldNavigateAfterProjectRemoval", () => {
   const projectThreads = [{ environmentId: "environment-local", id: "thread-1" }];
@@ -688,6 +739,54 @@ describe("resolveSidebarV2Status", () => {
 
   it("defaults to ready with no session", () => {
     expect(resolveSidebarV2Status({ ...idle, session: null })).toBe("ready");
+  });
+});
+
+describe("resolveAshlerSidebarIndicator", () => {
+  it("uses a yellow working indicator for running and preparing threads", () => {
+    expect(
+      resolveAshlerSidebarIndicator({
+        status: "working",
+        hasUnreadContent: true,
+        wokeFromSnooze: false,
+      }),
+    ).toEqual({ kind: "working", label: "Agent is working" });
+  });
+
+  it("uses the attention indicator for unread and blocked threads", () => {
+    expect(
+      resolveAshlerSidebarIndicator({
+        status: "ready",
+        hasUnreadContent: true,
+        wokeFromSnooze: false,
+      }),
+    ).toEqual({ kind: "attention", label: "Needs attention" });
+    expect(
+      resolveAshlerSidebarIndicator({
+        status: "input",
+        hasUnreadContent: false,
+        wokeFromSnooze: false,
+      }),
+    ).toEqual({ kind: "attention", label: "Needs attention" });
+  });
+
+  it("renders no idle indicator", () => {
+    expect(
+      resolveAshlerSidebarIndicator({
+        status: "ready",
+        hasUnreadContent: false,
+        wokeFromSnooze: false,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("isScaffoldEnvironmentLabel", () => {
+  it("recognizes Scaffold environment labels without treating every remote as Scaffold", () => {
+    expect(isScaffoldEnvironmentLabel("Scaffold staging")).toBe(true);
+    expect(isScaffoldEnvironmentLabel("ashler-scaffold-prod")).toBe(true);
+    expect(isScaffoldEnvironmentLabel("SSH workstation")).toBe(false);
+    expect(isScaffoldEnvironmentLabel(null)).toBe(false);
   });
 });
 

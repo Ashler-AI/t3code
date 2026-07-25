@@ -1,11 +1,54 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
-import { ProviderRuntimeEvent } from "./providerRuntime.ts";
+import { ProviderRuntimeEvent, ProviderRuntimeEventEnvelope } from "./providerRuntime.ts";
 
 const decodeRuntimeEvent = Schema.decodeUnknownSync(ProviderRuntimeEvent);
+const decodeRuntimeEventEnvelope = Schema.decodeUnknownSync(ProviderRuntimeEventEnvelope);
 
 describe("ProviderRuntimeEvent", () => {
+  it("decodes the canonical OMP ingestion identity and cursor envelope", () => {
+    const parsed = decodeRuntimeEventEnvelope({
+      protocolVersion: 1,
+      eventId: "omp:session-1:7",
+      environmentId: "environment-1",
+      threadId: "thread-1",
+      sourceSequence: 7,
+      resumeCursor: {
+        kind: "omp",
+        schemaVersion: 3,
+        sessionId: "session-1",
+        eventSequence: 7,
+        acpSequence: 5,
+      },
+      providerInstanceId: "omp",
+      runtimeSessionId: "session-1",
+      event: {
+        type: "turn.completed",
+        eventId: "omp:session-1:7",
+        provider: "omp",
+        providerInstanceId: "omp",
+        createdAt: "2026-07-24T00:00:00.000Z",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        payload: { state: "completed" },
+      },
+    });
+
+    expect(parsed.eventId).toBe(parsed.event.eventId);
+    expect(parsed.environmentId).toBe("environment-1");
+    expect(parsed.threadId).toBe(parsed.event.threadId);
+    expect(parsed.sourceSequence).toBe(7);
+    expect(parsed.resumeCursor).toEqual({
+      kind: "omp",
+      schemaVersion: 3,
+      sessionId: "session-1",
+      eventSequence: 7,
+      acpSequence: 5,
+    });
+    expect(parsed.runtimeSessionId).toBe("session-1");
+  });
+
   it("accepts fork-provided driver kinds as branded slugs", () => {
     const parsed = decodeRuntimeEvent({
       type: "session.started",
@@ -21,6 +64,40 @@ describe("ProviderRuntimeEvent", () => {
 
     expect(parsed.provider).toBe("ollama");
     expect(parsed.providerInstanceId).toBe("ollama_local");
+  });
+
+  it("decodes runtime-authoritative model and effort selections", () => {
+    const turnStarted = decodeRuntimeEvent({
+      type: "turn.started",
+      eventId: "omp:session-1:8",
+      provider: "omp",
+      providerInstanceId: "omp",
+      createdAt: "2026-07-24T00:00:01.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: { model: "openai/gpt-5.6", effort: "high" },
+    });
+    const rerouted = decodeRuntimeEvent({
+      type: "model.rerouted",
+      eventId: "omp:session-1:9",
+      provider: "omp",
+      providerInstanceId: "omp",
+      createdAt: "2026-07-24T00:00:02.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: {
+        fromModel: "openai/gpt-5.6",
+        toModel: "anthropic/claude-sonnet-5",
+        reason: "omp.config_option_update",
+        effort: "high",
+      },
+    });
+
+    expect(turnStarted.payload).toEqual({ model: "openai/gpt-5.6", effort: "high" });
+    expect(rerouted.payload).toMatchObject({
+      toModel: "anthropic/claude-sonnet-5",
+      effort: "high",
+    });
   });
 
   it("decodes turn.plan.updated for plan rendering", () => {
@@ -180,5 +257,30 @@ describe("ProviderRuntimeEvent", () => {
     }
     expect(parsed.payload.usage.maxTokens).toBe(200000);
     expect(parsed.payload.usage.usedTokens).toBe(31251);
+  });
+
+  it("decodes optional subagent model and effort metadata", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "task.started",
+      eventId: "event-subagent-1",
+      provider: "omp",
+      createdAt: "2026-07-24T00:00:00.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: {
+        taskId: "subagent-1",
+        taskType: "subagent",
+        description: "Review the implementation",
+        model: "gpt-5.6-terra",
+        effort: "high",
+      },
+    });
+
+    expect(parsed.type).toBe("task.started");
+    if (parsed.type !== "task.started") {
+      throw new Error("expected task.started");
+    }
+    expect(parsed.payload.model).toBe("gpt-5.6-terra");
+    expect(parsed.payload.effort).toBe("high");
   });
 });

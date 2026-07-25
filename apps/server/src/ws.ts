@@ -42,6 +42,8 @@ import {
   ProjectWriteFileError,
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
+  OmpAccountOperationError,
+  ScaffoldLifecycleError,
   type ServerSelfUpdateError,
   type ServerSelfUpdateProgressEvent,
   type FilesystemBrowseFailure,
@@ -79,6 +81,7 @@ import {
   observeRpcStreamEffect as instrumentRpcStreamEffect,
 } from "./observability/RpcInstrumentation.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -120,7 +123,11 @@ import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
+import * as OmpAccounts from "./ompAccounts/OmpAccountService.ts";
+import * as OmpAccountRuntime from "./ompAccounts/OmpAccountRuntime.ts";
+import { makeScaffoldLifecycleService } from "./scaffold/ScaffoldLifecycleService.ts";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const EDITOR_DISCOVERY_TIMEOUT = Duration.seconds(5);
@@ -341,6 +348,7 @@ function toAuthAccessStreamEvent(
 const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  ompAccounts: OmpAccounts.OmpAccountServiceShape,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -359,6 +367,7 @@ const makeWsRpcLayer = (
       const previewManager = yield* PreviewManager.PreviewManager;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+      const providerService = yield* ProviderService.ProviderService;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const config = yield* ServerConfig.ServerConfig;
@@ -424,6 +433,26 @@ const makeWsRpcLayer = (
         currentSession.scopes.includes(requiredScope)
           ? stream
           : Stream.fail(authorizationError(requiredScope));
+      const mapOmpAccountError = (error: OmpAccounts.OmpAccountServiceError) =>
+        new OmpAccountOperationError({
+          reason: error.reason,
+          operation: error.operation,
+          detail: error.detail,
+        });
+      const scaffoldLifecycle = makeScaffoldLifecycleService();
+      const scaffoldRequest = <A>(operation: () => Promise<A>) =>
+        Effect.tryPromise({
+          try: operation,
+          catch: (error) =>
+            isScaffoldLifecycleError(error)
+              ? error
+              : new ScaffoldLifecycleError({
+                  reason: "unavailable",
+                  message: "Scaffold lifecycle request failed.",
+                  status: 0,
+                  code: "scaffold_unexpected_error",
+                }),
+        });
       const observeRpcEffect = <A, E, R>(
         method: string,
         effect: Effect.Effect<A, E, R>,
@@ -1555,6 +1584,58 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "cloud" },
           ),
+        [WS_METHODS.ompAccountsGetSnapshot]: (_input) =>
+          observeRpcEffect(WS_METHODS.ompAccountsGetSnapshot, ompAccounts.getSnapshot, {
+            "rpc.aggregate": "omp-accounts",
+          }),
+        [WS_METHODS.ompAccountsGetAssignment]: ({ threadId }) =>
+          observeRpcEffect(
+            WS_METHODS.ompAccountsGetAssignment,
+            OmpAccounts.getOmpThreadAccountAssignment(providerService, ompAccounts, threadId).pipe(
+              Effect.mapError(mapOmpAccountError),
+            ),
+            { "rpc.aggregate": "omp-accounts" },
+          ),
+        [WS_METHODS.ompAccountsRefresh]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.ompAccountsRefresh,
+            Effect.all([ompAccounts.listAccounts, ompAccounts.getUsage({ refresh: true })], {
+              concurrency: "unbounded",
+            }).pipe(Effect.map(([accounts, usage]) => ({ accounts, usage }))),
+            { "rpc.aggregate": "omp-accounts" },
+          ),
+        [WS_METHODS.ompAccountsBeginLogin]: ({ provider }) =>
+          observeRpcEffect(
+            WS_METHODS.ompAccountsBeginLogin,
+            ompAccounts.beginLogin(provider).pipe(Effect.mapError(mapOmpAccountError)),
+            { "rpc.aggregate": "omp-accounts" },
+          ),
+        [WS_METHODS.ompAccountsRespondLogin]: ({ provider, flowId, response }) =>
+          observeRpcEffect(
+            WS_METHODS.ompAccountsRespondLogin,
+            ompAccounts
+              .respondLogin(provider, flowId, response)
+              .pipe(Effect.mapError(mapOmpAccountError)),
+            { "rpc.aggregate": "omp-accounts" },
+          ),
+        [WS_METHODS.ompAccountsCancelLogin]: ({ flowId }) =>
+          observeRpcEffect(
+            WS_METHODS.ompAccountsCancelLogin,
+            ompAccounts.cancelLogin(flowId).pipe(Effect.mapError(mapOmpAccountError)),
+            { "rpc.aggregate": "omp-accounts" },
+          ),
+        [WS_METHODS.ompAccountsRemove]: ({ accountRef }) =>
+          observeRpcEffect(
+            WS_METHODS.ompAccountsRemove,
+            ompAccounts.removeAccount(accountRef).pipe(Effect.mapError(mapOmpAccountError)),
+            { "rpc.aggregate": "omp-accounts" },
+          ),
+        [WS_METHODS.scaffoldPause]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.scaffoldPause,
+            scaffoldRequest(() => scaffoldLifecycle.pause(input)),
+            { "rpc.aggregate": "scaffold" },
+          ),
         [WS_METHODS.sourceControlLookupRepository]: (input) =>
           observeRpcEffect(
             WS_METHODS.sourceControlLookupRepository,
@@ -1978,7 +2059,14 @@ const makeWsRpcLayer = (
                   },
                 })),
               );
-              const providerStatuses = providerRegistry.streamChanges.pipe(
+              // Run the connection-triggered refresh as part of the subscribed stream.
+              // Starting it earlier can publish a ready snapshot before this lazy
+              // stream subscribes, leaving the browser on its stale bootstrap state.
+              const providerStatuses = Stream.merge(
+                providerRegistry.streamChanges,
+                Stream.fromEffect(providerRegistry.refresh()),
+              ).pipe(
+                Stream.changes,
                 Stream.map((providers) => ({
                   version: 1 as const,
                   type: "providerStatuses" as const,
@@ -1994,10 +2082,6 @@ const makeWsRpcLayer = (
                   payload: { settings },
                 })),
               );
-
-              yield* providerRegistry
-                .refresh()
-                .pipe(Effect.ignoreCause({ log: true }), Effect.forkScoped);
 
               const liveUpdates = Stream.merge(
                 keybindingsUpdates,
@@ -2090,6 +2174,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
+    const ompAccounts = yield* OmpAccountRuntime.make;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -2109,7 +2194,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           disableTracing: true,
         }).pipe(
           Effect.provide(
-            makeWsRpcLayer(session, previewAutomationBroker).pipe(
+            makeWsRpcLayer(session, previewAutomationBroker, ompAccounts).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),

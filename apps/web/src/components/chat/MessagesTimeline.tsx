@@ -45,6 +45,7 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   EyeIcon,
+  FileIcon,
   GlobeIcon,
   HammerIcon,
   MessageCircleIcon,
@@ -99,6 +100,9 @@ import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@t3tools/contracts/settings";
 import { formatChatTimestampTooltip, formatShortTimestamp } from "../../timestampFormat";
+import type { TranscriptAnnotationContext } from "../../transcriptAnnotation";
+import { parseTranscriptAnnotationMessageSegments } from "../../transcriptAnnotation";
+import { TranscriptSelectionAffordance } from "./TranscriptSelectionAffordance";
 
 import {
   buildInlineTerminalContextText,
@@ -113,6 +117,12 @@ import {
   parseReviewCommentMessageSegments,
   type ReviewCommentContext,
 } from "../../reviewCommentContext";
+
+function formatAttachmentSize(sizeBytes: number): string {
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return `${Math.ceil(sizeBytes / 1024)} KB`;
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 // ---------------------------------------------------------------------------
 // Context — shared state consumed by every row component via Context.
@@ -150,6 +160,7 @@ const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
 const TIMELINE_LIST_FADE_HEADER = <div className="h-10 sm:h-12" />;
 const TIMELINE_LIST_FOOTER = <div className="h-3 sm:h-4" />;
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+const IGNORE_TRANSCRIPT_ANNOTATION = () => {};
 
 // ---------------------------------------------------------------------------
 // Props (public API)
@@ -182,6 +193,7 @@ interface MessagesTimelineProps {
   contentInsetEndAdjustment: number;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
+  onAddTranscriptAnnotation?: (annotation: TranscriptAnnotationContext) => void;
   hideEmptyPlaceholder?: boolean;
   topFadeEnabled?: boolean;
 }
@@ -217,6 +229,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   contentInsetEndAdjustment,
   onIsAtEndChange,
   onManualNavigation,
+  onAddTranscriptAnnotation = IGNORE_TRANSCRIPT_ANNOTATION,
   hideEmptyPlaceholder = false,
   topFadeEnabled = false,
 }: MessagesTimelineProps) {
@@ -328,6 +341,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
     null,
   );
+  const timelineViewportRef = useRef<HTMLDivElement>(null);
   const [minimapHasPersistentGutter, setMinimapHasPersistentGutter] = useState(false);
   const [minimapHitStripWidth, setMinimapHitStripWidth] = useState(0);
   const handleAnchorReady = useCallback(
@@ -483,7 +497,13 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   return (
     <TimelineRowCtx value={sharedState}>
       <TimelineRowActivityCtx value={activityState}>
-        <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
+        <div
+          ref={(element) => {
+            timelineViewportRef.current = element;
+            setTimelineViewportElement(element);
+          }}
+          className="relative h-full min-h-0"
+        >
           <LegendList<MessagesTimelineRow>
             ref={listRef}
             data={rows}
@@ -532,6 +552,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                 viewOffset: 24,
               });
             }}
+          />
+          <TranscriptSelectionAffordance
+            rootRef={timelineViewportRef}
+            onAnnotate={onAddTranscriptAnnotation}
           />
         </div>
       </TimelineRowActivityCtx>
@@ -868,7 +892,9 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
 
 function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
-  const userImages = row.message.attachments ?? [];
+  const userAttachments = row.message.attachments ?? [];
+  const userImages = userAttachments.filter((attachment) => attachment.type === "image");
+  const userFiles = userAttachments.filter((attachment) => attachment.type === "file");
   const displayedUserMessage = deriveDisplayedUserMessageState(row.message.text);
   const terminalContexts = displayedUserMessage.contexts;
   const previewAnnotations: ParsedPreviewAnnotation[] = [];
@@ -924,6 +950,24 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             ))}
           </div>
         )}
+        {userFiles.length > 0 ? (
+          <div className="mb-2 flex max-w-[420px] flex-col gap-1.5">
+            {userFiles.map((file) => (
+              <div
+                key={file.id}
+                className="flex min-w-0 items-center gap-2 rounded-lg border border-border/80 bg-background/70 px-2.5 py-2"
+              >
+                <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 text-left">
+                  <div className="truncate text-xs font-medium">{file.name}</div>
+                  <div className="truncate text-[10px] text-muted-foreground">
+                    {file.mimeType} · {formatAttachmentSize(file.sizeBytes)}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {previewAnnotations.map((annotation, index) => (
           <UserMessagePreviewAnnotationCard
             key={annotation.id}
@@ -1486,6 +1530,25 @@ const UserMessageBody = memo(function UserMessageBody(props: {
   markdownCwd: string | undefined;
 }) {
   const ctx = use(TimelineRowCtx);
+  const transcriptSegments = parseTranscriptAnnotationMessageSegments(props.text);
+  if (transcriptSegments.some((segment) => segment.kind === "transcript-annotation")) {
+    return (
+      <div className="space-y-3 text-sm leading-relaxed text-foreground">
+        {transcriptSegments.map((segment) =>
+          segment.kind === "text" ? (
+            segment.text.trim() ? (
+              <UserMessageBody key={segment.id} {...props} text={segment.text.trim()} />
+            ) : null
+          ) : (
+            <UserMessageTranscriptAnnotationCard
+              key={segment.annotation.id}
+              annotation={segment.annotation}
+            />
+          ),
+        )}
+      </div>
+    );
+  }
   const renderInlineMarkdownSegment = (text: string, key: string) => {
     const leadingWhitespace = /^\s+/.exec(text)?.[0] ?? "";
     const textWithoutLeadingWhitespace = text.slice(leadingWhitespace.length);
@@ -1644,6 +1707,27 @@ const UserMessageBody = memo(function UserMessageBody(props: {
     />
   );
 });
+
+function UserMessageTranscriptAnnotationCard({
+  annotation,
+}: {
+  annotation: TranscriptAnnotationContext;
+}) {
+  return (
+    <section className="rounded-lg border border-border/70 bg-background/65 px-3 py-2.5 text-left">
+      <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        <MessageCircleIcon className="size-3.5" />
+        Annotated {annotation.role === "assistant" ? "agent response" : "user message"}
+      </div>
+      <blockquote className="border-l-2 border-border pl-2.5 text-sm text-foreground/80">
+        {annotation.selectedText}
+      </blockquote>
+      {annotation.comment ? (
+        <p className="mt-2 text-sm text-foreground">{annotation.comment}</p>
+      ) : null}
+    </section>
+  );
+}
 
 function UserMessageReviewCommentCard({ comment }: { comment: ReviewCommentContext }) {
   const ctx = use(TimelineRowCtx);
@@ -1921,6 +2005,65 @@ function toolWorkEntryHeading(workEntry: TimelineWorkEntry): string {
 
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
+function subagentStatusLabel(status: NonNullable<TimelineWorkEntry["subagentStatus"]>): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "completed":
+      return "Done";
+    case "failed":
+      return "Failed";
+    case "stopped":
+      return "Stopped";
+  }
+}
+
+const SubagentWorkEntryRow = memo(function SubagentWorkEntryRow(props: {
+  workEntry: TimelineWorkEntry;
+}) {
+  const { workEntry } = props;
+  const status = workEntry.subagentStatus ?? "running";
+  const task = workEntry.subagentTask ?? workEntry.label;
+  const metadata = [
+    { key: "status", value: subagentStatusLabel(status) },
+    { key: "model", value: workEntry.subagentModel },
+    { key: "effort", value: workEntry.subagentEffort },
+  ].filter((entry): entry is { key: string; value: string } => Boolean(entry.value));
+
+  return (
+    <div className="rounded-md border border-border/55 bg-background/45 px-2.5 py-2">
+      <div className="flex min-w-0 items-start gap-2">
+        <span
+          className={cn(
+            "mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full",
+            status === "failed"
+              ? "bg-destructive/10 text-destructive"
+              : "bg-muted text-muted-foreground",
+          )}
+        >
+          <BotIcon aria-hidden className="size-3.5" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-xs font-medium text-foreground/90">{task}</p>
+          <p className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-muted-foreground/65">
+            {metadata.map((entry, index) => (
+              <Fragment key={entry.key}>
+                {index > 0 ? <span aria-hidden>·</span> : null}
+                <span>{entry.value}</span>
+              </Fragment>
+            ))}
+          </p>
+          {workEntry.detail && workEntry.detail !== task ? (
+            <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-muted-foreground/60">
+              {workEntry.detail}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   workEntry: TimelineWorkEntry;
   workspaceRoot: string | undefined;
@@ -1928,6 +2071,9 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   const { workEntry, workspaceRoot } = props;
   const activity = use(TimelineRowActivityCtx);
   const [expanded, setExpanded] = useState(false);
+  if (workEntry.subagentStatus) {
+    return <SubagentWorkEntryRow workEntry={workEntry} />;
+  }
   const iconConfig = workToneIcon(workEntry.tone);
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
   const entryIconName = showWarningIndicator ? "x" : workEntryIconName(workEntry);

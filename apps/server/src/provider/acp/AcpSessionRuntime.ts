@@ -45,6 +45,11 @@ export interface AcpSessionEventStreamBarrier {
   readonly acknowledge: Deferred.Deferred<void>;
 }
 
+export interface AcpReplayNotification {
+  readonly sourceSequence: number;
+  readonly notification: EffectAcpSchema.SessionNotification;
+}
+
 export type AcpSessionRuntimeEvent = AcpParsedSessionEvent | AcpSessionEventStreamBarrier;
 
 const defaultSessionLoadTimeout = Duration.seconds(90);
@@ -181,12 +186,18 @@ export class AcpSessionRuntime extends Context.Service<
     readonly start: () => Effect.Effect<AcpSessionRuntimeStartResult, EffectAcpErrors.AcpError>;
     /** Stream of parsed ACP session events emitted after startup. */
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
+    /** Ordered session/load notifications captured before the live stream opens. */
+    readonly getReplayNotifications: Effect.Effect<ReadonlyArray<AcpReplayNotification>>;
     /** Waits until the current event consumer has processed every queued event. */
     readonly drainEvents: Effect.Effect<void>;
     /** Latest mode state observed from session setup and `session/update` notifications. */
     readonly getModeState: Effect.Effect<AcpSessionModeState | undefined>;
     /** Latest configuration options observed from session setup and configuration writes. */
     readonly getConfigOptions: Effect.Effect<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>;
+    /** Latest standard ACP command catalog advertised by the active agent session. */
+    readonly getAvailableCommands: Effect.Effect<ReadonlyArray<EffectAcpSchema.AvailableCommand>>;
+    /** Waits for the first standard ACP command-catalog update. */
+    readonly awaitAvailableCommands: Effect.Effect<ReadonlyArray<EffectAcpSchema.AvailableCommand>>;
     /**
      * Sends a prompt turn to the active session.
      * @see https://agentclientprotocol.com/protocol/schema#session/prompt
@@ -259,6 +270,7 @@ type AcpStartState =
 interface AcpAssistantSegmentState {
   readonly nextSegmentIndex: number;
   readonly activeItemId?: string;
+  readonly activeItemType?: "assistant_message" | "reasoning";
 }
 
 interface EnsureActiveAssistantSegmentResult {
@@ -291,12 +303,18 @@ export const make = (
     );
     const assistantSegmentRef = yield* Ref.make<AcpAssistantSegmentState>({ nextSegmentIndex: 0 });
     const configOptionsRef = yield* Ref.make(sessionConfigOptionsFromSetup(undefined));
+    const availableCommandsRef = yield* Ref.make<ReadonlyArray<EffectAcpSchema.AvailableCommand>>(
+      [],
+    );
+    const availableCommandsReady = yield* Deferred.make<void>();
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
     const promptSerializationSemaphore = yield* Semaphore.make(1);
     const activePromptFiberRef = yield* Ref.make<
       Option.Option<Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>>
     >(Option.none());
     const sessionLoadGateRef = yield* Ref.make<Option.Option<SessionLoadGate>>(Option.none());
+    const replayNotificationsRef = yield* Ref.make<ReadonlyArray<AcpReplayNotification>>([]);
+    const notificationSequenceRef = yield* Ref.make(0);
 
     const logRequest = (event: AcpSessionRequestLogEvent) =>
       options.requestLogger ? options.requestLogger(event) : Effect.void;
@@ -369,8 +387,24 @@ export const make = (
 
     yield* acp.handleSessionUpdate((notification) =>
       Effect.gen(function* () {
+        const startState = yield* Ref.get(startStateRef);
+        if (
+          notification.update.sessionUpdate === "available_commands_update" &&
+          (startState._tag !== "Started" || notification.sessionId === startState.result.sessionId)
+        ) {
+          yield* Ref.set(availableCommandsRef, notification.update.availableCommands);
+          yield* Deferred.succeed(availableCommandsReady, undefined).pipe(Effect.ignore);
+          return;
+        }
         const gate = yield* Ref.get(sessionLoadGateRef);
         if (Option.isSome(gate) && gate.value.active) {
+          yield* Ref.update(replayNotificationsRef, (current) => [
+            ...current,
+            {
+              sourceSequence: current.length + 1,
+              notification,
+            },
+          ]);
           const lastActivityAtMillis = yield* Clock.currentTimeMillis;
           yield* Ref.set(
             sessionLoadGateRef,
@@ -384,7 +418,6 @@ export const make = (
         if (sessionUpdateIsReplay(notification)) {
           return;
         }
-        const startState = yield* Ref.get(startStateRef);
         // One runtime projects one root ACP session. Child-session updates need
         // explicit lineage routing and must never be flattened into this stream.
         if (
@@ -393,13 +426,19 @@ export const make = (
         ) {
           return;
         }
+        const sourceSequence = yield* Ref.updateAndGet(
+          notificationSequenceRef,
+          (current) => current + 1,
+        );
         yield* handleSessionUpdate({
           queue: eventQueue,
           modeStateRef,
+          configOptionsRef,
           toolCallsRef,
           assistantSegmentRef,
           assistantItemRuntimeId,
           params: notification,
+          sourceSequence,
         });
       }),
     );
@@ -578,6 +617,7 @@ export const make = (
             initializeResult,
           }),
         );
+        yield* Ref.set(replayNotificationsRef, []);
 
         sessionId = options.resumeSessionId;
         sessionSetupResult = yield* Effect.gen(function* () {
@@ -644,6 +684,7 @@ export const make = (
         sessionSetupResult = created;
       }
 
+      yield* Ref.set(notificationSequenceRef, (yield* Ref.get(replayNotificationsRef)).length);
       yield* Ref.set(modeStateRef, parseSessionModeState(sessionSetupResult));
       yield* Ref.set(configOptionsRef, sessionConfigOptionsFromSetup(sessionSetupResult));
 
@@ -706,6 +747,7 @@ export const make = (
       handleExtNotification: acp.handleExtNotification,
       start: () => start,
       getEvents: () => Stream.fromQueue(eventQueue),
+      getReplayNotifications: Ref.get(replayNotificationsRef),
       drainEvents: Effect.gen(function* () {
         const acknowledge = yield* Deferred.make<void>();
         yield* Queue.offer(eventQueue, {
@@ -716,6 +758,10 @@ export const make = (
       }),
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
+      getAvailableCommands: Ref.get(availableCommandsRef),
+      awaitAvailableCommands: Deferred.await(availableCommandsReady).pipe(
+        Effect.andThen(Ref.get(availableCommandsRef)),
+      ),
       prompt: (payload) =>
         promptSerializationSemaphore.withPermit(
           Effect.gen(function* () {
@@ -844,17 +890,21 @@ function configOptionCurrentValueMatches(
 const handleSessionUpdate = ({
   queue,
   modeStateRef,
+  configOptionsRef,
   toolCallsRef,
   assistantSegmentRef,
   assistantItemRuntimeId,
   params,
+  sourceSequence,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly modeStateRef: Ref.Ref<AcpSessionModeState | undefined>;
+  readonly configOptionsRef: Ref.Ref<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>;
   readonly toolCallsRef: Ref.Ref<Map<string, AcpToolCallState>>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly assistantItemRuntimeId: string;
   readonly params: EffectAcpSchema.SessionNotification;
+  readonly sourceSequence: number;
 }): Effect.Effect<void> =>
   Effect.gen(function* () {
     const parsed = parseSessionUpdateEvent(params);
@@ -864,6 +914,9 @@ const handleSessionUpdate = ({
       );
     }
     for (const event of parsed.events) {
+      if (event._tag === "ConfigOptionsUpdated") {
+        yield* Ref.set(configOptionsRef, event.configOptions);
+      }
       if (event._tag === "ToolCallUpdated") {
         yield* closeActiveAssistantSegment({
           queue,
@@ -887,6 +940,7 @@ const handleSessionUpdate = ({
           _tag: "ToolCallUpdated",
           toolCall: merged,
           rawPayload: event.rawPayload,
+          sourceSequence,
         });
         continue;
       }
@@ -897,19 +951,26 @@ const handleSessionUpdate = ({
             continue;
           }
         }
+        const itemType = event.streamKind === "reasoning_text" ? "reasoning" : "assistant_message";
+        const activeSegment = yield* Ref.get(assistantSegmentRef);
+        if (activeSegment.activeItemId && activeSegment.activeItemType !== itemType) {
+          yield* closeActiveAssistantSegment({ queue, assistantSegmentRef });
+        }
         const itemId = yield* ensureActiveAssistantSegment({
           queue,
           assistantSegmentRef,
           sessionId: params.sessionId,
           assistantItemRuntimeId,
+          itemType,
         });
         yield* Queue.offer(queue, {
           ...event,
           itemId,
+          sourceSequence,
         });
         continue;
       }
-      yield* Queue.offer(queue, event);
+      yield* Queue.offer(queue, { ...event, sourceSequence });
     }
   });
 
@@ -947,11 +1008,13 @@ const ensureActiveAssistantSegment = ({
   assistantSegmentRef,
   sessionId,
   assistantItemRuntimeId,
+  itemType,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly sessionId: string;
   readonly assistantItemRuntimeId: string;
+  readonly itemType: "assistant_message" | "reasoning";
 }) =>
   Ref.modify<AcpAssistantSegmentState, EnsureActiveAssistantSegmentResult>(
     assistantSegmentRef,
@@ -966,11 +1029,13 @@ const ensureActiveAssistantSegment = ({
           startedEvent: {
             _tag: "AssistantItemStarted",
             itemId,
+            itemType,
           } satisfies Extract<AcpParsedSessionEvent, { readonly _tag: "AssistantItemStarted" }>,
         },
         {
           nextSegmentIndex: current.nextSegmentIndex + 1,
           activeItemId: itemId,
+          activeItemType: itemType,
         } satisfies AcpAssistantSegmentState,
       ] as const;
     },
@@ -997,6 +1062,7 @@ const closeActiveAssistantSegment = ({
       {
         _tag: "AssistantItemCompleted",
         itemId: current.activeItemId,
+        itemType: current.activeItemType ?? "assistant_message",
       } satisfies AcpParsedSessionEvent,
       {
         nextSegmentIndex: current.nextSegmentIndex,

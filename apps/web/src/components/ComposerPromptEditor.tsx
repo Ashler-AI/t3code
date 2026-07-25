@@ -81,6 +81,7 @@ import { ComposerPendingTerminalContextChip } from "./chat/ComposerPendingTermin
 import { formatProviderSkillDisplayName } from "~/providerSkillPresentation";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { registerComposerInlineTokenPaste } from "./composerInlineTokenPaste";
+import type { ComposerSessionMention } from "./chat/composerAtMentions";
 
 const COMPOSER_EDITOR_HMR_KEY = `composer-editor-${Math.random().toString(36).slice(2)}`;
 const SURROUND_SYMBOLS: [string, string][] = [
@@ -113,7 +114,21 @@ type SerializedComposerSkillNode = Spread<
     skillName: string;
     skillLabel?: string;
     skillDescription?: string;
+    source?: string;
     type: "composer-skill";
+    version: 1;
+  },
+  SerializedLexicalNode
+>;
+
+type SerializedComposerSessionNode = Spread<
+  {
+    environmentId: string;
+    threadId: string;
+    worktreePath: string | null;
+    title: string;
+    source: string;
+    type: "composer-session";
     version: 1;
   },
   SerializedLexicalNode
@@ -278,6 +293,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
   __skillName: string;
   __skillLabel: string;
   __skillDescription: string | null;
+  __source: string;
 
   static override getType(): string {
     return "composer-skill";
@@ -288,6 +304,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
       node.__skillName,
       node.__skillLabel,
       node.__skillDescription,
+      node.__source,
       node.__key,
     );
   }
@@ -297,6 +314,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
       serializedNode.skillName,
       serializedNode.skillLabel ?? serializedNode.skillName,
       serializedNode.skillDescription ?? null,
+      serializedNode.source ?? `$${serializedNode.skillName}`,
     ).updateFromJSON(serializedNode);
   }
 
@@ -304,6 +322,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
     skillName: string,
     skillLabel: string,
     skillDescription: string | null,
+    source: string,
     key?: NodeKey,
   ) {
     super(key);
@@ -311,6 +330,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
     this.__skillName = normalizedSkillName;
     this.__skillLabel = skillLabel;
     this.__skillDescription = skillDescription;
+    this.__source = source;
   }
 
   override exportJSON(): SerializedComposerSkillNode {
@@ -319,6 +339,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
       skillName: this.__skillName,
       skillLabel: this.__skillLabel,
       ...(this.__skillDescription ? { skillDescription: this.__skillDescription } : {}),
+      source: this.__source,
       type: "composer-skill",
       version: 1,
     };
@@ -335,7 +356,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
   }
 
   override getTextContent(): string {
-    return `$${this.__skillName}`;
+    return this.__source;
   }
 
   override isInline(): true {
@@ -356,8 +377,129 @@ function $createComposerSkillNode(
   skillName: string,
   skillLabel: string,
   skillDescription: string | null,
+  source: string = `$${skillName.startsWith("$") ? skillName.slice(1) : skillName}`,
 ): ComposerSkillNode {
-  return $applyNodeReplacement(new ComposerSkillNode(skillName, skillLabel, skillDescription));
+  return $applyNodeReplacement(
+    new ComposerSkillNode(skillName, skillLabel, skillDescription, source),
+  );
+}
+
+function ComposerSessionDecorator(props: { title: string; worktreePath: string | null }) {
+  const chip = (
+    <span
+      className={COMPOSER_INLINE_SKILL_CHIP_CLASS_NAME}
+      contentEditable={false}
+      spellCheck={false}
+      data-composer-session-chip="true"
+    >
+      <span className={COMPOSER_INLINE_CHIP_LABEL_CLASS_NAME}>@{props.title}</span>
+    </span>
+  );
+  if (!props.worktreePath) return chip;
+  return (
+    <Tooltip>
+      <TooltipTrigger render={chip} />
+      <TooltipPopup side="top" className="max-w-120 whitespace-normal leading-tight wrap-anywhere">
+        {props.worktreePath}
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
+
+class ComposerSessionNode extends DecoratorNode<React.ReactElement> {
+  __environmentId: string;
+  __threadId: string;
+  __worktreePath: string | null;
+  __title: string;
+  __source: string;
+
+  static override getType(): string {
+    return "composer-session";
+  }
+
+  static override clone(node: ComposerSessionNode): ComposerSessionNode {
+    return new ComposerSessionNode(
+      node.__environmentId,
+      node.__threadId,
+      node.__worktreePath,
+      node.__title,
+      node.__source,
+      node.__key,
+    );
+  }
+
+  static override importJSON(serializedNode: SerializedComposerSessionNode): ComposerSessionNode {
+    return $createComposerSessionNode(serializedNode).updateFromJSON(serializedNode);
+  }
+
+  constructor(
+    environmentId: string,
+    threadId: string,
+    worktreePath: string | null,
+    title: string,
+    source: string,
+    key?: NodeKey,
+  ) {
+    super(key);
+    this.__environmentId = environmentId;
+    this.__threadId = threadId;
+    this.__worktreePath = worktreePath;
+    this.__title = title;
+    this.__source = source;
+  }
+
+  override exportJSON(): SerializedComposerSessionNode {
+    return {
+      ...super.exportJSON(),
+      environmentId: this.__environmentId,
+      threadId: this.__threadId,
+      worktreePath: this.__worktreePath,
+      title: this.__title,
+      source: this.__source,
+      type: "composer-session",
+      version: 1,
+    };
+  }
+
+  override createDOM(): HTMLElement {
+    const dom = document.createElement("span");
+    dom.className = "composer-inline-chip relative inline-flex align-middle leading-none";
+    return dom;
+  }
+
+  override updateDOM(): false {
+    return false;
+  }
+
+  override getTextContent(): string {
+    return this.__source;
+  }
+
+  override isInline(): true {
+    return true;
+  }
+
+  override decorate(): React.ReactElement {
+    return <ComposerSessionDecorator title={this.__title} worktreePath={this.__worktreePath} />;
+  }
+}
+
+function $createComposerSessionNode(input: {
+  environmentId: string;
+  threadId: string;
+  worktreePath: string | null;
+  title: string;
+  source: string;
+}): ComposerSessionNode {
+  return $applyNodeReplacement(
+    new ComposerSessionNode(
+      input.environmentId,
+      input.threadId,
+      input.worktreePath,
+      input.title,
+      input.source,
+    ),
+  );
 }
 
 function ComposerTerminalContextDecorator(props: { context: TerminalContextDraft }) {
@@ -427,12 +569,14 @@ function $createComposerTerminalContextNode(
 type ComposerInlineTokenNode =
   | ComposerMentionNode
   | ComposerSkillNode
+  | ComposerSessionNode
   | ComposerTerminalContextNode;
 
 function isComposerInlineTokenNode(candidate: unknown): candidate is ComposerInlineTokenNode {
   return (
     candidate instanceof ComposerMentionNode ||
     candidate instanceof ComposerSkillNode ||
+    candidate instanceof ComposerSessionNode ||
     candidate instanceof ComposerTerminalContextNode
   );
 }
@@ -466,12 +610,41 @@ function skillSignature(skills: ReadonlyArray<ServerProviderSkill>): string {
         skill.displayName ?? "",
         skill.shortDescription ?? "",
         skill.description ?? "",
-        skill.path,
+        skill.path ?? "",
         skill.scope ?? "",
         skill.enabled ? "1" : "0",
       ].join("\u001f"),
     )
     .join("\u001e");
+}
+
+function sessionMentionKey(environmentId: string, threadId: string): string {
+  return `${environmentId}\u001f${threadId}`;
+}
+
+function sessionMentionSignature(mentions: ReadonlyArray<ComposerSessionMention>): string {
+  return mentions
+    .map((mention) =>
+      [
+        mention.environmentId,
+        mention.threadId,
+        mention.title,
+        mention.worktreePath ?? "",
+        mention.branch ?? "",
+      ].join("\u001f"),
+    )
+    .join("\u001e");
+}
+
+function sessionMentionByIdentity(
+  mentions: ReadonlyArray<ComposerSessionMention>,
+): ReadonlyMap<string, ComposerSessionMention> {
+  return new Map(
+    mentions.map((mention) => [
+      sessionMentionKey(mention.environmentId, mention.threadId),
+      mention,
+    ]),
+  );
 }
 
 function clampExpandedCursor(value: string, cursor: number): number {
@@ -821,6 +994,7 @@ function $setComposerEditorPrompt(
   prompt: string,
   terminalContexts: ReadonlyArray<TerminalContextDraft>,
   skillMetadata: ReadonlyMap<string, ComposerSkillMetadata>,
+  sessionMentions: ReadonlyMap<string, ComposerSessionMention>,
 ): void {
   const root = $getRoot();
   root.clear();
@@ -840,7 +1014,23 @@ function $setComposerEditorPrompt(
           segment.name,
           metadata?.label ?? formatProviderSkillDisplayName({ name: segment.name }),
           metadata?.description ?? null,
+          segment.source,
         ),
+      );
+      continue;
+    }
+    if (segment.type === "session") {
+      const mention = sessionMentions.get(
+        sessionMentionKey(segment.environmentId, segment.threadId),
+      );
+      paragraph.append(
+        $createComposerSessionNode({
+          environmentId: segment.environmentId,
+          threadId: segment.threadId,
+          worktreePath: segment.worktreePath,
+          title: mention?.title ?? segment.threadId,
+          source: segment.source,
+        }),
       );
       continue;
     }
@@ -881,6 +1071,7 @@ interface ComposerPromptEditorProps {
   cursor: number;
   terminalContexts: ReadonlyArray<TerminalContextDraft>;
   skills: ReadonlyArray<ServerProviderSkill>;
+  sessionMentions: ReadonlyArray<ComposerSessionMention>;
   disabled: boolean;
   placeholder: string;
   className?: string;
@@ -1262,10 +1453,12 @@ function ComposerInlineTokenPastePlugin() {
 function ComposerSurroundSelectionPlugin(props: {
   terminalContexts: ReadonlyArray<TerminalContextDraft>;
   skills: ReadonlyArray<ServerProviderSkill>;
+  sessionMentions: ReadonlyArray<ComposerSessionMention>;
 }) {
   const [editor] = useLexicalComposerContext();
   const terminalContextsRef = useRef(props.terminalContexts);
   const skillMetadataRef = useRef(skillMetadataByName(props.skills));
+  const sessionMentionsRef = useRef(sessionMentionByIdentity(props.sessionMentions));
   const pendingSurroundSelectionRef = useRef<{
     value: string;
     expandedStart: number;
@@ -1284,6 +1477,10 @@ function ComposerSurroundSelectionPlugin(props: {
   useEffect(() => {
     skillMetadataRef.current = skillMetadataByName(props.skills);
   }, [props.skills]);
+
+  useEffect(() => {
+    sessionMentionsRef.current = sessionMentionByIdentity(props.sessionMentions);
+  }, [props.sessionMentions]);
 
   const applySurroundInsertion = useEffectEvent((inputData: string): boolean => {
     const surroundCloseSymbol = SURROUND_SYMBOLS_MAP.get(inputData);
@@ -1329,7 +1526,12 @@ function ComposerSurroundSelectionPlugin(props: {
         selectionSnapshot.expandedEnd,
       );
       const nextValue = `${selectionSnapshot.value.slice(0, selectionSnapshot.expandedStart)}${inputData}${selectedText}${surroundCloseSymbol}${selectionSnapshot.value.slice(selectionSnapshot.expandedEnd)}`;
-      $setComposerEditorPrompt(nextValue, terminalContextsRef.current, skillMetadataRef.current);
+      $setComposerEditorPrompt(
+        nextValue,
+        terminalContextsRef.current,
+        skillMetadataRef.current,
+        sessionMentionsRef.current,
+      );
       const selectionStart = collapseExpandedComposerCursor(
         nextValue,
         selectionSnapshot.expandedStart,
@@ -1530,6 +1732,7 @@ function ComposerPromptEditorInner({
   cursor,
   terminalContexts,
   skills,
+  sessionMentions,
   disabled,
   placeholder,
   className,
@@ -1547,6 +1750,9 @@ function ComposerPromptEditorInner({
   const skillsSignature = skillSignature(skills);
   const skillsSignatureRef = useRef(skillsSignature);
   const skillMetadataRef = useRef(skillMetadataByName(skills));
+  const sessionsSignature = sessionMentionSignature(sessionMentions);
+  const sessionsSignatureRef = useRef(sessionsSignature);
+  const sessionMentionsRef = useRef(sessionMentionByIdentity(sessionMentions));
   const snapshotRef = useRef({
     value,
     cursor: initialCursor,
@@ -1567,6 +1773,10 @@ function ComposerPromptEditorInner({
     skillMetadataRef.current = skillMetadataByName(skills);
   }, [skills]);
 
+  useLayoutEffect(() => {
+    sessionMentionsRef.current = sessionMentionByIdentity(sessionMentions);
+  }, [sessionMentions]);
+
   useEffect(() => {
     editor.setEditable(!disabled);
   }, [disabled, editor]);
@@ -1576,11 +1786,13 @@ function ComposerPromptEditorInner({
     const previousSnapshot = snapshotRef.current;
     const contextsChanged = terminalContextsSignatureRef.current !== terminalContextsSignature;
     const skillsChanged = skillsSignatureRef.current !== skillsSignature;
+    const sessionsChanged = sessionsSignatureRef.current !== sessionsSignature;
     if (
       previousSnapshot.value === value &&
       previousSnapshot.cursor === normalizedCursor &&
       !contextsChanged &&
-      !skillsChanged
+      !skillsChanged &&
+      !sessionsChanged
     ) {
       return;
     }
@@ -1593,19 +1805,31 @@ function ComposerPromptEditorInner({
     };
     terminalContextsSignatureRef.current = terminalContextsSignature;
     skillsSignatureRef.current = skillsSignature;
+    sessionsSignatureRef.current = sessionsSignature;
 
     const rootElement = editor.getRootElement();
     const isFocused = Boolean(rootElement && document.activeElement === rootElement);
-    if (previousSnapshot.value === value && !contextsChanged && !skillsChanged && !isFocused) {
+    if (
+      previousSnapshot.value === value &&
+      !contextsChanged &&
+      !skillsChanged &&
+      !sessionsChanged &&
+      !isFocused
+    ) {
       return;
     }
 
     isApplyingControlledUpdateRef.current = true;
     editor.update(() => {
       const shouldRewriteEditorState =
-        previousSnapshot.value !== value || contextsChanged || skillsChanged;
+        previousSnapshot.value !== value || contextsChanged || skillsChanged || sessionsChanged;
       if (shouldRewriteEditorState) {
-        $setComposerEditorPrompt(value, terminalContexts, skillMetadataRef.current);
+        $setComposerEditorPrompt(
+          value,
+          terminalContexts,
+          skillMetadataRef.current,
+          sessionMentionsRef.current,
+        );
       }
       if (shouldRewriteEditorState || isFocused) {
         $setSelectionAtComposerOffset(normalizedCursor);
@@ -1614,7 +1838,15 @@ function ComposerPromptEditorInner({
     queueMicrotask(() => {
       isApplyingControlledUpdateRef.current = false;
     });
-  }, [cursor, editor, skillsSignature, terminalContexts, terminalContextsSignature, value]);
+  }, [
+    cursor,
+    editor,
+    sessionsSignature,
+    skillsSignature,
+    terminalContexts,
+    terminalContextsSignature,
+    value,
+  ]);
 
   const focusAt = useCallback(
     (nextCursor: number) => {
@@ -1772,7 +2004,11 @@ function ComposerPromptEditorInner({
         />
         <OnChangePlugin onChange={handleEditorChange} />
         <ComposerCommandKeyPlugin {...(onCommandKeyDown ? { onCommandKeyDown } : {})} />
-        <ComposerSurroundSelectionPlugin terminalContexts={terminalContexts} skills={skills} />
+        <ComposerSurroundSelectionPlugin
+          terminalContexts={terminalContexts}
+          skills={skills}
+          sessionMentions={sessionMentions}
+        />
         <ComposerHomeEndKeyPlugin />
         <ComposerInlineTokenArrowPlugin />
         <ComposerInlineTokenSelectionNormalizePlugin />
@@ -1790,6 +2026,7 @@ export function ComposerPromptEditor({
   cursor,
   terminalContexts,
   skills,
+  sessionMentions,
   disabled,
   placeholder,
   className,
@@ -1802,16 +2039,23 @@ export function ComposerPromptEditor({
   const initialValueRef = useRef(value);
   const initialTerminalContextsRef = useRef(terminalContexts);
   const initialSkillMetadataRef = useRef(skillMetadataByName(skills));
+  const initialSessionMentionsRef = useRef(sessionMentionByIdentity(sessionMentions));
   const initialConfig = useMemo<InitialConfigType>(
     () => ({
       namespace: "t3tools-composer-editor",
       editable: true,
-      nodes: [ComposerMentionNode, ComposerSkillNode, ComposerTerminalContextNode],
+      nodes: [
+        ComposerMentionNode,
+        ComposerSkillNode,
+        ComposerSessionNode,
+        ComposerTerminalContextNode,
+      ],
       editorState: () => {
         $setComposerEditorPrompt(
           initialValueRef.current,
           initialTerminalContextsRef.current,
           initialSkillMetadataRef.current,
+          initialSessionMentionsRef.current,
         );
       },
       onError: (error) => {
@@ -1828,6 +2072,7 @@ export function ComposerPromptEditor({
         cursor={cursor}
         terminalContexts={terminalContexts}
         skills={skills}
+        sessionMentions={sessionMentions}
         disabled={disabled}
         placeholder={placeholder}
         onRemoveTerminalContext={onRemoveTerminalContext}

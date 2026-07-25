@@ -57,6 +57,8 @@ import {
   makeAcpPlanUpdatedEvent,
   makeAcpRequestOpenedEvent,
   makeAcpRequestResolvedEvent,
+  makeAcpThreadMetadataUpdatedEvent,
+  makeAcpTokenUsageUpdatedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import {
@@ -799,6 +801,7 @@ export function makeCursorAdapter(
                         threadId: ctx.threadId,
                         turnId: ctx.activeTurnId,
                         itemId: event.itemId,
+                        itemType: event.itemType,
                         lifecycle: "item.started",
                       }),
                     );
@@ -811,6 +814,7 @@ export function makeCursorAdapter(
                         threadId: ctx.threadId,
                         turnId: ctx.activeTurnId,
                         itemId: event.itemId,
+                        itemType: event.itemType,
                         lifecycle: "item.completed",
                       }),
                     );
@@ -862,10 +866,39 @@ export function makeCursorAdapter(
                         threadId: ctx.threadId,
                         turnId: ctx.activeTurnId,
                         ...(event.itemId ? { itemId: event.itemId } : {}),
+                        streamKind: event.streamKind,
                         text: event.text,
                         rawPayload: event.rawPayload,
                       }),
                     );
+                    return;
+                  case "TokenUsageUpdated":
+                    yield* offerRuntimeEvent(
+                      makeAcpTokenUsageUpdatedEvent({
+                        stamp: yield* makeEventStamp(),
+                        provider: PROVIDER,
+                        threadId: ctx.threadId,
+                        turnId: ctx.activeTurnId,
+                        usage: event.usage,
+                        rawPayload: event.rawPayload,
+                      }),
+                    );
+                    return;
+                  case "SessionInfoUpdated":
+                    if (event.title) {
+                      yield* offerRuntimeEvent(
+                        makeAcpThreadMetadataUpdatedEvent({
+                          stamp: yield* makeEventStamp(),
+                          provider: PROVIDER,
+                          threadId: ctx.threadId,
+                          turnId: ctx.activeTurnId,
+                          title: event.title,
+                          rawPayload: event.rawPayload,
+                        }),
+                      );
+                    }
+                    return;
+                  case "ConfigOptionsUpdated":
                     return;
                 }
               }),

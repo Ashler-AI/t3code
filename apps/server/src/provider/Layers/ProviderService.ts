@@ -10,6 +10,7 @@
  * @module ProviderServiceLive
  */
 import {
+  EnvironmentId,
   ModelSelection,
   NonNegativeInt,
   ThreadId,
@@ -19,18 +20,24 @@ import {
   ProviderSendTurnInput,
   ProviderSessionStartInput,
   ProviderStopSessionInput,
+  ProviderRuntimeResumeCursor,
+  RuntimeSessionId,
   type ProviderInstanceId,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
+  type ProviderRuntimeEventEnvelope,
   type ProviderSession,
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Semaphore from "effect/Semaphore";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
@@ -45,7 +52,11 @@ import {
   providerTurnMetricAttributes,
   withMetrics,
 } from "../../observability/Metrics.ts";
-import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
+import {
+  type ProviderAdapterError,
+  type ProviderServiceError,
+  ProviderValidationError,
+} from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -55,7 +66,9 @@ import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 const isModelSelection = Schema.is(ModelSelection);
+const isProviderRuntimeResumeCursor = Schema.is(ProviderRuntimeResumeCursor);
 
 /**
  * Hook for tests that want to override the canonical event logger pulled
@@ -64,6 +77,7 @@ const isModelSelection = Schema.is(ModelSelection);
  */
 export interface ProviderServiceLiveOptions {
   readonly canonicalEventLogger?: EventNdjsonLogger;
+  readonly environmentId?: EnvironmentId;
 }
 
 type ProviderServiceMethod<Name extends keyof ProviderService.ProviderService["Service"]> =
@@ -162,6 +176,19 @@ function readPersistedCwd(
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function readPersistedCanonicalSourceSequence(
+  runtimePayload: ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"],
+): number | undefined {
+  if (!runtimePayload || typeof runtimePayload !== "object" || Array.isArray(runtimePayload)) {
+    return undefined;
+  }
+  const raw =
+    "canonicalSourceSequence" in runtimePayload
+      ? runtimePayload.canonicalSourceSequence
+      : undefined;
+  return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : undefined;
+}
+
 const dieOnMissingBindingInstanceId = (
   operation: string,
   payload: {
@@ -199,6 +226,35 @@ const correlateRuntimeEventWithInstance = (
   return { ...event, providerInstanceId: source.instanceId };
 };
 
+function canonicalResumeCursor(
+  event: ProviderRuntimeEvent,
+): ProviderRuntimeEventEnvelope["resumeCursor"] {
+  if (event.resumeCursor === undefined) {
+    return null;
+  }
+  if (
+    event.provider === "omp" &&
+    typeof event.resumeCursor === "object" &&
+    event.resumeCursor !== null &&
+    !Array.isArray(event.resumeCursor)
+  ) {
+    const raw = event.resumeCursor as Record<string, unknown>;
+    const candidate = {
+      kind: "omp" as const,
+      schemaVersion: raw.schemaVersion,
+      sessionId:
+        typeof raw.sessionId === "string" ? RuntimeSessionId.make(raw.sessionId) : raw.sessionId,
+      eventSequence: raw.eventSequence,
+      acpSequence: raw.acpSequence,
+      ...(typeof raw.activeTurnId === "string" ? { activeTurnId: raw.activeTurnId } : {}),
+    };
+    if (isProviderRuntimeResumeCursor(candidate)) {
+      return candidate;
+    }
+  }
+  return { kind: "opaque", value: event.resumeCursor };
+}
+
 const makeProviderService = Effect.fn("makeProviderService")(function* (
   options?: ProviderServiceLiveOptions,
 ) {
@@ -213,6 +269,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const canonicalRuntimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEventEnvelope>();
+  const canonicalRuntimeDeliveryQueue =
+    yield* Queue.unbounded<ProviderService.ProviderRuntimeEventDelivery>();
+  yield* Effect.addFinalizer(() => Queue.shutdown(canonicalRuntimeDeliveryQueue));
+  const environmentId = options?.environmentId ?? EnvironmentId.make("local");
+  const sourceSequences = new Map<ThreadId, number>();
+  let durableDeliveryConsumerEnabled = false;
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
     McpSessionRegistry.issueActiveMcpCredential({ threadId, providerInstanceId }).pipe(
@@ -227,16 +290,123 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
     );
 
-  const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
-    Effect.succeed(event).pipe(
-      Effect.tap((canonicalEvent) =>
-        canonicalEventLogger
-          ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
-          : Effect.void,
-      ),
-      Effect.flatMap((canonicalEvent) => PubSub.publish(runtimeEventPubSub, canonicalEvent)),
-      Effect.asVoid,
-    );
+  const resolveSourceSequence = Effect.fn("ProviderService.resolveSourceSequence")(function* (
+    event: ProviderRuntimeEvent,
+  ) {
+    const resumeCursor = canonicalResumeCursor(event);
+    if (resumeCursor?.kind === "omp") {
+      sourceSequences.set(
+        event.threadId,
+        Math.max(sourceSequences.get(event.threadId) ?? 0, resumeCursor.eventSequence),
+      );
+      return resumeCursor.eventSequence;
+    }
+
+    let previousSourceSequence = sourceSequences.get(event.threadId);
+    if (previousSourceSequence === undefined) {
+      const binding = Option.getOrUndefined(yield* directory.getBinding(event.threadId));
+      previousSourceSequence = readPersistedCanonicalSourceSequence(binding?.runtimePayload) ?? 0;
+    }
+    const sourceSequence = previousSourceSequence + 1;
+    sourceSequences.set(event.threadId, sourceSequence);
+    return sourceSequence;
+  });
+
+  const checkpointRuntimeEvent = (
+    source: { readonly instanceId: ProviderInstanceId; readonly provider: ProviderDriverKind },
+    envelope: ProviderRuntimeEventEnvelope,
+  ) =>
+    directory.upsert({
+      threadId: envelope.threadId,
+      provider: envelope.event.provider,
+      providerInstanceId: source.instanceId,
+      ...(envelope.event.resumeCursor !== undefined
+        ? { resumeCursor: envelope.event.resumeCursor }
+        : {}),
+      runtimePayload: {
+        canonicalSourceSequence: envelope.sourceSequence,
+        canonicalEventId: envelope.eventId,
+        lastRuntimeEvent: envelope.event.type,
+        lastRuntimeEventAt: envelope.event.createdAt,
+        ...(envelope.event.turnId !== undefined ? { activeTurnId: envelope.event.turnId } : {}),
+      },
+    });
+
+  const awaitDurableIngestion = Effect.fn("ProviderService.awaitDurableIngestion")(function* (
+    source: { readonly instanceId: ProviderInstanceId; readonly provider: ProviderDriverKind },
+    envelope: ProviderRuntimeEventEnvelope,
+  ) {
+    while (true) {
+      const receipt = yield* Deferred.make<
+        { readonly _tag: "Acknowledged" } | { readonly _tag: "Retry"; readonly cause?: unknown }
+      >();
+      const receiptSemaphore = yield* Semaphore.make(1);
+      const acknowledge = receiptSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          if (yield* Deferred.isDone(receipt)) return;
+          yield* checkpointRuntimeEvent(source, envelope);
+          yield* Deferred.succeed(receipt, { _tag: "Acknowledged" }).pipe(Effect.asVoid);
+        }),
+      );
+      const retry = (cause?: unknown) =>
+        receiptSemaphore.withPermits(1)(
+          Deferred.isDone(receipt).pipe(
+            Effect.flatMap((done) =>
+              done
+                ? Effect.void
+                : Deferred.succeed(receipt, {
+                    _tag: "Retry" as const,
+                    ...(cause === undefined ? {} : { cause }),
+                  }).pipe(Effect.asVoid),
+            ),
+          ),
+        );
+      yield* Queue.offer(canonicalRuntimeDeliveryQueue, {
+        envelope,
+        acknowledge,
+        retry,
+      });
+      const resolution = yield* Deferred.await(receipt);
+      if (resolution._tag === "Acknowledged") return;
+      yield* Effect.logWarning("provider runtime delivery requested retry", {
+        threadId: envelope.threadId,
+        eventId: envelope.eventId,
+        sourceSequence: envelope.sourceSequence,
+        ...(resolution.cause === undefined ? {} : { cause: resolution.cause }),
+      });
+      yield* Effect.yieldNow;
+    }
+  });
+
+  const publishRuntimeEvent = Effect.fn("ProviderService.publishRuntimeEvent")(function* (
+    event: ProviderRuntimeEvent,
+    source: { readonly instanceId: ProviderInstanceId },
+  ) {
+    const resumeCursor = canonicalResumeCursor(event);
+    const sourceSequence = yield* resolveSourceSequence(event);
+    const envelope: ProviderRuntimeEventEnvelope = {
+      protocolVersion: 1,
+      eventId: event.eventId,
+      environmentId,
+      threadId: event.threadId,
+      sourceSequence,
+      resumeCursor,
+      providerInstanceId: source.instanceId,
+      ...(resumeCursor?.kind === "omp" ? { runtimeSessionId: resumeCursor.sessionId } : {}),
+      event,
+    };
+    if (canonicalEventLogger) {
+      yield* canonicalEventLogger.write(event, event.threadId);
+    }
+    yield* PubSub.publish(runtimeEventPubSub, event);
+    yield* PubSub.publish(canonicalRuntimeEventPubSub, envelope);
+    if (durableDeliveryConsumerEnabled) {
+      yield* awaitDurableIngestion(
+        { instanceId: source.instanceId, provider: event.provider },
+        envelope,
+      );
+    }
+  });
 
   const requireBindingInstanceId = (
     operation: string,
@@ -287,13 +457,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       readonly provider: ProviderDriverKind;
     },
     event: ProviderRuntimeEvent,
-  ): Effect.Effect<void> =>
+  ): Effect.Effect<void, ProviderServiceError> =>
     Effect.sync(() => correlateRuntimeEventWithInstance(source, event)).pipe(
       Effect.flatMap((canonicalEvent) =>
         increment(providerRuntimeEventsTotal, {
           provider: canonicalEvent.provider,
           eventType: canonicalEvent.type,
-        }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent))),
+        }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent, source))),
       ),
     );
 
@@ -1091,12 +1261,25 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     get streamEvents(): ProviderServiceMethod<"streamEvents"> {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
+    get streamCanonicalEvents(): NonNullable<ProviderServiceMethod<"streamCanonicalEvents">> {
+      return Stream.fromPubSub(canonicalRuntimeEventPubSub);
+    },
+    get streamCanonicalDeliveries(): NonNullable<
+      ProviderServiceMethod<"streamCanonicalDeliveries">
+    > {
+      durableDeliveryConsumerEnabled = true;
+      return Stream.fromQueue(canonicalRuntimeDeliveryQueue);
+    },
   } satisfies ProviderService.ProviderService["Service"];
 });
 
 export const ProviderServiceLive = Layer.effect(
   ProviderService.ProviderService,
-  makeProviderService(),
+  Effect.gen(function* () {
+    const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+    const environmentId = yield* serverEnvironment.getEnvironmentId;
+    return yield* makeProviderService({ environmentId });
+  }),
 );
 
 export function makeProviderServiceLive(options?: ProviderServiceLiveOptions) {

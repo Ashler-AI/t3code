@@ -11,6 +11,7 @@ import { HttpBody, HttpClient, HttpRouter, HttpServerResponse } from "effect/uns
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
+import * as SessionReferenceAuthority from "./toolkits/session-references/authority.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -145,6 +146,64 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
         ),
       });
       expect(reusedSessionResponse.status).toBe(404);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("initializes OMP against the complete MCP tool registry", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const authority = SessionReferenceAuthority.SessionReferenceAuthority.of({
+        resolve: () => Effect.die("unused"),
+        send: () => Effect.die("unused"),
+      });
+      const registrationLayer = Layer.mergeAll(
+        McpHttpServer.PreviewToolkitRegistrationLive,
+        McpHttpServer.SessionReferenceToolkitRegistrationLive,
+      ).pipe(
+        Layer.provide(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
+        Layer.provide(
+          Layer.succeed(SessionReferenceAuthority.SessionReferenceAuthority, authority),
+        ),
+      );
+      const authMiddleware = HttpRouter.middleware<{
+        provides: McpInvocationContext.McpInvocationContext;
+      }>()(
+        Effect.succeed((httpEffect) =>
+          httpEffect.pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+            Effect.map(McpHttpServer.normalizeMcpHttpResponse),
+          ),
+        ),
+      ).layer;
+      const serverLayer = registrationLayer.pipe(
+        Layer.provideMerge(
+          McpServer.layerHttp({
+            name: "T3 Code",
+            version: "0.0.28",
+            path: "/mcp",
+          }).pipe(Layer.provide(authMiddleware)),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, {
+        disableListenLog: true,
+        disableLogger: true,
+      }).pipe(Layer.build);
+      const httpClient = yield* HttpClient.HttpClient;
+
+      const response = yield* httpClient.post("/mcp", {
+        headers: { accept: "application/json, text/event-stream" },
+        body: HttpBody.text(
+          `{"jsonrpc":"2.0","id":"153cd6a475dbf9d6","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"roots":{"listChanged":false}},"clientInfo":{"name":"omp-coding-agent","version":"1.0.0"}}}`,
+          "application/json",
+        ),
+      });
+      const body = yield* response.text;
+
+      expect(response.status).toBe(200);
+      expect(response.headers["mcp-session-id"]).not.toBeNull();
+      expect(body).not.toContain('"error"');
+      expect(body).toContain('"protocolVersion":"2025-03-26"');
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

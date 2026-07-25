@@ -6,6 +6,7 @@ import { defineProject, type TestProjectInlineConfiguration } from "vite-plus/te
 import "vite-plus/test/config";
 import { defineConfig } from "vite-plus";
 import pkg from "./package.json" with { type: "json" };
+import productManifest from "../../ashler/product.json" with { type: "json" };
 
 import { DEV_PROXIED_PATH_PREFIXES } from "@t3tools/shared/devProxy";
 
@@ -127,6 +128,11 @@ const allowedHosts = [".ts.net", ...configuredAllowedHosts];
 export default defineConfig(() => {
   return {
     plugins: [
+      {
+        name: "ashler-web-product-identity",
+        transformIndexHtml: (html) =>
+          html.replaceAll("__ASHLER_PRODUCT_NAME__", productManifest.productName),
+      },
       tanstackRouter(),
       react(),
       babel({

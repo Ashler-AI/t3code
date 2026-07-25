@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "ashlerVersion": "0.1.0-alpha.0",
+  "upstream": {
+    "repository": "https://github.com/pingdotgg/t3code",
+    "baseSha": "ece05087a70e94efcd57441337fa1249559362ba"
+  }
+}

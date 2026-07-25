@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 
 import type { ConnectionCatalogEntry } from "./catalog.ts";
 import type {
@@ -52,6 +53,35 @@ export const make = Effect.gen(function* () {
     yield* reportProgress({ stage: "preparing" });
     const prepared = yield* resolver.prepare(entry);
     yield* reportProgress({ stage: "opening", prepared });
+    if (target._tag === "SessionFabricConnectionTarget") {
+      const unavailable = () =>
+        Effect.die(
+          new Error(
+            "This operation requires the owning session runner; the durable session view only supports orchestration and context operations.",
+          ),
+        );
+      const client = new Proxy(
+        {},
+        {
+          get: (_target, property) =>
+            typeof property === "string" &&
+            (property.startsWith("subscribe") ||
+              property.endsWith(".connect") ||
+              property.endsWith(".attach"))
+              ? () => Stream.never
+              : unavailable,
+        },
+      ) as RpcSession.RpcSession["client"];
+      const session = {
+        client,
+        initialConfig: unavailable(),
+        ready: Effect.void,
+        probe: Effect.void,
+        closed: Effect.never,
+      } satisfies RpcSession.RpcSession;
+      yield* reportProgress({ stage: "synchronizing", prepared });
+      return { prepared, session } satisfies EnvironmentConnectionLease;
+    }
     const session = yield* sessions.connect(prepared);
     yield* reportProgress({ stage: "synchronizing", prepared });
     yield* session.ready;

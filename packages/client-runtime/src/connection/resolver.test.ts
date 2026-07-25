@@ -1,4 +1,13 @@
-import { EnvironmentId, type DesktopSshEnvironmentTarget } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ScaffoldEnvironmentBinding,
+  ScaffoldLifecycleError,
+  ScaffoldPreparedConnection,
+  ScaffoldSessionLinks,
+  SessionFabricClientId,
+  SessionFabricSessionId,
+  type DesktopSshEnvironmentTarget,
+} from "@t3tools/contracts";
 import { RelayEnvironmentConnectScope } from "@t3tools/contracts/relay";
 import { RelayClientTracer } from "@t3tools/shared/relayTracing";
 import { describe, expect, it } from "@effect/vitest";
@@ -26,10 +35,13 @@ import {
   ConnectionTransientError,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
+  ScaffoldConnectionTarget,
+  SessionFabricConnectionTarget,
   SshConnectionTarget,
   type ConnectionTarget,
 } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
+import { ScaffoldLifecycleGateway } from "../scaffold/managedConnection.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
 const ENDPOINT = {
@@ -97,6 +109,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly primaryBearerToken?: string;
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
+  readonly prepareScaffold?: ScaffoldLifecycleGateway["Service"]["prepare"];
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -183,6 +196,31 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
     Layer.succeed(RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization, remote),
     Layer.succeed(ClientCapabilities.SshEnvironmentGateway, ssh),
     Layer.succeed(
+      ScaffoldLifecycleGateway,
+      ScaffoldLifecycleGateway.of({
+        create: () =>
+          Effect.fail(
+            new ScaffoldLifecycleError({
+              reason: "configuration",
+              message: "unused",
+              status: 0,
+              code: "unused",
+            }),
+          ),
+        prepare:
+          options?.prepareScaffold ??
+          (() =>
+            Effect.fail(
+              new ScaffoldLifecycleError({
+                reason: "configuration",
+                message: "unused",
+                status: 0,
+                code: "unused",
+              }),
+            )),
+      }),
+    ),
+    Layer.succeed(
       ManagedRelay.ManagedRelayClient,
       relayClient(
         options?.connectEnvironment ??
@@ -201,6 +239,31 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
 });
 
 describe("ConnectionResolver", () => {
+  it.effect("prepares a virtual session fabric connection without environment auth", () =>
+    Effect.gen(function* () {
+      const target = new SessionFabricConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Shared session",
+        relayBaseUrl: "https://relay.example.test/base/",
+        sessionId: SessionFabricSessionId.make("session-fabric-1"),
+        clientId: SessionFabricClientId.make("client-1"),
+      });
+
+      const prepared = yield* ConnectionResolver.prepareSessionFabricConnection(target);
+
+      expect(prepared).toMatchObject({
+        environmentId: ENVIRONMENT_ID,
+        label: "Shared session",
+        httpBaseUrl: "https://relay.example.test/base/",
+        httpAuthorization: null,
+        target,
+      });
+      expect(prepared.socketUrl).toBe(
+        "wss://relay.example.test/base/v1/session-fabric/sessions/session-fabric-1/connect",
+      );
+    }),
+  );
+
   it.effect("prepares a primary environment without remote capabilities", () =>
     Effect.gen(function* () {
       const brokerLayer = yield* makeDependencies();
@@ -460,5 +523,73 @@ describe("ConnectionResolver", () => {
       expect(error).toBeInstanceOf(ConnectionTransientError);
       expect(error).toMatchObject({ reason: "timeout" });
     }),
+  );
+
+  it.effect(
+    "refreshes Scaffold lifecycle authority and connects directly with ephemeral DPoP",
+    () =>
+      Effect.gen(function* () {
+        const target = new ScaffoldConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "Scaffold sandbox",
+          deployment: "staging",
+          sessionId: "session-1",
+          lifecycleEpoch: 2,
+        });
+        const prepareInputs = yield* Ref.make<ReadonlyArray<ScaffoldConnectionTarget>>([]);
+        const bootstrapCredentials = yield* Ref.make<ReadonlyArray<string>>([]);
+        const brokerLayer = yield* makeDependencies({
+          prepareScaffold: (input) =>
+            Ref.update(prepareInputs, (values) => [...values, input]).pipe(
+              Effect.as(
+                new ScaffoldPreparedConnection({
+                  binding: new ScaffoldEnvironmentBinding({
+                    deployment: "staging",
+                    environmentId: ENVIRONMENT_ID,
+                    sessionId: "session-1",
+                    lifecycleEpoch: 3,
+                    status: "ready",
+                    links: new ScaffoldSessionLinks({
+                      session: "https://scaffold.example.test/?q=session-1",
+                      web: "https://scaffold.example.test/sessions/session-1/web",
+                      tilt: "https://scaffold.example.test/sessions/session-1/tilt",
+                    }),
+                    lastKnownAt: "2026-07-24T20:00:00.000Z",
+                  }),
+                  httpBaseUrl: ENDPOINT.httpBaseUrl,
+                  wsBaseUrl: ENDPOINT.wsBaseUrl,
+                  bootstrapCredential: "one-time-bootstrap",
+                  expiresAt: "2026-07-24T20:05:00.000Z",
+                }),
+              ),
+            ),
+          authorizeDpop: (input) =>
+            input.obtainBootstrap.pipe(
+              Effect.tap((bootstrap) =>
+                Ref.update(bootstrapCredentials, (values) => [...values, bootstrap.credential]),
+              ),
+              Effect.as({
+                environmentId: ENVIRONMENT_ID,
+                label: "Scaffold sandbox",
+                httpBaseUrl: ENDPOINT.httpBaseUrl,
+                socketUrl: "wss://environment.example.test/ws?wsTicket=scaffold",
+                httpAuthorization: { _tag: "Dpop" as const, accessToken: "ephemeral-access" },
+              }),
+            ),
+        });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(brokerLayer),
+        );
+
+        const prepared = yield* broker.prepare(catalogEntry(target));
+
+        expect(yield* Ref.get(prepareInputs)).toEqual([target]);
+        expect(yield* Ref.get(bootstrapCredentials)).toEqual(["one-time-bootstrap"]);
+        expect(prepared.target).toMatchObject({
+          _tag: "ScaffoldConnectionTarget",
+          lifecycleEpoch: 3,
+        });
+        expect(prepared.socketUrl).toContain("wsTicket=scaffold");
+      }),
   );
 });

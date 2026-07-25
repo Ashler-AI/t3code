@@ -279,7 +279,7 @@ function deriveUnsettledTurnId(
 
 /**
  * Settled turns fold their commentary and tool activity behind a
- * "Worked for ..." row anchored at the turn's first foldable entry; the
+ * "Thinking for ..." row anchored at the turn's first foldable entry; the
  * terminal assistant message stays visible below the fold.
  */
 function deriveTurnFolds(input: {
@@ -388,8 +388,8 @@ function deriveTurnFolds(input: {
         ? `You stopped after ${duration}`
         : "You stopped this response"
       : duration
-        ? `Worked for ${duration}`
-        : "Worked";
+        ? `Thinking for ${duration}`
+        : "Thinking";
 
     foldsByAnchorEntryId.set(firstEntry.id, {
       turnId,

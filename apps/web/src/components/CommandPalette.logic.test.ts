@@ -3,11 +3,16 @@ import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools
 import type { Thread } from "../types";
 import {
   buildBrowseGroups,
+  buildAshlerRootGroups,
   buildThreadActionItems,
   enumerateCommandPaletteItems,
   filterCommandPaletteGroups,
   reduceCommandPaletteUiState,
+  getCommandPaletteInputPlaceholder,
+  shouldRefreshOmpOverviewOnOpen,
+  type CommandPaletteActionItem,
   type CommandPaletteGroup,
+  type CommandPaletteSubmenuItem,
 } from "./CommandPalette.logic";
 
 describe("reduceCommandPaletteUiState", () => {
@@ -105,6 +110,64 @@ describe("enumerateCommandPaletteItems", () => {
       "thread.jump.9",
       undefined,
     ]);
+  });
+});
+
+describe("Ashler command palette root", () => {
+  const action = (value: string, title: string): CommandPaletteActionItem => ({
+    kind: "action",
+    value,
+    searchTerms: [title],
+    title,
+    icon: null,
+    run: async () => undefined,
+  });
+
+  it("contains only session creation, account actions, and plan usage", () => {
+    const newSessionItem: CommandPaletteSubmenuItem = {
+      kind: "submenu",
+      value: "action:new-session",
+      searchTerms: ["new session"],
+      title: "New Session",
+      icon: null,
+      addonIcon: null,
+      groups: [],
+    };
+    const groups = buildAshlerRootGroups({
+      newSessionItem,
+      accountItems: [action("account:add", "Add ChatGPT"), action("account:remove", "Remove A")],
+      planUsageItems: [
+        action("usage:refresh", "Refresh plan usage"),
+        action("usage:cached", "ChatGPT · 7-day quota"),
+      ],
+    });
+
+    expect(groups.map((group) => group.value)).toEqual([
+      "sessions",
+      "omp-accounts",
+      "omp-plan-usage",
+    ]);
+    expect(groups.flatMap((group) => group.items.map((item) => item.value))).toEqual([
+      "action:new-session",
+      "account:add",
+      "account:remove",
+      "usage:refresh",
+      "usage:cached",
+    ]);
+    expect(JSON.stringify(groups)).not.toMatch(/settings|recent|project:add|thread:/i);
+    expect(getCommandPaletteInputPlaceholder("root")).toBe("Search commands...");
+  });
+
+  it("waits for cached usage before starting the synchronous refresh", () => {
+    expect(shouldRefreshOmpOverviewOnOpen({ cacheHydrated: false, hasEnvironment: true })).toBe(
+      false,
+    );
+    expect(shouldRefreshOmpOverviewOnOpen({ cacheHydrated: true, hasEnvironment: true })).toBe(
+      true,
+    );
+    expect(shouldRefreshOmpOverviewOnOpen({ cacheHydrated: true, hasEnvironment: false })).toBe(
+      false,
+    );
   });
 });
 

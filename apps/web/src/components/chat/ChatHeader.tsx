@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   type EditorId,
+  type OmpAccountAssignment,
   type ProjectScript,
   type ResolvedKeybindingsConfig,
   type ThreadId,
@@ -19,6 +20,44 @@ import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { cn } from "~/lib/utils";
+import { providerDisplayName } from "../OmpAccountPalette.logic";
+
+export interface OmpAccountAssignmentPresentation {
+  readonly label: string;
+  readonly detail: string;
+}
+
+function automaticAssignmentDetail(reason: OmpAccountAssignment["reassignmentReason"]): string {
+  switch (reason) {
+    case "initial-assignment":
+      return "Automatically assigned for this session.";
+    case "load-balanced":
+      return "Automatically assigned to balance usage across accounts.";
+    case "usage-limited":
+      return "Automatically reassigned because another account reached a usage limit.";
+    case "quota-exhausted":
+      return "Automatically reassigned because another account exhausted its quota.";
+    case "account-unavailable":
+      return "Automatically reassigned because another account became unavailable.";
+    case "broker-policy":
+      return "Automatically reassigned by the Scaffold account policy.";
+    case "unknown":
+    case undefined:
+      return "Automatically assigned to keep this session available.";
+  }
+}
+
+export function getOmpAccountAssignmentPresentation(
+  assignment: OmpAccountAssignment | null,
+): OmpAccountAssignmentPresentation | null {
+  const account = assignment?.account;
+  if (!account) return null;
+
+  return {
+    label: `${providerDisplayName(account.provider)} · ${account.maskedEmail ?? account.displayName}`,
+    detail: automaticAssignmentDetail(assignment.reassignmentReason),
+  };
+}
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -29,6 +68,7 @@ interface ChatHeaderProps {
   activeProjectCwd: string | null;
   openInCwd: string | null;
   activeProjectScripts: ReadonlyArray<ProjectScript> | undefined;
+  ompAccountAssignment: OmpAccountAssignment | null;
   preferredScriptId: string | null;
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
@@ -65,6 +105,7 @@ export const ChatHeader = memo(function ChatHeader({
   activeProjectCwd,
   openInCwd,
   activeProjectScripts,
+  ompAccountAssignment,
   preferredScriptId,
   keybindings,
   availableEditors,
@@ -86,6 +127,7 @@ export const ChatHeader = memo(function ChatHeader({
     activeThreadEnvironmentId,
     primaryEnvironmentId,
   });
+  const accountAssignment = getOmpAccountAssignmentPresentation(ompAccountAssignment);
   return (
     <div className="@container/header-actions flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
       <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden sm:gap-3">
@@ -132,6 +174,23 @@ export const ChatHeader = memo(function ChatHeader({
           />
           <TooltipPopup side="top">{activeThreadTitle}</TooltipPopup>
         </Tooltip>
+        {accountAssignment ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <span
+                  aria-label={`${accountAssignment.label}. ${accountAssignment.detail}`}
+                  className="inline-flex max-w-48 shrink-0 items-center gap-1.5 truncate rounded-md border border-border/70 bg-muted/35 px-2 py-1 text-xs text-muted-foreground"
+                  data-omp-account-assignment
+                >
+                  <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-emerald-500/80" />
+                  <span className="truncate">{accountAssignment.label}</span>
+                </span>
+              }
+            />
+            <TooltipPopup side="bottom">{accountAssignment.detail}</TooltipPopup>
+          </Tooltip>
+        ) : null}
       </div>
       <div
         data-chat-header-actions

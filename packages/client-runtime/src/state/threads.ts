@@ -1,5 +1,4 @@
 import {
-  ORCHESTRATION_WS_METHODS,
   type EnvironmentId as EnvironmentIdType,
   type OrchestrationThread,
   type OrchestrationThreadDetailSnapshot,
@@ -20,8 +19,7 @@ import { connectionProjectionPhase } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import * as ConnectionWakeups from "../connection/wakeups.ts";
 import { EnvironmentCacheStore } from "../platform/persistence.ts";
-import { subscribeDynamic } from "../rpc/client.ts";
-import { ThreadSnapshotLoader } from "./threadSnapshotHttp.ts";
+import { resolveUiSessionSource } from "../session-source/index.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyThreadDetailEvent } from "./threadReducer.ts";
 import { THREAD_STATE_IDLE_TTL_MS } from "./threadRetention.ts";
@@ -53,7 +51,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 ) {
   const supervisor = yield* EnvironmentSupervisor;
   const cache = yield* EnvironmentCacheStore;
-  const snapshotLoader = yield* ThreadSnapshotLoader;
+  const sessionSource = yield* resolveUiSessionSource;
   const wakeups = yield* Effect.serviceOption(ConnectionWakeups.ConnectionWakeups);
   const environmentId = supervisor.target.environmentId;
   const cached = yield* cache.loadThread(environmentId, threadId).pipe(
@@ -241,61 +239,62 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
 
   yield* setSynchronizing;
   yield* Effect.forkScoped(
-    subscribeDynamic(
-      ORCHESTRATION_WS_METHODS.subscribeThread,
-      Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (session) {
-        const supportsCompletionMarker = yield* session.initialConfig.pipe(
-          Effect.map((config) => config.threadResumeCompletionMarker === true),
-          Effect.orElseSucceed(() => false),
-        );
-        yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
-        yield* setSynchronizing;
+    sessionSource
+      .subscribeThread(
+        Effect.fn("EnvironmentThreadState.makeSubscribeInput")(function* (capabilities) {
+          const supportsCompletionMarker = capabilities.threadResumeCompletionMarker;
+          yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
+          yield* setSynchronizing;
 
-        let current = yield* SubscriptionRef.get(state);
-        if (Option.isNone(current.data) && current.status !== "deleted") {
-          const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
-            Effect.flatMap(
-              Option.match({
-                onSome: Effect.succeed,
-                onNone: () =>
-                  SubscriptionRef.changes(supervisor.prepared).pipe(
-                    Stream.filter(Option.isSome),
-                    Stream.map((value) => value.value),
-                    Stream.runHead,
-                    Effect.map(Option.getOrThrow),
-                  ),
-              }),
-            ),
-          );
-          const httpSnapshot = yield* snapshotLoader.load(prepared, threadId);
-          if (Option.isSome(httpSnapshot)) {
-            yield* applyItem({ kind: "snapshot", snapshot: httpSnapshot.value });
-            current = yield* SubscriptionRef.get(state);
+          let current = yield* SubscriptionRef.get(state);
+          if (Option.isNone(current.data) && current.status !== "deleted") {
+            const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
+              Effect.flatMap(
+                Option.match({
+                  onSome: Effect.succeed,
+                  onNone: () =>
+                    SubscriptionRef.changes(supervisor.prepared).pipe(
+                      Stream.filter(Option.isSome),
+                      Stream.map((value) => value.value),
+                      Stream.runHead,
+                      Effect.map(Option.getOrThrow),
+                    ),
+                }),
+              ),
+            );
+            const httpSnapshot = yield* sessionSource.authoritativeThreadSnapshot(
+              prepared,
+              threadId,
+            );
+            if (Option.isSome(httpSnapshot)) {
+              yield* applyItem({ kind: "snapshot", snapshot: httpSnapshot.value });
+              current = yield* SubscriptionRef.get(state);
+            }
           }
-        }
 
-        const sequence = yield* SubscriptionRef.get(lastSequence);
-        const canResume = Option.isSome(current.data);
-        if (!supportsCompletionMarker && canResume) {
-          yield* SubscriptionRef.update(state, (value) => ({
-            ...value,
-            status: value.status === "deleted" ? value.status : ("live" as const),
-            error: Option.none(),
-          }));
-        }
+          const sequence = yield* SubscriptionRef.get(lastSequence);
+          const canResume = Option.isSome(current.data);
+          if (!supportsCompletionMarker && canResume) {
+            yield* SubscriptionRef.update(state, (value) => ({
+              ...value,
+              status: value.status === "deleted" ? value.status : ("live" as const),
+              error: Option.none(),
+            }));
+          }
 
-        return {
-          threadId,
-          ...(canResume ? { afterSequence: sequence } : {}),
-          ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
-        };
-      }),
-      {
-        onExpectedFailure: setStreamError,
-        retryExpectedFailureAfter: "250 millis",
-        resubscribe: foregroundResubscriptions,
-      },
-    ).pipe(Stream.runForEach(applyItem)),
+          return {
+            threadId,
+            ...(canResume ? { afterSequence: sequence } : {}),
+            ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
+          };
+        }),
+        {
+          onExpectedFailure: setStreamError,
+          retryExpectedFailureAfter: "250 millis",
+          resubscribe: foregroundResubscriptions,
+        },
+      )
+      .pipe(Stream.runForEach(applyItem)),
   );
 
   yield* Effect.addFinalizer(() =>
@@ -321,10 +320,7 @@ export function threadStateChanges(environmentId: EnvironmentIdType, threadId: T
 }
 
 export function createEnvironmentThreadStateAtoms<R, E>(
-  runtime: Atom.AtomRuntime<
-    EnvironmentRegistry | EnvironmentCacheStore | ThreadSnapshotLoader | R,
-    E
-  >,
+  runtime: Atom.AtomRuntime<EnvironmentRegistry | EnvironmentCacheStore | R, E>,
 ) {
   const family = Atom.family((key: string) => {
     const { environmentId, threadId } = parseThreadKey(key);

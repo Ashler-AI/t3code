@@ -25,6 +25,7 @@ import { resolveNewDraftStartFromOrigin } from "../lib/chatThreadActions";
 import { primaryServerSettingsAtom } from "../state/server";
 import { resolveThreadRouteTarget } from "../threadRoutes";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
+import { selectDefaultNewThreadProject } from "../newThreadProject";
 import { useClientSettings } from "./useSettings";
 
 export function useNewThreadHandler() {
@@ -50,7 +51,9 @@ export function useNewThreadHandler() {
         worktreePath?: string | null;
         envMode?: DraftThreadEnvMode;
         startFromOrigin?: boolean;
+        forceNew?: boolean;
         replace?: boolean;
+        onDraftCreated?: (draftId: import("../composerDraftStore").DraftId) => void;
       },
     ): Promise<void> => {
       const {
@@ -128,8 +131,9 @@ export function useNewThreadHandler() {
           ? getDraftThread(currentRouteTarget.threadRef)
           : getDraftSession(currentRouteTarget.draftId)
         : null;
-      if (reusableStoredDraftThread) {
+      if (reusableStoredDraftThread && options?.forceNew !== true) {
         return (async () => {
+          options?.onDraftCreated?.(reusableStoredDraftThread.draftId);
           const isDraftAlreadyOpen =
             currentRouteTarget?.kind === "draft" &&
             currentRouteTarget.draftId === reusableStoredDraftThread.draftId;
@@ -210,11 +214,13 @@ export function useNewThreadHandler() {
       }
 
       if (
+        options?.forceNew !== true &&
         latestActiveDraftThread &&
         currentRouteTarget?.kind === "draft" &&
         latestActiveDraftThread.logicalProjectKey === logicalProjectKey &&
         latestActiveDraftThread.promotedTo == null
       ) {
+        options?.onDraftCreated?.(currentRouteTarget.draftId);
         if (
           hasBranchOption ||
           hasWorktreePathOption ||
@@ -271,6 +277,8 @@ export function useNewThreadHandler() {
           setModelSelection(draftId, carryModelSelection, { replaceOptions: true });
         }
 
+        options?.onDraftCreated?.(draftId);
+
         await router.navigate({
           to: "/draft/$draftId",
           params: { draftId },
@@ -311,12 +319,13 @@ export function useHandleNewThread() {
     });
   }, [projectOrder, projects]);
   const handleNewThread = useNewThreadHandler();
+  const defaultProject = selectDefaultNewThreadProject(orderedProjects);
 
   return {
     activeDraftThread,
     activeThread,
-    defaultProjectRef: orderedProjects[0]
-      ? scopeProjectRef(orderedProjects[0].environmentId, orderedProjects[0].id)
+    defaultProjectRef: defaultProject
+      ? scopeProjectRef(defaultProject.environmentId, defaultProject.id)
       : null,
     handleNewThread,
     routeThreadRef,

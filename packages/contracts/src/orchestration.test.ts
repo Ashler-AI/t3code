@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
+  ChatAttachment,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   ModelSelection,
@@ -27,6 +28,7 @@ import {
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 const decodeTurnDiffInput = Schema.decodeUnknownEffect(OrchestrationGetTurnDiffInput);
+const decodeChatAttachment = Schema.decodeUnknownEffect(ChatAttachment);
 const decodeFullThreadDiffInput = Schema.decodeUnknownEffect(OrchestrationGetFullThreadDiffInput);
 const decodeThreadTurnDiff = Schema.decodeUnknownEffect(ThreadTurnDiff);
 const decodeProjectCreateCommand = Schema.decodeUnknownEffect(ProjectCreateCommand);
@@ -63,6 +65,35 @@ it.effect("parses turn diff input when fromTurnCount <= toTurnCount", () =>
     });
     assert.strictEqual(parsed.fromTurnCount, 1);
     assert.strictEqual(parsed.toTurnCount, 2);
+  }),
+);
+
+it.effect("decodes safe generic file attachment metadata", () =>
+  Effect.gen(function* () {
+    const attachment = yield* decodeChatAttachment({
+      type: "file",
+      id: "thread-1-attachment",
+      name: "diagnostics.zip",
+      mimeType: "application/zip",
+      sizeBytes: 1024,
+    });
+    assert.strictEqual(attachment.type, "file");
+    assert.strictEqual(attachment.name, "diagnostics.zip");
+  }),
+);
+
+it.effect("rejects attachment names that could become paths", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.exit(
+      decodeChatAttachment({
+        type: "file",
+        id: "thread-1-attachment",
+        name: "../secret.txt",
+        mimeType: "text/plain",
+        sizeBytes: 12,
+      }),
+    );
+    assert.strictEqual(result._tag, "Failure");
   }),
 );
 

@@ -209,6 +209,15 @@ describe("expandCollapsedComposerCursor", () => {
       expandedCursorAfterSkill,
     );
   });
+
+  it("maps collapsed typed @ references to their serialized prompt offsets", () => {
+    const text = "ask @[session|local|thread-2|%2Ftmp%2Fworktree] next";
+    const collapsedCursorAfterReference = "ask ".length + 2;
+
+    expect(expandCollapsedComposerCursor(text, collapsedCursorAfterReference)).toBe(
+      "ask @[session|local|thread-2|%2Ftmp%2Fworktree] ".length,
+    );
+  });
 });
 
 describe("collapseExpandedComposerCursor", () => {
@@ -243,6 +252,13 @@ describe("collapseExpandedComposerCursor", () => {
 
     expect(collapseExpandedComposerCursor(text, expandedCursorAfterMention)).toBe(
       collapsedCursorAfterMention,
+    );
+  });
+
+  it("maps serialized @ skill references back to one inline chip", () => {
+    const text = "use @[skill|omp|review] next";
+    expect(collapseExpandedComposerCursor(text, "use @[skill|omp|review] ".length)).toBe(
+      "use ".length + 2,
     );
   });
 

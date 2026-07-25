@@ -9,10 +9,12 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import { Atom } from "effect/unstable/reactivity";
 import { RpcClientError } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
 
@@ -22,11 +24,13 @@ import {
   type PreparedConnection,
 } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import type { EnvironmentRegistry } from "../connection/registry.ts";
 import * as Persistence from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
   applyServerConfigProjection,
+  createServerEnvironmentAtoms,
   makeEnvironmentServerConfigState,
   isLegacyUpdateHandoffLoss,
   projectServerWelcome,
@@ -171,6 +175,19 @@ describe("server state projection", () => {
     expect(serverUpdateStateForServerVersion(failed, "0.0.30")).toBe(failed);
     expect(serverUpdateStateForServerVersion(failed, null)).toBe(failed);
     expect(serverUpdateStateForServerVersion(failed, "0.0.31")).toEqual({ status: "idle" });
+  });
+
+  it("exposes Scaffold pause without duplicating HTTP connection preparation", () => {
+    const runtime = Atom.runtime(Layer.empty) as unknown as Atom.AtomRuntime<
+      EnvironmentRegistry | Persistence.EnvironmentCacheStore,
+      never
+    >;
+    const atoms = createServerEnvironmentAtoms(runtime, {
+      initialConfigValueAtom: () => Atom.make<ServerConfig | null>(null),
+    });
+
+    expect(atoms).toHaveProperty("pauseScaffold");
+    expect(atoms).not.toHaveProperty("prepareScaffoldConnection");
   });
 
   it("applies every config category to the projected snapshot", () => {

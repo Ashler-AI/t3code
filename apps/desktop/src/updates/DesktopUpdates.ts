@@ -296,7 +296,12 @@ export const make = Effect.gen(function* () {
   );
 
   const hasUpdateFeedConfig = Ref.get(appUpdateYmlConfigRef).pipe(
-    Effect.map((appUpdateYmlConfig) => Option.isSome(appUpdateYmlConfig) || config.mockUpdates),
+    Effect.map(
+      (appUpdateYmlConfig) =>
+        Option.isSome(appUpdateYmlConfig) ||
+        Option.isSome(config.productUpdateFeedUrl) ||
+        config.mockUpdates,
+    ),
   );
 
   const resolveDisabledReason = Effect.gen(function* () {
@@ -716,7 +721,12 @@ export const make = Effect.gen(function* () {
       const appUpdateYmlConfig = yield* readAppUpdateYml;
       yield* Ref.set(appUpdateYmlConfigRef, appUpdateYmlConfig);
 
-      if (config.mockUpdates) {
+      if (Option.isSome(config.productUpdateFeedUrl)) {
+        yield* electronUpdater.setFeedURL({
+          provider: "generic",
+          url: config.productUpdateFeedUrl.value.href,
+        } as ElectronUpdater.ElectronUpdaterFeedUrl);
+      } else if (config.mockUpdates) {
         yield* electronUpdater.setFeedURL({
           provider: "generic",
           url: `http://localhost:${config.mockUpdateServerPort}`,

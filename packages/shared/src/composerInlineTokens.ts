@@ -9,6 +9,8 @@ export type ComposerInlineToken =
   | {
       readonly type: "skill";
       readonly value: string;
+      readonly provider?: string;
+      readonly syntax?: "at";
       readonly source: string;
       readonly start: number;
       readonly end: number;
@@ -19,6 +21,7 @@ export interface CollectComposerInlineTokensOptions {
 }
 
 const SKILL_TOKEN_REGEX = /(^|\s)\$([a-zA-Z][a-zA-Z0-9:_-]*)(?=\s)/g;
+const TYPED_SKILL_TOKEN_REGEX = /(^|\s)@\[skill\|([^\]|]*)\|([^\]|]*)\](?=\s)/g;
 const MENTION_TOKEN_REGEX = /(^|\s)@(?:"((?:\\.|[^"\\])*)"|([^\s@"]+))(?=\s)/g;
 const FILE_LINK_TOKEN_REGEX = /(^|\s)\[((?:\\.|[^\]\\])*)\]\(([^)\s]+)\)(?=\s)/g;
 const URI_SCHEME_REGEX = /^[A-Za-z][A-Za-z0-9+.-]*:/;
@@ -63,7 +66,11 @@ function collectMentionTokens(text: string): ComposerInlineToken[] {
     const prefix = match[1] ?? "";
     const quotedPath = match[2];
     const path = quotedPath !== undefined ? quotedPath.replace(/\\(.)/g, "$1") : (match[3] ?? "");
-    if (!path || (quotedPath === undefined && SCOPED_PACKAGE_REFERENCE_REGEX.test(path))) {
+    if (
+      !path ||
+      (quotedPath === undefined &&
+        (SCOPED_PACKAGE_REFERENCE_REGEX.test(path) || /^\[(?:skill|session)\|/.test(path)))
+    ) {
       continue;
     }
     const start = (match.index ?? 0) + prefix.length;
@@ -85,6 +92,26 @@ export function collectComposerInlineTokens(
   options: CollectComposerInlineTokensOptions = {},
 ): ReadonlyArray<ComposerInlineToken> {
   const matches = collectMentionTokens(text);
+
+  for (const match of text.matchAll(TYPED_SKILL_TOKEN_REGEX)) {
+    const fullMatch = match[0];
+    const prefix = match[1] ?? "";
+    const provider = decodeReferencePart(match[2] ?? "");
+    const skillName = decodeReferencePart(match[3] ?? "");
+    const start = (match.index ?? 0) + prefix.length;
+    const end = start + fullMatch.length - prefix.length;
+    if (provider && skillName) {
+      matches.push({
+        type: "skill",
+        value: skillName,
+        provider,
+        syntax: "at",
+        source: text.slice(start, end),
+        start,
+        end,
+      });
+    }
+  }
 
   for (const match of text.matchAll(SKILL_TOKEN_REGEX)) {
     const fullMatch = match[0];
@@ -118,4 +145,12 @@ export function collectComposerInlineTokens(
   }
 
   return [...matches].sort((left, right) => left.start - right.start);
+}
+
+function decodeReferencePart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }

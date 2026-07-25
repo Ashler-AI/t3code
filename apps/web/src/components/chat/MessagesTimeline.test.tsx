@@ -3,6 +3,7 @@ import { createRef, type ReactNode, type Ref } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import type { LegendListRef } from "@legendapp/list/react";
+import { appendTranscriptAnnotationsToPrompt } from "../../transcriptAnnotation";
 
 vi.mock("@legendapp/list/react", async () => {
   const legendListTestId = "legend-list";
@@ -223,6 +224,29 @@ function buildUserTimelineEntry(text: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("renders sent transcript context as an annotation card instead of protocol markup", () => {
+    const messageText = appendTranscriptAnnotationsToPrompt("Please revise this.", [
+      {
+        id: "selection-1",
+        messageId: "assistant-message-1",
+        role: "assistant",
+        selectedText: "The selected answer text",
+        comment: "Keep this constraint.",
+      },
+    ]);
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[buildUserTimelineEntry(messageText)]}
+      />,
+    );
+
+    expect(markup).toContain("Annotated agent response");
+    expect(markup).toContain("The selected answer text");
+    expect(markup).toContain("Keep this constraint.");
+    expect(markup).not.toContain("&lt;transcript_annotation");
+  });
+
   it("uses the larger leading inset only when the top fade is enabled", () => {
     const timelineEntries = [buildUserTimelineEntry("Hello")];
 

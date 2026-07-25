@@ -608,6 +608,62 @@ export function createServerEnvironmentAtoms<R, E>(
     updateStateAtom,
     settingsValueAtom,
     providersValueAtom,
+    ompAccountsSnapshot: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:omp-accounts:snapshot",
+      tag: WS_METHODS.ompAccountsGetSnapshot,
+      staleTimeMs: 60_000,
+      idleTtlMs: 10 * 60_000,
+    }),
+    ompAccountAssignment: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:omp-accounts:assignment",
+      tag: WS_METHODS.ompAccountsGetAssignment,
+      staleTimeMs: 15_000,
+      idleTtlMs: 10 * 60_000,
+    }),
+    refreshOmpAccounts: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:omp-accounts:refresh",
+      tag: WS_METHODS.ompAccountsRefresh,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
+    beginOmpAccountLogin: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:omp-accounts:begin-login",
+      tag: WS_METHODS.ompAccountsBeginLogin,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId, input }) => `${environmentId}:${input.provider}`,
+      },
+    }),
+    respondOmpAccountLogin: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:omp-accounts:respond-login",
+      tag: WS_METHODS.ompAccountsRespondLogin,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.flowId}`,
+      },
+    }),
+    cancelOmpAccountLogin: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:omp-accounts:cancel-login",
+      tag: WS_METHODS.ompAccountsCancelLogin,
+    }),
+    removeOmpAccount: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:omp-accounts:remove",
+      tag: WS_METHODS.ompAccountsRemove,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
+    pauseScaffold: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:scaffold:pause",
+      tag: WS_METHODS.scaffoldPause,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.sessionId}`,
+      },
+    }),
     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:trace-diagnostics",
       tag: WS_METHODS.serverGetTraceDiagnostics,

@@ -33,7 +33,10 @@ import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
-import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import {
+  PendingTurnStartRecoveryQuery,
+  ProjectionSnapshotQuery,
+} from "../Services/ProjectionSnapshotQuery.ts";
 import {
   ProviderCommandReactor,
   type ProviderCommandReactorShape,
@@ -248,6 +251,7 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const pendingTurnStartRecoveryQuery = yield* PendingTurnStartRecoveryQuery;
   const providerService = yield* ProviderService;
   const providerRegistry = yield* ProviderRegistry;
   const gitWorkflow = yield* GitWorkflowService;
@@ -1350,6 +1354,17 @@ const make = Effect.gen(function* () {
         );
       }),
     );
+
+    const pendingTurnStartEvents = yield* pendingTurnStartRecoveryQuery
+      .listPendingTurnStartEvents()
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("provider command reactor could not restore pending turns", {
+            error,
+          }).pipe(Effect.as([] as ReadonlyArray<ProviderIntentEvent>)),
+        ),
+      );
+    yield* Effect.forEach(pendingTurnStartEvents, worker.enqueue, { concurrency: 1 });
   });
 
   return {
