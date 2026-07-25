@@ -4,6 +4,8 @@ import {
   classifyHostedHttpsCompatibility,
   createAdvertisedEndpoint,
   deriveWsBaseUrl,
+  environmentEndpointUrl,
+  environmentWebSocketUrl,
   normalizeHttpBaseUrl,
 } from "./endpoint.ts";
 
@@ -20,6 +22,29 @@ describe("advertised endpoint helpers", () => {
     expect(normalizeHttpBaseUrl("wss://example.com/socket")).toBe("https://example.com/");
     expect(deriveWsBaseUrl("https://example.com/api")).toBe("wss://example.com/");
     expect(deriveWsBaseUrl("http://127.0.0.1:3773")).toBe("ws://127.0.0.1:3773/");
+  });
+
+  it("appends HTTP endpoint paths beneath a non-root environment mount", () => {
+    expect(
+      environmentEndpointUrl(
+        "https://platform.example.test/sessions/session-123/agent/",
+        "/.well-known/t3/environment",
+      ),
+    ).toBe("https://platform.example.test/sessions/session-123/agent/.well-known/t3/environment");
+  });
+
+  it("adds the default websocket route only to an origin-level base URL", () => {
+    expect(environmentWebSocketUrl("wss://remote.example.test/").toString()).toBe(
+      "wss://remote.example.test/ws",
+    );
+  });
+
+  it.each([
+    "wss://agent.example.com/ws/",
+    "wss://remote.example.test/custom-socket",
+    "wss://platform.example.test/sessions/session-123/agent/ws",
+  ])("preserves an explicit websocket route URL: %s", (wsBaseUrl) => {
+    expect(environmentWebSocketUrl(wsBaseUrl).toString()).toBe(wsBaseUrl);
   });
 
   it("marks HTTP endpoints as blocked from hosted HTTPS apps", () => {

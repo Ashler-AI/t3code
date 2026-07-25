@@ -8,6 +8,7 @@ import {
   createAssetEnvironmentAtoms,
   InvalidAssetCollectionKeyError,
   parseAssetCollectionKey,
+  resolveAssetUrl,
 } from "./assets.ts";
 
 describe("asset collection keys", () => {
@@ -29,6 +30,28 @@ describe("asset collection keys", () => {
     const key = JSON.stringify(["environment-1", [{ _tag: "unknown" }]]);
 
     expect(() => parseAssetCollectionKey(key)).toThrowError(InvalidAssetCollectionKeyError);
+  });
+});
+
+describe("resolveAssetUrl", () => {
+  it("keeps root-relative asset routes beneath the environment mount", () => {
+    expect(
+      resolveAssetUrl(
+        "https://platform.example.test/sessions/session-123/agent/",
+        "/api/assets/signed-token/favicon.png?download=1",
+      ),
+    ).toBe(
+      "https://platform.example.test/sessions/session-123/agent/api/assets/signed-token/favicon.png?download=1",
+    );
+  });
+
+  it("preserves absolute asset URLs", () => {
+    expect(
+      resolveAssetUrl(
+        "https://platform.example.test/sessions/session-123/agent/",
+        "https://assets.example.test/signed/favicon.png",
+      ),
+    ).toBe("https://assets.example.test/signed/favicon.png");
   });
 });
 
