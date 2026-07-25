@@ -114,6 +114,10 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  trustedPublicBaseUrl: Config.url("T3CODE_TRUSTED_PUBLIC_BASE_URL").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   autoBootstrapProjectFromCwd: Config.boolean("T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -150,6 +154,22 @@ export interface CliServerFlags {
 export interface CliAuthLocationFlags {
   readonly baseDir: Option.Option<string>;
   readonly devUrl?: Option.Option<URL>;
+}
+
+export function validateTrustedPublicBaseUrl(value: URL | undefined): URL | undefined {
+  if (
+    value !== undefined &&
+    (value.protocol !== "https:" ||
+      value.username !== "" ||
+      value.password !== "" ||
+      value.search !== "" ||
+      value.hash !== "")
+  ) {
+    throw new Error(
+      "T3CODE_TRUSTED_PUBLIC_BASE_URL must be an HTTPS URL without userinfo, query, or fragment.",
+    );
+  }
+  return value;
 }
 
 export const sharedServerLocationFlags = {
@@ -211,6 +231,7 @@ export const resolveServerConfig = (
     const path = yield* Path.Path;
     const fs = yield* FileSystem.FileSystem;
     const env = yield* EnvServerConfig;
+    const trustedPublicBaseUrl = validateTrustedPublicBaseUrl(env.trustedPublicBaseUrl);
     const normalizedFlags = {
       mode: flags.mode ?? Option.none(),
       port: flags.port ?? Option.none(),
@@ -366,6 +387,7 @@ export const resolveServerConfig = (
       noBrowser,
       startupPresentation,
       desktopBootstrapToken,
+      ...(trustedPublicBaseUrl ? { trustedPublicBaseUrl } : {}),
       autoBootstrapProjectFromCwd,
       logWebSocketEvents,
       tailscaleServeEnabled,

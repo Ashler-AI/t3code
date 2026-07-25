@@ -2,7 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as PlatformError from "effect/PlatformError";
 
 import { SecretStorePersistError } from "./ServerSecretStore.ts";
-import { mapDpopReplayStoreError } from "./dpop.ts";
+import { mapDpopReplayStoreError, mapDpopRequestUrl } from "./dpop.ts";
 
 const storeFailure = (tag: "AlreadyExists" | "PermissionDenied") =>
   new SecretStorePersistError({
@@ -33,5 +33,18 @@ describe("mapDpopReplayStoreError", () => {
     if (error._tag === "ServerAuthDpopReplayStateRecordError") {
       expect(error.message).toBe("Failed to record DPoP proof replay state.");
     }
+  });
+});
+
+describe("mapDpopRequestUrl", () => {
+  it("appends the actual endpoint path and query to the trusted directory base", () => {
+    expect(
+      mapDpopRequestUrl(
+        new URL("https://scaffold.example.test/_scaffold/sandbox/attach/agent/session-1/"),
+        new URL("https://internal.e2b.test/api/auth/session?refresh=1"),
+      ),
+    ).toBe(
+      "https://scaffold.example.test/_scaffold/sandbox/attach/agent/session-1/api/auth/session?refresh=1",
+    );
   });
 });

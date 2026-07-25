@@ -75,6 +75,7 @@ export class ServerConfig extends Context.Service<
     readonly noBrowser: boolean;
     readonly startupPresentation: StartupPresentation;
     readonly desktopBootstrapToken: string | undefined;
+    readonly trustedPublicBaseUrl?: URL;
     readonly autoBootstrapProjectFromCwd: boolean;
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;

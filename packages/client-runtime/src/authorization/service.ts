@@ -21,6 +21,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as HttpClient from "effect/unstable/http/HttpClient";
+import { withScaffoldAttachGrant } from "../rpc/http.ts";
 
 import type { PreparedHttpAuthorization } from "../connection/model.ts";
 
@@ -28,6 +29,7 @@ export interface RelayEnvironmentAuthorization {
   readonly environmentId: EnvironmentId;
   readonly endpoint: RelayManagedEndpoint;
   readonly credential: string;
+  readonly attachCredential?: string;
 }
 
 export interface AuthorizedRemoteEnvironment {
@@ -36,6 +38,7 @@ export interface AuthorizedRemoteEnvironment {
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization;
+  readonly scaffoldAttachCredential?: string;
 }
 
 export class RemoteEnvironmentAuthorization extends Context.Service<
@@ -141,7 +144,10 @@ export const make = Effect.gen(function* () {
   );
 
   const createDpopSocketUrl = Effect.fn("clientRuntime.connection.remote.createDpopSocketUrl")(
-    function* (token: TokenStore.RemoteDpopAccessToken) {
+    function* (
+      token: TokenStore.RemoteDpopAccessToken,
+      requestHttpClient: HttpClient.HttpClient = httpClient,
+    ) {
       const ticketProof = yield* signer
         .createProof({
           method: "POST",
@@ -162,7 +168,7 @@ export const make = Effect.gen(function* () {
         httpBaseUrl: token.endpoint.httpBaseUrl,
         accessToken: token.accessToken,
         dpopProof: ticketProof,
-      }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
+      }).pipe(Effect.provideService(HttpClient.HttpClient, requestHttpClient));
     },
   );
 
@@ -237,8 +243,11 @@ export const make = Effect.gen(function* () {
         "connection.remote_token_cache": "miss",
       });
       const bootstrap = yield* input.obtainBootstrap;
+      const requestHttpClient = bootstrap.attachCredential
+        ? withScaffoldAttachGrant(httpClient, bootstrap.attachCredential)
+        : httpClient;
       const descriptor = yield* fetchDescriptor(bootstrap.endpoint.httpBaseUrl).pipe(
-        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.provideService(HttpClient.HttpClient, requestHttpClient),
         Effect.withSpan("environment.authorization.descriptor"),
       );
       if (descriptor.environmentId !== input.expectedEnvironmentId) {
@@ -269,7 +278,7 @@ export const make = Effect.gen(function* () {
         clientMetadata: presentation.metadata,
       }).pipe(
         Effect.mapError(mapRemoteEnvironmentError),
-        Effect.provideService(HttpClient.HttpClient, httpClient),
+        Effect.provideService(HttpClient.HttpClient, requestHttpClient),
         Effect.withSpan("environment.authorization.accessToken.exchange"),
       );
       const issuedAt = yield* Clock.currentTimeMillis;
@@ -281,7 +290,9 @@ export const make = Effect.gen(function* () {
         expiresAtEpochMs: issuedAt + access.expires_in * 1_000,
         dpopThumbprint: thumbprint,
       });
-      const socketUrl = yield* createDpopSocketUrl(token).pipe(Effect.mapError(mapDpopSocketError));
+      const socketUrl = yield* createDpopSocketUrl(token, requestHttpClient).pipe(
+        Effect.mapError(mapDpopSocketError),
+      );
       if (persistAccessToken) {
         yield* tokenStore
           .put(token)
@@ -296,6 +307,9 @@ export const make = Effect.gen(function* () {
           _tag: "Dpop" as const,
           accessToken: token.accessToken,
         },
+        ...(bootstrap.attachCredential
+          ? { scaffoldAttachCredential: bootstrap.attachCredential }
+          : {}),
       };
     },
   );

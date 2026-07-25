@@ -16,7 +16,7 @@ import {
 import * as NetService from "@t3tools/shared/Net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { deriveServerPaths } from "../config.ts";
-import { resolveServerConfig } from "./config.ts";
+import { resolveServerConfig, validateTrustedPublicBaseUrl } from "./config.ts";
 
 const deriveExplicitServerPaths = (baseDir: string, devUrl: URL | undefined) =>
   deriveServerPaths(baseDir, devUrl, { baseDirIsExplicit: true });
@@ -35,6 +35,24 @@ const makeDesktopBootstrap = (
   tailscaleServeEnabled: false,
   tailscaleServePort: 443,
   ...overrides,
+});
+
+it("validates the optional trusted external DPoP base URL", () => {
+  expect(
+    validateTrustedPublicBaseUrl(
+      new URL("https://scaffold.example.test/_scaffold/sandbox/attach/agent/session-1/"),
+    )?.href,
+  ).toBe("https://scaffold.example.test/_scaffold/sandbox/attach/agent/session-1/");
+  for (const value of [
+    "http://scaffold.example.test/attach/",
+    "https://user@scaffold.example.test/attach/",
+    "https://scaffold.example.test/attach/?token=secret",
+    "https://scaffold.example.test/attach/#fragment",
+  ]) {
+    expect(() => validateTrustedPublicBaseUrl(new URL(value))).toThrow(
+      "T3CODE_TRUSTED_PUBLIC_BASE_URL",
+    );
+  }
 });
 
 it.layer(NodeServices.layer)("cli config resolution", (it) => {

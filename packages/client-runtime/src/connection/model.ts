@@ -151,6 +151,8 @@ export interface PreparedConnection {
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization | null;
+  /** Ephemeral Scaffold proxy authority. Never persist on a connection target. */
+  readonly scaffoldAttachCredential?: string;
   readonly target: ConnectionTarget;
 }
 

@@ -12,6 +12,7 @@ import { ManagedRelayDpopSigner } from "../relay/managedRelay.ts";
 import {
   executeEnvironmentHttpRequest,
   makeEnvironmentHttpApiClient,
+  withScaffoldAttachGrant,
   type RemoteEnvironmentRequestError,
 } from "../rpc/http.ts";
 import { buildEnvironmentAuthHeaders, withEnvironmentCredentials } from "./environmentHttpAuth.ts";
@@ -34,11 +35,17 @@ export const fetchEnvironmentThreadSnapshot = Effect.fn(
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly timeoutMs?: number;
 }) {
+  const httpClient = yield* HttpClient.HttpClient;
+  const requestHttpClient = input.prepared.scaffoldAttachCredential
+    ? withScaffoldAttachGrant(httpClient, input.prepared.scaffoldAttachCredential)
+    : httpClient;
   const requestUrl = environmentEndpointUrl(
     input.prepared.httpBaseUrl,
     `/api/orchestration/threads/${input.threadId}`,
   );
-  const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
+  const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl).pipe(
+    Effect.provideService(HttpClient.HttpClient, requestHttpClient),
+  );
   const headers = yield* buildEnvironmentAuthHeaders(
     input.prepared.httpAuthorization,
     "GET",
@@ -55,7 +62,7 @@ export const fetchEnvironmentThreadSnapshot = Effect.fn(
         headers,
       }),
     ),
-  );
+  ).pipe(Effect.provideService(HttpClient.HttpClient, requestHttpClient));
 });
 
 export type FetchEnvironmentThreadSnapshotError = RemoteEnvironmentRequestError;

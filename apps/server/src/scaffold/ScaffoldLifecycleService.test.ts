@@ -46,6 +46,7 @@ function fakeClient(
       httpBaseUrl: "https://sandbox.example.com/",
       wsBaseUrl: "wss://sandbox.example.com/",
       bootstrapCredential: "one-time-secret",
+      attachCredential: "attach-secret",
       expiresAt: "2026-07-24T21:00:00.000Z",
     }),
     ...overrides,
@@ -63,6 +64,7 @@ describe("ScaffoldLifecycleService", () => {
         httpBaseUrl: "https://sandbox-generation-1.example.com/",
         wsBaseUrl: "wss://sandbox-generation-1.example.com/",
         bootstrapCredential: "bootstrap-generation-1",
+        attachCredential: "attach-generation-1",
         expiresAt: "2026-07-24T21:00:00.000Z",
       })
       .mockResolvedValueOnce({
@@ -72,6 +74,7 @@ describe("ScaffoldLifecycleService", () => {
         httpBaseUrl: "https://sandbox-generation-2.example.com/",
         wsBaseUrl: "wss://sandbox-generation-2.example.com/",
         bootstrapCredential: "bootstrap-generation-2",
+        attachCredential: "attach-generation-2",
         expiresAt: "2026-07-24T22:00:00.000Z",
       });
     const client = fakeClient({
@@ -203,6 +206,7 @@ describe("ScaffoldLifecycleService", () => {
             httpBaseUrl: "https://sandbox.example.com/",
             wsBaseUrl: "wss://sandbox.example.com/",
             bootstrapCredential: "one-time-secret",
+            attachCredential: "attach-secret",
             expiresAt: "2026-07-24T21:00:00.000Z",
           }),
         }),

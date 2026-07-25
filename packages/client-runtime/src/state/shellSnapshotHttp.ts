@@ -9,7 +9,11 @@ import { HttpClient } from "effect/unstable/http";
 import type { PreparedConnection } from "../connection/model.ts";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
 import { ManagedRelayDpopSigner } from "../relay/managedRelay.ts";
-import { executeEnvironmentHttpRequest, makeEnvironmentHttpApiClient } from "../rpc/http.ts";
+import {
+  executeEnvironmentHttpRequest,
+  makeEnvironmentHttpApiClient,
+  withScaffoldAttachGrant,
+} from "../rpc/http.ts";
 import { buildEnvironmentAuthHeaders, withEnvironmentCredentials } from "./environmentHttpAuth.ts";
 
 // Bounded so a pathologically slow endpoint cannot block the (cheaper) socket
@@ -29,8 +33,14 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
   readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly timeoutMs?: number;
 }) {
+  const httpClient = yield* HttpClient.HttpClient;
+  const requestHttpClient = input.prepared.scaffoldAttachCredential
+    ? withScaffoldAttachGrant(httpClient, input.prepared.scaffoldAttachCredential)
+    : httpClient;
   const requestUrl = environmentEndpointUrl(input.prepared.httpBaseUrl, "/api/orchestration/shell");
-  const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
+  const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl).pipe(
+    Effect.provideService(HttpClient.HttpClient, requestHttpClient),
+  );
   const headers = yield* buildEnvironmentAuthHeaders(
     input.prepared.httpAuthorization,
     "GET",
@@ -44,7 +54,7 @@ export const fetchEnvironmentShellSnapshot = Effect.fn(
       input.prepared.httpAuthorization,
       client.orchestration.shellSnapshot({ headers }),
     ),
-  );
+  ).pipe(Effect.provideService(HttpClient.HttpClient, requestHttpClient));
 });
 
 /**

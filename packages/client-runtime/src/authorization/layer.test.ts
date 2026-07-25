@@ -184,6 +184,15 @@ describe("RemoteEnvironmentAuthorization", () => {
       expect(String(harness.fetch.calls[0]?.[0])).toBe(
         "https://environment.example.test/api/auth/websocket-ticket",
       );
+      const cachedTicketCall = harness.fetch.calls[0];
+      expect(cachedTicketCall?.[1].credentials).toBeUndefined();
+      expect(
+        cachedTicketCall
+          ? new Request(cachedTicketCall[0], cachedTicketCall[1]).headers.get(
+              "x-scaffold-attach-grant",
+            )
+          : undefined,
+      ).toBeNull();
     }),
   );
 
@@ -250,7 +259,9 @@ describe("RemoteEnvironmentAuthorization", () => {
         return yield* remote.authorizeDpop({
           expectedEnvironmentId: ENVIRONMENT_ID,
           persistAccessToken: false,
-          obtainBootstrap: harness.obtainBootstrap,
+          obtainBootstrap: harness.obtainBootstrap.pipe(
+            Effect.map((bootstrap) => ({ ...bootstrap, attachCredential: "attach-secret" })),
+          ),
         });
       }).pipe(Effect.provide(harness.layer));
 
@@ -259,6 +270,17 @@ describe("RemoteEnvironmentAuthorization", () => {
         accessToken: "ephemeral-access-token",
       });
       expect(yield* Ref.get(harness.bootstrapCalls)).toBe(1);
+      expect(authorized.scaffoldAttachCredential).toBe("attach-secret");
+      expect(
+        harness.fetch.calls.map(([request, init]) =>
+          new Request(request, init).headers.get("x-scaffold-attach-grant"),
+        ),
+      ).toEqual(["attach-secret", "attach-secret", "attach-secret"]);
+      expect(harness.fetch.calls.map(([, init]) => init.credentials)).toEqual([
+        "include",
+        "include",
+        "include",
+      ]);
       expect((yield* Ref.get(harness.tokens)).get(ENVIRONMENT_ID)?.accessToken).toBe(
         "must-not-be-reused",
       );

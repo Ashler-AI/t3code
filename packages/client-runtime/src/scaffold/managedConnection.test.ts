@@ -32,6 +32,7 @@ describe("prepareManagedScaffoldConnection", () => {
   it.effect("exchanges bootstrap authority in memory and returns only the safe binding", () =>
     Effect.gen(function* () {
       let receivedCredential: string | undefined;
+      let receivedAttachCredential: string | undefined;
       let persistAccessToken: boolean | undefined;
       const remote = RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
         authorizeBearer: () => Effect.die("not used"),
@@ -39,6 +40,7 @@ describe("prepareManagedScaffoldConnection", () => {
           input.obtainBootstrap.pipe(
             Effect.map((bootstrap) => {
               receivedCredential = bootstrap.credential;
+              receivedAttachCredential = bootstrap.attachCredential;
               persistAccessToken = input.persistAccessToken;
               return {
                 environmentId: ENVIRONMENT_ID,
@@ -49,6 +51,9 @@ describe("prepareManagedScaffoldConnection", () => {
                   _tag: "Dpop" as const,
                   accessToken: "ephemeral-access",
                 },
+                ...(bootstrap.attachCredential
+                  ? { scaffoldAttachCredential: bootstrap.attachCredential }
+                  : {}),
               };
             }),
           ),
@@ -65,6 +70,7 @@ describe("prepareManagedScaffoldConnection", () => {
             httpBaseUrl: "https://sandbox.example.com/",
             wsBaseUrl: "wss://sandbox.example.com/",
             bootstrapCredential: "one-time-secret",
+            attachCredential: "attach-secret",
             expiresAt: "2026-07-24T21:00:00.000Z",
           }),
         ),
@@ -75,6 +81,7 @@ describe("prepareManagedScaffoldConnection", () => {
       );
 
       expect(receivedCredential).toBe("one-time-secret");
+      expect(receivedAttachCredential).toBe("attach-secret");
       expect(persistAccessToken).toBe(false);
       expect(result.binding).toMatchObject({
         environmentId: ENVIRONMENT_ID,
@@ -87,6 +94,7 @@ describe("prepareManagedScaffoldConnection", () => {
       });
       expect("bootstrapCredential" in result.binding).toBe(false);
       expect(result.connection.socketUrl).toContain("wsTicket=ephemeral");
+      expect(result.connection.scaffoldAttachCredential).toBe("attach-secret");
     }),
   );
 
