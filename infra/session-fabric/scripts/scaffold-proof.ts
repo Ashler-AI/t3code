@@ -6,6 +6,7 @@ import {
   SESSION_FABRIC_PROTOCOL_VERSION,
   SessionFabricClientFrame,
   SessionFabricClientId,
+  SessionFabricSearchResponse,
   SessionFabricServerFrame,
   SessionFabricSessionId,
   SessionFabricSnapshot,
@@ -17,25 +18,32 @@ import {
   buildScaffoldSessionProofCommand,
   fetchScaffoldProofSnapshotResponse,
   isTerminalScaffoldProofCommandReceipt,
+  scaffoldSessionSemanticSearchResult,
   scaffoldSessionProofMetadata,
 } from "../src/scaffoldProof.ts";
 
 const encodeClientFrame = Schema.encodeSync(Schema.fromJsonString(SessionFabricClientFrame));
 const decodeServerFrame = Schema.decodeUnknownSync(Schema.fromJsonString(SessionFabricServerFrame));
 const decodeSnapshot = Schema.decodeUnknownSync(SessionFabricSnapshot);
+const decodeSearchResponse = Schema.decodeUnknownSync(SessionFabricSearchResponse);
 
 const { values } = NodeUtil.parseArgs({
   options: {
     "relay-url": { type: "string" },
     "session-id": { type: "string" },
     message: { type: "string" },
+    "semantic-query": { type: "string" },
     timeout: { type: "string", default: "60000" },
   },
 });
 
-if (values["relay-url"] === undefined || values["session-id"] === undefined) {
+if (
+  values["relay-url"] === undefined ||
+  values["session-id"] === undefined ||
+  values["semantic-query"] === undefined
+) {
   throw new Error(
-    "Usage: pnpm smoke:scaffold --relay-url <url> --session-id <global-id> [--message <prompt>]",
+    "Usage: pnpm smoke:scaffold --relay-url <url> --session-id <global-id> --semantic-query <zero-overlap-query> [--message <prompt>]",
   );
 }
 
@@ -69,6 +77,24 @@ if (!snapshotResponse.ok) {
 }
 const snapshot = decodeSnapshot(await snapshotResponse.json());
 const metadata = scaffoldSessionProofMetadata(snapshot);
+const searchUrl = new URL(relayUrl);
+searchUrl.pathname = `${searchUrl.pathname.replace(/\/$/, "")}/v1/session-fabric/search`;
+searchUrl.search = "";
+searchUrl.hash = "";
+const searchResponse = await fetch(searchUrl, {
+  method: "POST",
+  headers: { "content-type": "application/json", "cache-control": "no-cache" },
+  body: JSON.stringify({ query: values["semantic-query"], limit: 50 }),
+  signal: AbortSignal.timeout(timeoutMs),
+});
+if (!searchResponse.ok) {
+  throw new Error(`Session semantic search failed with status ${searchResponse.status}.`);
+}
+const semanticResult = scaffoldSessionSemanticSearchResult({
+  snapshot,
+  query: values["semantic-query"],
+  response: decodeSearchResponse(await searchResponse.json()),
+});
 
 class ProofClient {
   readonly clientId;
@@ -199,6 +225,7 @@ try {
         scaffoldSessionId: metadata.scaffoldSessionId,
         scaffoldSessionUrl: metadata.scaffoldSessionUrl,
         clients: clients.length,
+        semanticSearchScore: semanticResult.score,
         resultSequence: receipt?.type === "command.receipt" ? receipt.receipt.resultSequence : null,
         observedSequences,
       },
