@@ -317,9 +317,9 @@ export const resolveServerConfig = (
     const desktopBootstrapToken = bootstrap?.desktopBootstrapToken;
     const autoBootstrapProjectFromCwd = Option.getOrElse(
       resolveOptionPrecedence(
+        normalizedFlags.autoBootstrapProjectFromCwd,
         Option.fromUndefinedOr(options?.forceAutoBootstrapProjectFromCwd),
         isHeadlessStartup ? Option.some(false) : Option.none(),
-        normalizedFlags.autoBootstrapProjectFromCwd,
         Option.fromUndefinedOr(env.autoBootstrapProjectFromCwd),
       ),
       () => mode === "web",
