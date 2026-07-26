@@ -40,6 +40,9 @@ describe("session fabric proof deployment", () => {
       expect(workflow).toContain("BASETEN_EMBEDDING_URL: ${{ vars.BASETEN_EMBEDDING_URL }}");
       expect(workflow).toContain("--stage proof --yes");
       expect(workflow).toContain("ashler-session-fabric-proof");
+      expect(workflow).toContain("smoke:deployment");
+      expect(workflow).toContain('--marker "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"');
+      expect(workflow).not.toContain("/health");
 
       for (const unrelatedCredential of [
         "PLANETSCALE",

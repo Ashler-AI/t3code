@@ -6,6 +6,7 @@
     "deploy": "alchemy deploy",
     "destroy": "alchemy destroy",
     "dev": "alchemy dev",
+    "smoke:deployment": "node scripts/deployment-smoke.ts",
     "smoke:scaffold": "node scripts/scaffold-proof.ts",
     "test": "vp test run",
     "typecheck": "tsgo --noEmit"

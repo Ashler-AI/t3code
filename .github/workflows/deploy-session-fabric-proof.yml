@@ -53,7 +53,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
       - id: endpoint
-        name: Resolve and verify public Relay endpoint
+        name: Resolve public Relay endpoint
         if: inputs.operation == 'deploy'
         shell: bash
         env:
@@ -71,10 +71,17 @@ jobs:
             process.stdout.write(response.result.subdomain);
           ' "$response")"
           relay_url="https://ashler-session-fabric-proof.${subdomain}.workers.dev"
-          curl --fail-with-body --silent --show-error "${relay_url}/health"
           echo "relay_url=${relay_url}" >> "$GITHUB_OUTPUT"
           echo "### Session fabric proof" >> "$GITHUB_STEP_SUMMARY"
           echo "Relay URL: ${relay_url}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify deployed session fabric behavior
+        if: inputs.operation == 'deploy'
+        run: >-
+          vp run --filter @t3tools/session-fabric-worker smoke:deployment --
+          --relay-url "${{ steps.endpoint.outputs.relay_url }}"
+          --marker "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          --timeout 30000
 
       - name: Destroy isolated proof stack
         if: inputs.operation == 'destroy'
