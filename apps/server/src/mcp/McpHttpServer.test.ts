@@ -213,11 +213,31 @@ it.effect("initializes OMP against the complete MCP tool registry", () =>
         ),
       });
       const body = yield* response.text;
+      const sessionId = response.headers["mcp-session-id"];
 
       expect(response.status).toBe(200);
-      expect(response.headers["mcp-session-id"]).not.toBeNull();
+      expect(typeof sessionId).toBe("string");
+      expect(sessionId?.trim().length).toBeGreaterThan(0);
       expect(body).not.toContain('"error"');
       expect(body).toContain('"protocolVersion":"2025-03-26"');
+
+      const toolsResponse = yield* httpClient.post("/mcp", {
+        headers: {
+          accept: "application/json, text/event-stream",
+          "mcp-session-id": sessionId!,
+        },
+        body: HttpBody.text(
+          `{"jsonrpc":"2.0","id":"153cd6a475dbf9d7","method":"tools/list","params":{}}`,
+          "application/json",
+        ),
+      });
+      const toolsBody = yield* toolsResponse.text;
+
+      expect(toolsResponse.status).toBe(200);
+      expect(toolsBody).not.toContain('"error"');
+      expect(toolsBody).toContain('"name":"preview_snapshot"');
+      expect(toolsBody).toContain('"name":"session_reference_resolve"');
+      expect(toolsBody).toContain('"name":"session_fabric_context"');
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
