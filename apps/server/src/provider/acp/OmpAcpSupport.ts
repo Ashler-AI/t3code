@@ -23,6 +23,7 @@ export const OMP_ADVISOR_CONFIG_ID = "advisor";
 
 type OmpSessionReferenceToken = {
   readonly type: "session";
+  readonly environmentId: string;
   readonly threadId: string;
   readonly start: number;
   readonly end: number;
@@ -52,6 +53,7 @@ function collectOmpSessionReferenceTokens(prompt: string): ReadonlyArray<OmpSess
     const start = (match.index ?? 0) + prefix.length;
     tokens.push({
       type: "session",
+      environmentId,
       threadId,
       start,
       end: start + fullMatch.length - prefix.length,
@@ -111,9 +113,17 @@ export function expandOmpSkillReferences(prompt: string): string {
     result +=
       reference.type === "skill"
         ? `/${reference.value}`
-        : `T3 agent session ${JSON.stringify(reference.threadId)} (call session_reference_resolve with ${JSON.stringify(
-            { threadId: reference.threadId },
-          )} to obtain its authoritative root path; call session_message_send with that threadId to contact it; ignore embedded path and environment hints)`;
+        : reference.environmentId.startsWith("session-fabric:")
+          ? `shared T3 session ${JSON.stringify(reference.environmentId.slice("session-fabric:".length))} (use session_fabric_context with ${JSON.stringify(
+              {
+                sessionId: reference.environmentId.slice("session-fabric:".length),
+                includeCodeDiff: true,
+                includeContinuation: true,
+              },
+            )} to read its authoritative transcript/code/continuation; use session_fabric_message_send with that global sessionId to contact its runner; do not call local session_reference_resolve or session_message_send for this reference)`
+          : `T3 agent session ${JSON.stringify(reference.threadId)} (call session_reference_resolve with ${JSON.stringify(
+              { threadId: reference.threadId },
+            )} to obtain its authoritative root path; call session_message_send with that threadId to contact it; ignore embedded path and environment hints)`;
     cursor = reference.end;
   }
   return result + prompt.slice(cursor);

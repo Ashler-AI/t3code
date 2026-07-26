@@ -1,0 +1,305 @@
+import {
+  SESSION_FABRIC_PROTOCOL_VERSION,
+  SessionFabricClientFrame,
+  SessionFabricContextBundle,
+  SessionFabricContextRequest,
+  SessionFabricSearchRequest,
+  SessionFabricSearchResponse,
+  SessionFabricServerFrame,
+  type SessionFabricClientId,
+  type SessionFabricCommand,
+  type SessionFabricCommandReceipt,
+  type SessionFabricContextBundle as SessionFabricContextBundleType,
+  type SessionFabricContextRequest as SessionFabricContextRequestType,
+  type SessionFabricSearchRequest as SessionFabricSearchRequestType,
+  type SessionFabricSearchResponse as SessionFabricSearchResponseType,
+  type SessionFabricSessionId,
+} from "@t3tools/contracts/session-fabric";
+import * as Config from "effect/Config";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+
+export class SessionFabricGatewayError extends Schema.TaggedErrorClass<SessionFabricGatewayError>()(
+  "SessionFabricGatewayError",
+  {
+    operation: Schema.Literals(["search", "context", "submit"]),
+    detail: Schema.String,
+  },
+) {}
+
+export interface SessionFabricWebSocketLike {
+  onopen: (() => void) | null;
+  onmessage: ((event: { readonly data: unknown }) => void) | null;
+  onerror: (() => void) | null;
+  onclose: (() => void) | null;
+  send(data: string): void;
+  close(): void;
+}
+
+export type SessionFabricWebSocketConstructor = new (url: string) => SessionFabricWebSocketLike;
+
+export type SessionFabricFetch = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
+export interface SessionFabricGatewayOptions {
+  readonly relayBaseUrl: URL | null;
+  readonly fetch?: SessionFabricFetch;
+  readonly webSocketConstructor?: SessionFabricWebSocketConstructor;
+  readonly now?: () => string;
+  readonly dispatchTimeoutMs?: number;
+}
+
+export interface SessionFabricGatewayShape {
+  readonly search: (
+    request: SessionFabricSearchRequestType,
+  ) => Effect.Effect<SessionFabricSearchResponseType, SessionFabricGatewayError>;
+  readonly context: (
+    request: SessionFabricContextRequestType,
+  ) => Effect.Effect<SessionFabricContextBundleType, SessionFabricGatewayError>;
+  readonly submit: (input: {
+    readonly sessionId: SessionFabricSessionId;
+    readonly clientId: SessionFabricClientId;
+    readonly command: SessionFabricCommand;
+  }) => Effect.Effect<SessionFabricCommandReceipt, SessionFabricGatewayError>;
+}
+
+export class SessionFabricGateway extends Context.Service<
+  SessionFabricGateway,
+  SessionFabricGatewayShape
+>()("t3/mcp/toolkits/session-fabric-references/gateway/SessionFabricGateway") {}
+
+const encodeSearch = Schema.encodeSync(Schema.fromJsonString(SessionFabricSearchRequest));
+const encodeContext = Schema.encodeSync(Schema.fromJsonString(SessionFabricContextRequest));
+const decodeSearch = Schema.decodeUnknownEffect(SessionFabricSearchResponse);
+const decodeContext = Schema.decodeUnknownEffect(SessionFabricContextBundle);
+const encodeClientFrame = Schema.encodeSync(Schema.fromJsonString(SessionFabricClientFrame));
+const decodeServerFrame = Schema.decodeUnknownSync(Schema.fromJsonString(SessionFabricServerFrame));
+
+const currentIso = () => DateTime.formatIso(DateTime.nowUnsafe());
+
+function apiUrl(relayBaseUrl: URL, resource: "search" | "context"): URL {
+  const url = new URL(relayBaseUrl);
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/v1/session-fabric/${resource}`;
+  url.search = "";
+  url.hash = "";
+  return url;
+}
+
+export function sessionFabricGatewayWebSocketUrl(
+  relayBaseUrl: URL,
+  sessionId: SessionFabricSessionId,
+): URL | null {
+  const url = new URL(relayBaseUrl);
+  if (url.protocol === "https:") url.protocol = "wss:";
+  else if (url.protocol === "http:") url.protocol = "ws:";
+  else return null;
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/v1/session-fabric/sessions/${encodeURIComponent(sessionId)}/connect`;
+  url.search = "";
+  url.hash = "";
+  return url;
+}
+
+function messageText(data: unknown): string | null {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) {
+    return new TextDecoder().decode(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  }
+  return null;
+}
+
+export function makeSessionFabricGateway(
+  options: SessionFabricGatewayOptions,
+): SessionFabricGatewayShape {
+  const fetchImplementation = options.fetch ?? globalThis.fetch.bind(globalThis);
+  const WebSocketImplementation =
+    options.webSocketConstructor ??
+    (globalThis.WebSocket as unknown as SessionFabricWebSocketConstructor | undefined);
+  const now = options.now ?? currentIso;
+
+  const requireRelay = (
+    operation: SessionFabricGatewayError["operation"],
+  ): Effect.Effect<URL, SessionFabricGatewayError> =>
+    options.relayBaseUrl === null
+      ? Effect.fail(
+          new SessionFabricGatewayError({
+            operation,
+            detail: "T3CODE_SESSION_FABRIC_RELAY_URL is not configured.",
+          }),
+        )
+      : Effect.succeed(options.relayBaseUrl);
+
+  const request = <A>(input: {
+    readonly operation: "search" | "context";
+    readonly body: string;
+    readonly decode: (value: unknown) => Effect.Effect<A, Schema.SchemaError>;
+  }): Effect.Effect<A, SessionFabricGatewayError> =>
+    Effect.gen(function* () {
+      const relayBaseUrl = yield* requireRelay(input.operation);
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          fetchImplementation(apiUrl(relayBaseUrl, input.operation), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: input.body,
+          }),
+        catch: (cause) =>
+          new SessionFabricGatewayError({
+            operation: input.operation,
+            detail: cause instanceof Error ? cause.message : "Session fabric request failed.",
+          }),
+      });
+      if (!response.ok) {
+        return yield* new SessionFabricGatewayError({
+          operation: input.operation,
+          detail: `Session fabric request failed with status ${response.status}.`,
+        });
+      }
+      const payload = yield* Effect.tryPromise({
+        try: () => response.json() as Promise<unknown>,
+        catch: () =>
+          new SessionFabricGatewayError({
+            operation: input.operation,
+            detail: "Session fabric returned an unreadable response.",
+          }),
+      });
+      return yield* input.decode(payload).pipe(
+        Effect.mapError(
+          () =>
+            new SessionFabricGatewayError({
+              operation: input.operation,
+              detail: "Session fabric returned an invalid response.",
+            }),
+        ),
+      );
+    });
+
+  const submit: SessionFabricGatewayShape["submit"] = (input) =>
+    Effect.gen(function* () {
+      const relayBaseUrl = yield* requireRelay("submit");
+      const socketUrl = sessionFabricGatewayWebSocketUrl(relayBaseUrl, input.sessionId);
+      if (socketUrl === null || WebSocketImplementation === undefined) {
+        return yield* new SessionFabricGatewayError({
+          operation: "submit",
+          detail: "Session fabric WebSocket transport is unavailable.",
+        });
+      }
+
+      return yield* Effect.callback<SessionFabricCommandReceipt, SessionFabricGatewayError>(
+        (resume) => {
+          const socket = new WebSocketImplementation(socketUrl.toString());
+          let settled = false;
+          const finish = (
+            result: Effect.Effect<SessionFabricCommandReceipt, SessionFabricGatewayError>,
+          ) => {
+            if (settled) return;
+            settled = true;
+            socket.onopen = null;
+            socket.onmessage = null;
+            socket.onerror = null;
+            socket.onclose = null;
+            socket.close();
+            resume(result);
+          };
+          const fail = (detail: string) =>
+            finish(Effect.fail(new SessionFabricGatewayError({ operation: "submit", detail })));
+
+          socket.onopen = () => {
+            try {
+              socket.send(
+                encodeClientFrame({
+                  type: "client.hello",
+                  hello: {
+                    protocolVersion: SESSION_FABRIC_PROTOCOL_VERSION,
+                    sessionId: input.sessionId,
+                    clientId: input.clientId,
+                    afterEventSequence: 0,
+                    connectedAt: now(),
+                  },
+                }),
+              );
+              socket.send(encodeClientFrame({ type: "command.submit", command: input.command }));
+            } catch (cause) {
+              fail(cause instanceof Error ? cause.message : "Could not submit the fabric command.");
+            }
+          };
+          socket.onmessage = (event) => {
+            const text = messageText(event.data);
+            if (text === null) return;
+            try {
+              const frame = decodeServerFrame(text);
+              if (
+                frame.type !== "command.receipt" ||
+                frame.receipt.commandId !== input.command.commandId ||
+                (frame.receipt.status !== "accepted" && frame.receipt.status !== "rejected")
+              ) {
+                return;
+              }
+              finish(Effect.succeed(frame.receipt));
+            } catch {
+              // Other clients and protocol versions may share the socket. Ignore
+              // frames that do not satisfy the current fabric contract.
+            }
+          };
+          socket.onerror = () => fail("The session fabric WebSocket failed.");
+          socket.onclose = () => fail("The session fabric WebSocket closed before acceptance.");
+
+          return Effect.sync(() => {
+            if (settled) return;
+            settled = true;
+            socket.onopen = null;
+            socket.onmessage = null;
+            socket.onerror = null;
+            socket.onclose = null;
+            socket.close();
+          });
+        },
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: options.dispatchTimeoutMs ?? 30_000,
+          orElse: () =>
+            Effect.fail(
+              new SessionFabricGatewayError({
+                operation: "submit",
+                detail: "The session runner did not accept the command before the timeout.",
+              }),
+            ),
+        }),
+      );
+    });
+
+  return SessionFabricGateway.of({
+    search: (search) =>
+      request({
+        operation: "search",
+        body: encodeSearch(search),
+        decode: decodeSearch,
+      }),
+    context: (context) =>
+      request({
+        operation: "context",
+        body: encodeContext(context),
+        decode: decodeContext,
+      }),
+    submit,
+  });
+}
+
+const config = Config.url("T3CODE_SESSION_FABRIC_RELAY_URL").pipe(Config.option);
+
+export const layer = Layer.effect(
+  SessionFabricGateway,
+  config.pipe(
+    Effect.map((relayUrl) =>
+      makeSessionFabricGateway({
+        relayBaseUrl: Option.isSome(relayUrl) ? relayUrl.value : null,
+      }),
+    ),
+  ),
+);

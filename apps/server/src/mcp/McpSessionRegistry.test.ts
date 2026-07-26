@@ -96,7 +96,13 @@ it.effect("grants session read/send capabilities only to OMP provider credential
     const codexScope = yield* resolveIssued(codex.config.authorizationHeader);
 
     expect(ompScope?.capabilities).toEqual(
-      new Set(["preview", "session_reference_read", "session_message_send"]),
+      new Set([
+        "preview",
+        "session_reference_read",
+        "session_message_send",
+        "session_fabric_read",
+        "session_fabric_send",
+      ]),
     );
     expect(codexScope?.capabilities).toEqual(new Set(["preview"]));
   }),

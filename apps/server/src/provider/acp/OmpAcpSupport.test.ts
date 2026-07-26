@@ -56,6 +56,19 @@ describe("OMP command skills", () => {
       "Keep @[session||thread-1|] unchanged ",
     );
   });
+
+  it("routes fabric session references by global identity without local thread tools", () => {
+    const expanded = expandOmpSkillReferences(
+      "Continue @[session|session-fabric%3Aglobal-session-1|remote-thread|%2Fremote%2Ftree] please ",
+    );
+    expect(expanded).toContain('shared T3 session "global-session-1"');
+    expect(expanded).toContain('session_fabric_context with {"sessionId":"global-session-1"');
+    expect(expanded).toContain("session_fabric_message_send");
+    expect(expanded).toContain(
+      "do not call local session_reference_resolve or session_message_send",
+    );
+    expect(expanded).not.toContain("/remote/tree");
+  });
 });
 
 describe("buildOmpAcpSpawnInput", () => {

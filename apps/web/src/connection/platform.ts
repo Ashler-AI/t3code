@@ -50,6 +50,7 @@ import {
 } from "../environments/primary/target";
 import { clearComposerDraftsEnvironment } from "../composerDraftStore";
 import { isHostedStaticApp } from "../hostedPairing";
+import { randomUUID } from "../lib/utils";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { acknowledgeRpcRequest, trackRpcRequestSent } from "../rpc/requestLatencyState";
 import {
@@ -59,8 +60,13 @@ import {
 } from "./desktopLocal";
 import { connectionStorageLayer } from "./storage";
 import { scaffoldLifecycleGatewayLayer } from "./scaffold";
+import {
+  configuredSessionFabricRelayUrl,
+  sessionFabricRegistrationFromRoute,
+} from "./sessionFabricBootstrap";
 
 let nextObservedRpcRequestId = 0;
+const sessionFabricPageClientId = randomUUID();
 
 function currentNetworkStatus(): "unknown" | "offline" | "online" {
   if (typeof navigator === "undefined") {
@@ -457,9 +463,17 @@ export function secondaryRegistrationsToRetainAfterTopologyRead(
 const platformConnectionSourceLayer = Layer.effect(
   PlatformConnectionSource,
   Effect.gen(function* () {
+    const fabricRegistration = sessionFabricRegistrationFromRoute({
+      pathname: window.location.pathname,
+      relayBaseUrl: configuredSessionFabricRelayUrl(
+        import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
+      ),
+      clientId: sessionFabricPageClientId,
+    });
     if (isHostedStaticApp()) {
       return PlatformConnectionSource.of({
-        registrations: Stream.empty,
+        registrations:
+          fabricRegistration === null ? Stream.empty : Stream.succeed([fabricRegistration]),
       });
     }
     const cacheRef = yield* Ref.make(new Map<string, CachedPlatformRegistration>());
@@ -472,7 +486,8 @@ const platformConnectionSourceLayer = Layer.effect(
       const previous = yield* Ref.get(cacheRef);
       const nowEpochMs = yield* Clock.currentTimeMillis;
       const next = new Map<string, CachedPlatformRegistration>();
-      const registrations: Array<PlatformConnectionRegistration> = [];
+      const registrations: Array<PlatformConnectionRegistration> =
+        fabricRegistration === null ? [] : [fabricRegistration];
 
       const primaryTopologyRead = readPrimaryEnvironmentTargetResult();
       const retainedPrimary = primaryRegistrationToRetainAfterTopologyRead(
