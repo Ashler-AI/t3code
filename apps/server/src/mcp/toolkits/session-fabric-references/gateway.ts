@@ -31,6 +31,12 @@ export class SessionFabricGatewayError extends Schema.TaggedErrorClass<SessionFa
   },
 ) {}
 
+const isSessionFabricGatewayError = (cause: unknown): cause is SessionFabricGatewayError =>
+  typeof cause === "object" &&
+  cause !== null &&
+  "_tag" in cause &&
+  cause._tag === "SessionFabricGatewayError";
+
 export interface SessionFabricWebSocketLike {
   onopen: (() => void) | null;
   onmessage: ((event: { readonly data: unknown }) => void) | null;
@@ -52,6 +58,7 @@ export interface SessionFabricGatewayOptions {
   readonly fetch?: SessionFabricFetch;
   readonly webSocketConstructor?: SessionFabricWebSocketConstructor;
   readonly now?: () => string;
+  readonly requestTimeoutMs?: number;
   readonly dispatchTimeoutMs?: number;
 }
 
@@ -114,6 +121,76 @@ function messageText(data: unknown): string | null {
   return null;
 }
 
+async function fetchJsonWithTimeout(input: {
+  readonly fetch: SessionFabricFetch;
+  readonly url: URL;
+  readonly operation: "search" | "context";
+  readonly body: string;
+  readonly timeoutMs: number;
+}): Promise<unknown> {
+  const controller = new AbortController();
+  const deadlineController = new AbortController();
+  let timedOut = false;
+  const timeoutError = () =>
+    new SessionFabricGatewayError({
+      operation: input.operation,
+      detail: "Session fabric request timed out.",
+    });
+  const request = (async () => {
+    let response: Response;
+    try {
+      response = await input.fetch(input.url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: input.body,
+        signal: controller.signal,
+      });
+    } catch (cause) {
+      throw timedOut
+        ? timeoutError()
+        : new SessionFabricGatewayError({
+            operation: input.operation,
+            detail: cause instanceof Error ? cause.message : "Session fabric request failed.",
+          });
+    }
+    if (!response.ok) {
+      throw new SessionFabricGatewayError({
+        operation: input.operation,
+        detail: `Session fabric request failed with status ${response.status}.`,
+      });
+    }
+    try {
+      return (await response.json()) as unknown;
+    } catch {
+      throw timedOut
+        ? timeoutError()
+        : new SessionFabricGatewayError({
+            operation: input.operation,
+            detail: "Session fabric returned an unreadable response.",
+          });
+    }
+  })();
+  const deadline = Effect.runPromise(
+    Effect.sleep(`${input.timeoutMs} millis`).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          timedOut = true;
+          controller.abort();
+        }),
+      ),
+      Effect.flatMap(() => Effect.fail(timeoutError())),
+    ),
+    { signal: deadlineController.signal },
+  );
+
+  try {
+    return await Promise.race([request, deadline]);
+  } finally {
+    deadlineController.abort();
+    controller.abort();
+  }
+}
+
 export function makeSessionFabricGateway(
   options: SessionFabricGatewayOptions,
 ): SessionFabricGatewayShape {
@@ -142,32 +219,22 @@ export function makeSessionFabricGateway(
   }): Effect.Effect<A, SessionFabricGatewayError> =>
     Effect.gen(function* () {
       const relayBaseUrl = yield* requireRelay(input.operation);
-      const response = yield* Effect.tryPromise({
+      const payload = yield* Effect.tryPromise({
         try: () =>
-          fetchImplementation(apiUrl(relayBaseUrl, input.operation), {
-            method: "POST",
-            headers: { "content-type": "application/json" },
+          fetchJsonWithTimeout({
+            fetch: fetchImplementation,
+            url: apiUrl(relayBaseUrl, input.operation),
+            operation: input.operation,
             body: input.body,
+            timeoutMs: options.requestTimeoutMs ?? 30_000,
           }),
         catch: (cause) =>
-          new SessionFabricGatewayError({
-            operation: input.operation,
-            detail: cause instanceof Error ? cause.message : "Session fabric request failed.",
-          }),
-      });
-      if (!response.ok) {
-        return yield* new SessionFabricGatewayError({
-          operation: input.operation,
-          detail: `Session fabric request failed with status ${response.status}.`,
-        });
-      }
-      const payload = yield* Effect.tryPromise({
-        try: () => response.json() as Promise<unknown>,
-        catch: () =>
-          new SessionFabricGatewayError({
-            operation: input.operation,
-            detail: "Session fabric returned an unreadable response.",
-          }),
+          isSessionFabricGatewayError(cause)
+            ? cause
+            : new SessionFabricGatewayError({
+                operation: input.operation,
+                detail: "Session fabric request failed.",
+              }),
       });
       return yield* input.decode(payload).pipe(
         Effect.mapError(
@@ -239,6 +306,10 @@ export function makeSessionFabricGateway(
                 frame.receipt.commandId !== input.command.commandId ||
                 (frame.receipt.status !== "accepted" && frame.receipt.status !== "rejected")
               ) {
+                return;
+              }
+              if (frame.receipt.sessionId !== input.sessionId) {
+                fail("Session fabric returned a command receipt for a different session.");
                 return;
               }
               finish(Effect.succeed(frame.receipt));

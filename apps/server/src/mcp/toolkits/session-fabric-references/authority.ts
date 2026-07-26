@@ -22,6 +22,7 @@ export const SESSION_FABRIC_MESSAGE_MAX_CHARS = 16_000;
 
 export const SessionFabricReferenceFailureReason = Schema.Literals([
   "capability_denied",
+  "self_reference",
   "message_empty",
   "message_too_long",
   "relay_unavailable",
@@ -108,9 +109,27 @@ export const make = Effect.gen(function* () {
   const context: SessionFabricReferenceAuthorityShape["context"] = Effect.fn(
     "SessionFabricReferenceAuthority.context",
   )(function* (scope, sessionId, includeCodeDiff, includeContinuation) {
-    return yield* gateway
+    const bundle = yield* gateway
       .context({ sessionId, includeCodeDiff, includeContinuation })
       .pipe(Effect.mapError((cause) => gatewayError(scope, "context", sessionId, cause)));
+    if (
+      bundle.session.sessionId !== sessionId ||
+      bundle.snapshot.session.sessionId !== sessionId ||
+      bundle.snapshot.session.location.environmentId !== bundle.session.location.environmentId ||
+      bundle.snapshot.session.location.projectId !== bundle.session.location.projectId ||
+      bundle.snapshot.session.location.threadId !== bundle.session.location.threadId ||
+      bundle.snapshot.thread.thread.id !== bundle.session.location.threadId ||
+      bundle.snapshot.thread.thread.projectId !== bundle.session.location.projectId
+    ) {
+      return yield* makeError({
+        operation: "context",
+        reason: "relay_unavailable",
+        sourceThreadId: scope.threadId,
+        sessionId,
+        detail: "Session fabric returned context for a different session.",
+      });
+    }
+    return bundle;
   });
 
   const search: SessionFabricReferenceAuthorityShape["search"] = Effect.fn(
@@ -143,6 +162,17 @@ export const make = Effect.gen(function* () {
     }
 
     const target = yield* context(scope, sessionId, false, false);
+    if (
+      target.session.location.environmentId === scope.environmentId &&
+      target.session.location.threadId === scope.threadId
+    ) {
+      return yield* makeError({
+        operation: "send",
+        reason: "self_reference",
+        sourceThreadId: scope.threadId,
+        sessionId,
+      });
+    }
     const [commandUuid, messageUuid, createdAt] = yield* Effect.all([
       crypto.randomUUIDv4.pipe(Effect.orDie),
       crypto.randomUUIDv4.pipe(Effect.orDie),
@@ -175,6 +205,15 @@ export const make = Effect.gen(function* () {
     const receipt = yield* gateway
       .submit({ sessionId, clientId, command })
       .pipe(Effect.mapError((cause) => gatewayError(scope, "send", sessionId, cause)));
+    if (receipt.sessionId !== sessionId) {
+      return yield* makeError({
+        operation: "send",
+        reason: "dispatch_rejected",
+        sourceThreadId: scope.threadId,
+        sessionId,
+        detail: "Session fabric returned a command receipt for a different session.",
+      });
+    }
     if (receipt.status !== "accepted") {
       return yield* makeError({
         operation: "send",

@@ -3,6 +3,7 @@ import {
   CommandId,
   SessionFabricClientFrame,
   SessionFabricClientId,
+  SessionFabricSessionId,
   SessionFabricServerFrame,
   type SessionFabricCommand,
 } from "@t3tools/contracts";
@@ -53,10 +54,12 @@ describe("SessionFabricGateway", () => {
   it.effect("searches and loads context through the configured Relay base path", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly body: string }> = [];
+      const signals: AbortSignal[] = [];
       const gateway = makeSessionFabricGateway({
         relayBaseUrl: new URL("https://relay.example/base/"),
         fetch: async (input, init) => {
           calls.push({ url: String(input), body: String(init?.body) });
+          if (init?.signal) signals.push(init.signal);
           return String(input).endsWith("/search")
             ? Response.json({
                 results: [
@@ -84,6 +87,27 @@ describe("SessionFabricGateway", () => {
         "https://relay.example/base/v1/session-fabric/search",
         "https://relay.example/base/v1/session-fabric/context",
       ]);
+      expect(signals).toHaveLength(2);
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+    }),
+  );
+
+  it.effect("aborts an HTTP request when its bounded timeout expires", () =>
+    Effect.gen(function* () {
+      let signal: AbortSignal | undefined;
+      const gateway = makeSessionFabricGateway({
+        relayBaseUrl: new URL("https://relay.example/base/"),
+        requestTimeoutMs: 10,
+        fetch: (_input, init) => {
+          signal = init?.signal ?? undefined;
+          return new Promise<Response>(() => undefined);
+        },
+      });
+
+      const error = yield* gateway.search({ query: "oauth callback", limit: 5 }).pipe(Effect.flip);
+
+      expect(error.detail).toBe("Session fabric request timed out.");
+      expect(signal?.aborted).toBe(true);
     }),
   );
 
@@ -139,6 +163,58 @@ describe("SessionFabricGateway", () => {
           }),
         );
         expect((yield* Fiber.join(fiber)).resultSequence).toBe(23);
+      }),
+    ),
+  );
+
+  it.effect("rejects a command receipt for another session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gateway = makeSessionFabricGateway({
+          relayBaseUrl: new URL("https://relay.example/base/"),
+          webSocketConstructor: TestWebSocket,
+          now: () => TEST_NOW,
+        });
+        const command = {
+          sessionId: TEST_SESSION_RECORD.sessionId,
+          commandId: CommandId.make("command-mismatched-session"),
+          clientId: SessionFabricClientId.make("client-1"),
+          command: {
+            type: "thread.archive",
+            commandId: CommandId.make("command-mismatched-session"),
+            threadId: TEST_SESSION_RECORD.location.threadId,
+          },
+          submittedAt: TEST_NOW,
+        } satisfies SessionFabricCommand;
+
+        const fiber = yield* gateway
+          .submit({
+            sessionId: TEST_SESSION_RECORD.sessionId,
+            clientId: command.clientId,
+            command,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        const socket = TestWebSocket.last;
+        socket?.open();
+        socket?.receive(
+          encodeServerFrame({
+            type: "command.receipt",
+            receipt: {
+              sessionId: SessionFabricSessionId.make("global-session-other"),
+              commandId: command.commandId,
+              status: "accepted",
+              resultSequence: 23,
+              detail: null,
+              updatedAt: TEST_NOW,
+            },
+          }),
+        );
+
+        const error = yield* Fiber.join(fiber).pipe(Effect.flip);
+        expect(error.detail).toBe(
+          "Session fabric returned a command receipt for a different session.",
+        );
       }),
     ),
   );
