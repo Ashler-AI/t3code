@@ -85,10 +85,35 @@ describe("OmpProvider", () => {
       "openai/gpt-5.6-terra",
       "anthropic/claude-sonnet-5",
     ]);
+    expect(models.map((model) => ({ slug: model.slug, isDefault: model.isDefault }))).toEqual([
+      { slug: "openai/gpt-5.6-terra", isDefault: true },
+      { slug: "anthropic/claude-sonnet-5", isDefault: undefined },
+    ]);
     expect(models[0]?.capabilities?.optionDescriptors?.[0]).toMatchObject({
       id: "reasoningEffort",
       currentValue: "high",
     });
+  });
+
+  it("preserves Scaffold's live OMP model selection as the catalog default", () => {
+    const models = buildOmpDiscoveredModelsFromConfigOptions([
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "openai/gpt-5.6-sol",
+        options: [
+          { value: "ashler/moonshotai/Kimi-K2.6", name: "Kimi K2.6" },
+          { value: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol" },
+        ],
+      },
+    ]);
+
+    expect(models.map((model) => ({ slug: model.slug, isDefault: model.isDefault }))).toEqual([
+      { slug: "ashler/moonshotai/Kimi-K2.6", isDefault: undefined },
+      { slug: "openai/gpt-5.6-sol", isDefault: true },
+    ]);
   });
 
   it.effect("publishes standard ACP commands as pathless OMP skills", () =>

@@ -86,6 +86,62 @@ it("uses a live allowed OMP model for auto-bootstrapped model selection", () => 
   );
 });
 
+it("honors OMP's live default for Scaffold bootstrap selection", () => {
+  assert.deepStrictEqual(
+    ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection([
+      {
+        ...liveOmpProvider,
+        models: [
+          {
+            slug: "ashler/moonshotai/Kimi-K2.6",
+            name: "Kimi K2.6",
+            isCustom: false,
+            capabilities: null,
+          },
+          {
+            slug: "openai/gpt-5.6-sol",
+            name: "Sol",
+            isCustom: false,
+            isDefault: true,
+            capabilities: null,
+          },
+        ],
+      },
+    ]),
+    {
+      instanceId: ProviderInstanceId.make("omp"),
+      model: "openai/gpt-5.6-sol",
+    },
+  );
+
+  assert.deepStrictEqual(
+    ServerRuntimeStartup.getAutoBootstrapDefaultModelSelection([
+      {
+        ...liveOmpProvider,
+        models: [
+          {
+            slug: "openai/gpt-5.6-sol",
+            name: "Sol",
+            isCustom: false,
+            capabilities: null,
+          },
+          {
+            slug: "openai/gpt-5.6-terra",
+            name: "Terra",
+            isCustom: false,
+            isDefault: true,
+            capabilities: null,
+          },
+        ],
+      },
+    ]),
+    {
+      instanceId: ProviderInstanceId.make("omp"),
+      model: "openai/gpt-5.6-terra",
+    },
+  );
+});
+
 it.effect("enqueueCommand waits for readiness and then drains queued work", () =>
   Effect.scoped(
     Effect.gen(function* () {

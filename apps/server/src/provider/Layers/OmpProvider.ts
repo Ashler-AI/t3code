@@ -132,6 +132,7 @@ export function buildOmpDiscoveredModelsFromConfigOptions(
   const capabilities = thinkingDescriptor
     ? createModelCapabilities({ optionDescriptors: [thinkingDescriptor] })
     : EMPTY_CAPABILITIES;
+  const currentModel = modelOption.currentValue.trim();
   const seen = new Set<string>();
   const discoveredModels = modelOption.options
     .flatMap((entry) => ("value" in entry ? [entry] : entry.options))
@@ -145,6 +146,7 @@ export function buildOmpDiscoveredModelsFromConfigOptions(
         slug,
         name: model.name.trim() || slug,
         isCustom: false,
+        ...(slug === currentModel ? { isDefault: true } : {}),
         capabilities,
       };
     })
