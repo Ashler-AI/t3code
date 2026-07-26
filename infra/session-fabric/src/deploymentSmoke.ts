@@ -28,11 +28,11 @@ const encodeClientFrame = Schema.encodeSync(Schema.fromJsonString(SessionFabricC
 export interface DeploymentSmokeSocket {
   readonly readyState: number;
   addEventListener(
-    type: "open" | "error",
+    type: "open" | "error" | "close",
     listener: () => void,
     options?: { once?: boolean },
   ): void;
-  removeEventListener(type: "open" | "error", listener: () => void): void;
+  removeEventListener(type: "open" | "error" | "close", listener: () => void): void;
   send(data: string): void;
   close(code?: number, reason?: string): void;
 }
@@ -191,6 +191,9 @@ function matchesDeploymentSmokeSnapshot(
     snapshot.session.location.environmentId === DEPLOYMENT_SMOKE_ENVIRONMENT_ID &&
     snapshot.session.location.projectId === DEPLOYMENT_SMOKE_PROJECT_ID &&
     snapshot.session.location.threadId === DEPLOYMENT_SMOKE_THREAD_ID &&
+    snapshot.session.cursor.snapshotSequence === DEPLOYMENT_SMOKE_SNAPSHOT_SEQUENCE &&
+    snapshot.shell.snapshotSequence === DEPLOYMENT_SMOKE_SNAPSHOT_SEQUENCE &&
+    snapshot.thread.snapshotSequence === DEPLOYMENT_SMOKE_SNAPSHOT_SEQUENCE &&
     snapshot.thread.thread.id === DEPLOYMENT_SMOKE_THREAD_ID &&
     snapshot.thread.thread.projectId === DEPLOYMENT_SMOKE_PROJECT_ID
   );
@@ -202,22 +205,48 @@ async function fetchBeforeDeadline(
   fetchClient: typeof fetch,
   url: URL,
   deadline: number,
+  timeoutMessage = "The session fabric deployment smoke timed out.",
 ): Promise<Response> {
   const timeoutMs = remainingMs(deadline);
-  if (timeoutMs === 0) throw new Error("The session fabric deployment smoke timed out.");
+  if (timeoutMs === 0) throw new Error(timeoutMessage);
   const signal = AbortSignal.timeout(timeoutMs);
   const request = fetchClient(url, {
     headers: { "cache-control": "no-cache" },
     signal,
   });
   const timeout = new Promise<never>((_, reject) => {
-    signal.addEventListener(
-      "abort",
-      () => reject(new Error("The session fabric deployment smoke timed out.")),
-      { once: true },
-    );
+    signal.addEventListener("abort", () => reject(new Error(timeoutMessage)), { once: true });
   });
   return await Promise.race([request, timeout]);
+}
+
+async function closeSocket(socket: DeploymentSmokeSocket, deadline: number): Promise<void> {
+  if (socket.readyState === 3) return;
+  await new Promise<void>((resolve, reject) => {
+    const timeoutMs = remainingMs(deadline);
+    if (timeoutMs === 0) {
+      reject(
+        new Error("The session fabric deployment smoke timed out waiting for WebSocket close."),
+      );
+      return;
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeEventListener("close", onClose);
+    };
+    const onClose = () => {
+      cleanup();
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(
+        new Error("The session fabric deployment smoke timed out waiting for WebSocket close."),
+      );
+    }, timeoutMs);
+    socket.addEventListener("close", onClose, { once: true });
+    if (socket.readyState < 2) socket.close(1000, "deployment smoke complete");
+  });
 }
 
 async function openSocket(socket: DeploymentSmokeSocket, deadline: number): Promise<void> {
@@ -249,10 +278,56 @@ async function openSocket(socket: DeploymentSmokeSocket, deadline: number): Prom
   });
 }
 
-async function waitForPoll(deadline: number, pollIntervalMs: number): Promise<void> {
+async function waitForPoll(
+  deadline: number,
+  pollIntervalMs: number,
+  timeoutMessage = "The session fabric deployment smoke timed out.",
+): Promise<void> {
   const delayMs = Math.min(pollIntervalMs, remainingMs(deadline));
-  if (delayMs === 0) throw new Error("The session fabric deployment smoke timed out.");
+  if (delayMs === 0) throw new Error(timeoutMessage);
   await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function pollForDeploymentSnapshot(input: {
+  readonly fetch: typeof fetch;
+  readonly snapshotUrl: URL;
+  readonly deadline: number;
+  readonly pollIntervalMs: number;
+  readonly marker: string;
+  readonly runnerState: "online" | "offline";
+  readonly timeoutMessage: string;
+  readonly requireOpenSocket?: DeploymentSmokeSocket;
+}): Promise<void> {
+  while (true) {
+    const response = await fetchBeforeDeadline(
+      input.fetch,
+      input.snapshotUrl,
+      input.deadline,
+      input.timeoutMessage,
+    );
+    if (response.status === 200) {
+      const snapshot = decodeSnapshot(await response.json());
+      if (
+        matchesDeploymentSmokeSnapshot(snapshot, input.marker) &&
+        snapshot.session.runnerState === input.runnerState
+      ) {
+        if (input.requireOpenSocket !== undefined && input.requireOpenSocket.readyState !== 1) {
+          throw new Error(
+            "The session fabric deployment smoke WebSocket closed before the online snapshot was proven.",
+          );
+        }
+        return;
+      }
+      await waitForPoll(input.deadline, input.pollIntervalMs, input.timeoutMessage);
+      continue;
+    }
+    if (response.status !== 404) {
+      throw new Error(
+        `The deployment smoke snapshot returned unexpected status ${response.status}.`,
+      );
+    }
+    await waitForPoll(input.deadline, input.pollIntervalMs, input.timeoutMessage);
+  }
 }
 
 export async function runDeploymentSmoke(
@@ -285,33 +360,45 @@ export async function runDeploymentSmoke(
   const socket = input.createWebSocket(
     sessionResourceUrl(input.relayUrl, DEPLOYMENT_SMOKE_SESSION_ID, "connect"),
   );
+  let socketCloseRequested = false;
   try {
     await openSocket(socket, deadline);
     for (const frame of frames) socket.send(encodeClientFrame(frame));
 
     const snapshotUrl = sessionResourceUrl(input.relayUrl, DEPLOYMENT_SMOKE_SESSION_ID, "snapshot");
-    while (true) {
-      const response = await fetchBeforeDeadline(input.fetch, snapshotUrl, deadline);
-      if (response.status === 200) {
-        const snapshot = decodeSnapshot(await response.json());
-        if (matchesDeploymentSmokeSnapshot(snapshot, input.marker)) {
-          return {
-            marker: input.marker,
-            sessionId: DEPLOYMENT_SMOKE_SESSION_ID,
-            runnerId: DEPLOYMENT_SMOKE_RUNNER_ID,
-          };
-        }
-        await waitForPoll(deadline, pollIntervalMs);
-        continue;
-      }
-      if (response.status !== 404) {
-        throw new Error(
-          `The deployment smoke snapshot returned unexpected status ${response.status}.`,
-        );
-      }
-      await waitForPoll(deadline, pollIntervalMs);
-    }
+    await pollForDeploymentSnapshot({
+      fetch: input.fetch,
+      snapshotUrl,
+      deadline,
+      pollIntervalMs,
+      marker: input.marker,
+      runnerState: "online",
+      requireOpenSocket: socket,
+      timeoutMessage:
+        "The session fabric deployment smoke timed out waiting for the published online snapshot.",
+    });
+
+    socketCloseRequested = true;
+    await closeSocket(socket, deadline);
+    await pollForDeploymentSnapshot({
+      fetch: input.fetch,
+      snapshotUrl,
+      deadline,
+      pollIntervalMs,
+      marker: input.marker,
+      runnerState: "offline",
+      timeoutMessage:
+        "The session fabric deployment smoke timed out waiting for the post-disconnect offline snapshot.",
+    });
+
+    return {
+      marker: input.marker,
+      sessionId: DEPLOYMENT_SMOKE_SESSION_ID,
+      runnerId: DEPLOYMENT_SMOKE_RUNNER_ID,
+    };
   } finally {
-    socket.close(1000, "deployment smoke complete");
+    if (!socketCloseRequested && socket.readyState < 2) {
+      socket.close(1000, "deployment smoke complete");
+    }
   }
 }

@@ -16,13 +16,18 @@ class TestSocket implements DeploymentSmokeSocket {
   readyState = 0;
   readonly sent: string[] = [];
   readonly urls: URL[];
+  readonly emitClose: boolean;
+  closeCalls = 0;
+  serverCloseHandled = false;
   readonly #listeners = {
     open: new Set<() => void>(),
     error: new Set<() => void>(),
+    close: new Set<() => void>(),
   };
 
-  constructor(url: URL, urls: URL[]) {
+  constructor(url: URL, urls: URL[], emitClose = true) {
     this.urls = urls;
+    this.emitClose = emitClose;
     this.urls.push(url);
     queueMicrotask(() => {
       this.readyState = 1;
@@ -30,11 +35,11 @@ class TestSocket implements DeploymentSmokeSocket {
     });
   }
 
-  addEventListener(type: "open" | "error", listener: () => void): void {
+  addEventListener(type: "open" | "error" | "close", listener: () => void): void {
     this.#listeners[type].add(listener);
   }
 
-  removeEventListener(type: "open" | "error", listener: () => void): void {
+  removeEventListener(type: "open" | "error" | "close", listener: () => void): void {
     this.#listeners[type].delete(listener);
   }
 
@@ -43,7 +48,14 @@ class TestSocket implements DeploymentSmokeSocket {
   }
 
   close(): void {
-    this.readyState = 3;
+    this.closeCalls += 1;
+    this.readyState = 2;
+    if (!this.emitClose) return;
+    queueMicrotask(() => {
+      this.readyState = 3;
+      this.serverCloseHandled = true;
+      for (const listener of this.#listeners.close) listener();
+    });
   }
 }
 
@@ -80,7 +92,7 @@ describe("session fabric deployment smoke", () => {
     );
   });
 
-  it("requires the empty coordinator to be absent, publishes over WebSocket, and polls to 200", async () => {
+  it("waits for disconnect handling and the retained offline snapshot before succeeding", async () => {
     const urls: URL[] = [];
     let socket: TestSocket | undefined;
     let proofPolls = 0;
@@ -88,6 +100,10 @@ describe("session fabric deployment smoke", () => {
     const [, publication] = buildDeploymentSmokeFrames({ marker: "run-84", now: NOW });
     if (stalePublication.type !== "session.publish-snapshot") throw new Error("unexpected frame");
     if (publication.type !== "session.publish-snapshot") throw new Error("unexpected frame");
+    const offlineSnapshot = {
+      ...publication.published.snapshot,
+      session: { ...publication.published.snapshot.session, runnerState: "offline" as const },
+    };
     const fetchClient: typeof fetch = async (input) => {
       const url = new URL(input instanceof Request ? input.url : input);
       urls.push(url);
@@ -96,9 +112,11 @@ describe("session fabric deployment smoke", () => {
       }
       proofPolls += 1;
       if (proofPolls === 1) return new Response(null, { status: 404 });
-      return Response.json(
-        proofPolls === 2 ? stalePublication.published.snapshot : publication.published.snapshot,
-      );
+      if (proofPolls === 2) return Response.json(stalePublication.published.snapshot);
+      if (proofPolls === 3) return Response.json(publication.published.snapshot);
+      if (!socket?.serverCloseHandled)
+        throw new Error("offline snapshot polled before close handling");
+      return Response.json(offlineSnapshot);
     };
 
     const result = await runDeploymentSmoke({
@@ -113,12 +131,90 @@ describe("session fabric deployment smoke", () => {
     expect(result).toMatchObject({ marker: "run-84", sessionId: DEPLOYMENT_SMOKE_SESSION_ID });
     expect(urls[0]?.pathname).toContain(`${DEPLOYMENT_SMOKE_EMPTY_SESSION_ID}/snapshot`);
     expect(urls.some((url) => url.protocol === "wss:")).toBe(true);
-    expect(proofPolls).toBe(3);
+    expect(proofPolls).toBe(4);
     expect(socket?.sent.map((frame) => JSON.parse(frame).type)).toEqual([
       "runner.hello",
       "session.publish-snapshot",
     ]);
     expect(socket?.readyState).toBe(3);
+    expect(socket?.closeCalls).toBe(1);
+  });
+
+  it("rejects post-disconnect snapshots with the wrong sequence or identity", async () => {
+    const urls: URL[] = [];
+    let socket: TestSocket | undefined;
+    let postDisconnectPolls = 0;
+    const [, publication] = buildDeploymentSmokeFrames({ marker: "run-identity", now: NOW });
+    if (publication.type !== "session.publish-snapshot") throw new Error("unexpected frame");
+    const offlineSnapshot = {
+      ...publication.published.snapshot,
+      session: { ...publication.published.snapshot.session, runnerState: "offline" as const },
+    };
+    const wrongSequence = {
+      ...offlineSnapshot,
+      session: {
+        ...offlineSnapshot.session,
+        cursor: { ...offlineSnapshot.session.cursor, snapshotSequence: 2 },
+      },
+    };
+    const wrongIdentity = {
+      ...offlineSnapshot,
+      session: {
+        ...offlineSnapshot.session,
+        location: { ...offlineSnapshot.session.location, environmentId: "wrong-environment" },
+      },
+    };
+    const fetchClient: typeof fetch = async (input) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname.includes(DEPLOYMENT_SMOKE_EMPTY_SESSION_ID)) {
+        return new Response(null, { status: 404 });
+      }
+      if (!socket?.serverCloseHandled) return Response.json(publication.published.snapshot);
+      postDisconnectPolls += 1;
+      if (postDisconnectPolls === 1) return Response.json(wrongSequence);
+      if (postDisconnectPolls === 2) return Response.json(wrongIdentity);
+      return Response.json(offlineSnapshot);
+    };
+
+    await expect(
+      runDeploymentSmoke({
+        relayUrl: new URL("https://fabric.example"),
+        marker: "run-identity",
+        timeoutMs: 1_000,
+        pollIntervalMs: 1,
+        fetch: fetchClient,
+        createWebSocket: (url) => (socket = new TestSocket(url, urls)),
+      }),
+    ).resolves.toMatchObject({ marker: "run-identity" });
+
+    expect(postDisconnectPolls).toBe(3);
+    expect(socket?.closeCalls).toBe(1);
+  });
+
+  it("bounds the WebSocket close handshake without closing twice", async () => {
+    const urls: URL[] = [];
+    let socket: TestSocket | undefined;
+    const [, publication] = buildDeploymentSmokeFrames({ marker: "run-close-timeout", now: NOW });
+    if (publication.type !== "session.publish-snapshot") throw new Error("unexpected frame");
+    const fetchClient: typeof fetch = async (input) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      return url.pathname.includes(DEPLOYMENT_SMOKE_EMPTY_SESSION_ID)
+        ? new Response(null, { status: 404 })
+        : Response.json(publication.published.snapshot);
+    };
+
+    await expect(
+      runDeploymentSmoke({
+        relayUrl: new URL("https://fabric.example"),
+        marker: "run-close-timeout",
+        timeoutMs: 25,
+        pollIntervalMs: 1,
+        fetch: fetchClient,
+        createWebSocket: (url) => (socket = new TestSocket(url, urls, false)),
+      }),
+    ).rejects.toThrow("timed out waiting for WebSocket close");
+
+    expect(socket?.closeCalls).toBe(1);
   });
 
   it("fails closed when the stable empty coordinator already has state", async () => {
