@@ -215,7 +215,13 @@ import { searchProviderSkills } from "../../providerSkillSearch";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 import { useThreadShells } from "../../state/entities";
-import { compatibleComposerSessionMentions } from "./composerAtMentions";
+import { configuredSessionFabricRelayUrl } from "../../connection/sessionFabricBootstrap";
+import {
+  type ComposerFabricSessionMention,
+  compatibleComposerSessionMentions,
+  loadComposerFabricSessionMentions,
+} from "./composerAtMentions";
+import { resolveSessionFabricComposerProviders } from "./sessionFabricComposerProvider";
 
 const IMAGE_SIZE_LIMIT_LABEL = `${Math.round(PROVIDER_SEND_TURN_MAX_IMAGE_BYTES / (1024 * 1024))}MB`;
 const FILE_SIZE_LIMIT_LABEL = `${Math.round(PROVIDER_SEND_TURN_MAX_FILE_BYTES / (1024 * 1024))}MB`;
@@ -691,7 +697,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     runtimeMode,
     interactionMode,
     lockedProvider,
-    providerStatuses,
+    providerStatuses: reportedProviderStatuses,
     activeProjectDefaultModelSelection,
     activeThreadModelSelection,
     activeThreadActivities,
@@ -782,6 +788,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Model state
   // ------------------------------------------------------------------
+  const providerStatuses = useMemo(
+    () =>
+      resolveSessionFabricComposerProviders({
+        environmentId,
+        providers: reportedProviderStatuses,
+        thread: activeThread,
+      }),
+    [activeThread, environmentId, reportedProviderStatuses],
+  );
   // Instance-aware projection of the wire provider list. One entry per
   // configured instance (default built-in + any custom `providerInstances.*`),
   // sorted default-first per driver kind for a stable picker order.
@@ -916,7 +931,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => new Map(providerInstanceEntries.map((entry) => [entry.instanceId, entry.driverKind])),
     [providerInstanceEntries],
   );
-  const sessionMentions = useMemo(
+  const localSessionMentions = useMemo(
     () =>
       compatibleComposerSessionMentions({
         threads: allThreadShells,
@@ -1022,6 +1037,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [composerHighlightedSearchKey, setComposerHighlightedSearchKey] = useState<string | null>(
     null,
   );
+  const [fabricSessionMentions, setFabricSessionMentions] = useState<
+    ReadonlyArray<ComposerFabricSessionMention>
+  >([]);
+  const [isFabricSessionSearchPending, setIsFabricSessionSearchPending] = useState(false);
   const [isDragOverComposer, setIsDragOverComposer] = useState(false);
   const [isComposerFooterCompact, setIsComposerFooterCompact] = useState(false);
   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
@@ -1105,6 +1124,43 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     query: isPathTrigger ? pathTriggerQuery : null,
   });
 
+  useEffect(() => {
+    const relayBaseUrl = configuredSessionFabricRelayUrl(
+      import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
+    );
+    if (!isPathTrigger || selectedProvider !== ProviderDriverKind.make("omp") || !relayBaseUrl) {
+      setFabricSessionMentions([]);
+      setIsFabricSessionSearchPending(false);
+      return;
+    }
+    let cancelled = false;
+    setIsFabricSessionSearchPending(true);
+    const timeout = window.setTimeout(
+      () => {
+        void loadComposerFabricSessionMentions({
+          relayBaseUrl,
+          query: pathTriggerQuery,
+        })
+          .then((mentions) => {
+            if (!cancelled) setFabricSessionMentions(mentions);
+          })
+          .catch((cause: unknown) => {
+            if (cancelled) return;
+            console.warn("Could not search shared sessions.", cause);
+            setFabricSessionMentions([]);
+          })
+          .finally(() => {
+            if (!cancelled) setIsFabricSessionSearchPending(false);
+          });
+      },
+      pathTriggerQuery.trim() ? 150 : 0,
+    );
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [isPathTrigger, pathTriggerQuery, selectedProvider]);
+
   const composerMenuItems = useMemo<ComposerCommandItem[]>(() => {
     if (!composerTrigger) return [];
     if (composerTrigger.kind === "path") {
@@ -1133,7 +1189,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               }),
             )
           : [];
-      const sessionItems = sessionMentions
+      const sessionItems = localSessionMentions
         .filter((session) => {
           if (!query) return true;
           return [session.title, session.branch, session.threadId].some((value) =>
@@ -1149,7 +1205,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           label: session.title,
           description: session.branch ?? session.worktreePath ?? "OMP session",
         }));
-      return [...pathItems, ...skillItems, ...sessionItems];
+      const fabricSessionItems = fabricSessionMentions.map((session) => ({
+        id: `fabric-session:${session.sessionId}`,
+        type: "fabric-session" as const,
+        environmentId: session.environmentId,
+        threadId: session.threadId,
+        worktreePath: null,
+        label: session.title,
+        description: `${session.environmentKind === "scaffold" ? "Scaffold" : "Local"} · ${session.runnerState} · ${session.matchText}`,
+      }));
+      return [...pathItems, ...skillItems, ...sessionItems, ...fabricSessionItems];
     }
     if (composerTrigger.kind === "slash-command") {
       const builtInSlashCommandItems = [
@@ -1212,7 +1277,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     composerTrigger,
     selectedProvider,
     selectedProviderStatus,
-    sessionMentions,
+    fabricSessionMentions,
+    localSessionMentions,
     workspaceEntries.entries,
   ]);
 
@@ -1279,7 +1345,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   ]);
 
   const isComposerMenuLoading =
-    composerTriggerKind === "path" && pathTriggerQuery.length > 0 && workspaceEntries.isPending;
+    composerTriggerKind === "path" &&
+    ((pathTriggerQuery.length > 0 && workspaceEntries.isPending) || isFabricSessionSearchPending);
   const composerMenuEmptyState = useMemo(() => {
     if (composerTriggerKind === "skill") {
       return "No skills found. Try / to browse provider commands.";
@@ -1850,7 +1917,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         }
         return;
       }
-      if (item.type === "session") {
+      if (item.type === "session" || item.type === "fabric-session") {
         const replacement = `${serializeComposerSessionReference({
           environmentId: item.environmentId,
           threadId: item.threadId,
@@ -3226,7 +3293,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     : []
                 }
                 skills={selectedProviderStatus?.skills ?? []}
-                sessionMentions={sessionMentions}
+                sessionMentions={[...localSessionMentions, ...fabricSessionMentions]}
                 {...(showMobilePendingAnswerActions ? { className: "max-sm:pb-11" } : {})}
                 onRemoveTerminalContext={removeComposerTerminalContextFromDraft}
                 onChange={onPromptChange}

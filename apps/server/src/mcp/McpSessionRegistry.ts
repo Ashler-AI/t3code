@@ -130,6 +130,8 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       if (providerInstance?.driverKind === "omp") {
         capabilities.add("session_reference_read");
         capabilities.add("session_message_send");
+        capabilities.add("session_fabric_read");
+        capabilities.add("session_fabric_send");
       }
       const scope: McpInvocationContext.McpInvocationScope = {
         environmentId,

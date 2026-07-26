@@ -7,7 +7,12 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
-export type McpCapability = "preview" | "session_reference_read" | "session_message_send";
+export type McpCapability =
+  | "preview"
+  | "session_reference_read"
+  | "session_message_send"
+  | "session_fabric_read"
+  | "session_fabric_send";
 
 export interface McpInvocationScope {
   readonly environmentId: EnvironmentId;

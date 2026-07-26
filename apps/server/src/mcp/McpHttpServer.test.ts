@@ -11,6 +11,7 @@ import { HttpBody, HttpClient, HttpRouter, HttpServerResponse } from "effect/uns
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
+import * as SessionFabricReferenceAuthority from "./toolkits/session-fabric-references/authority.ts";
 import * as SessionReferenceAuthority from "./toolkits/session-references/authority.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
@@ -157,13 +158,25 @@ it.effect("initializes OMP against the complete MCP tool registry", () =>
         resolve: () => Effect.die("unused"),
         send: () => Effect.die("unused"),
       });
+      const fabricAuthority = SessionFabricReferenceAuthority.SessionFabricReferenceAuthority.of({
+        search: () => Effect.die("unused"),
+        context: () => Effect.die("unused"),
+        send: () => Effect.die("unused"),
+      });
       const registrationLayer = Layer.mergeAll(
         McpHttpServer.PreviewToolkitRegistrationLive,
         McpHttpServer.SessionReferenceToolkitRegistrationLive,
+        McpHttpServer.SessionFabricReferenceToolkitRegistrationLive,
       ).pipe(
         Layer.provide(PreviewAutomationBroker.layer.pipe(Layer.provide(NodeServices.layer))),
         Layer.provide(
           Layer.succeed(SessionReferenceAuthority.SessionReferenceAuthority, authority),
+        ),
+        Layer.provide(
+          Layer.succeed(
+            SessionFabricReferenceAuthority.SessionFabricReferenceAuthority,
+            fabricAuthority,
+          ),
         ),
       );
       const authMiddleware = HttpRouter.middleware<{

@@ -4,7 +4,7 @@ import {
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
-import { BotIcon, MessagesSquareIcon } from "lucide-react";
+import { BotIcon, CloudIcon, MessagesSquareIcon } from "lucide-react";
 import { memo, useLayoutEffect, useMemo, useRef } from "react";
 
 import { type ComposerSlashCommand, type ComposerTriggerKind } from "../../composer-logic";
@@ -60,6 +60,15 @@ export type ComposerCommandItem =
       worktreePath: string | null;
       label: string;
       description: string;
+    }
+  | {
+      id: string;
+      type: "fabric-session";
+      environmentId: string;
+      threadId: string;
+      worktreePath: null;
+      label: string;
+      description: string;
     };
 
 type ComposerCommandGroup = {
@@ -100,6 +109,7 @@ function groupCommandItems(
       { id: "files", label: "Files", type: "path" },
       { id: "skills", label: "Skills", type: "skill" },
       { id: "sessions", label: "Sessions", type: "session" },
+      { id: "shared-sessions", label: "Shared sessions", type: "fabric-session" },
     ] as const;
     return sections.flatMap((section) => {
       const sectionItems = items.filter((item) => item.type === section.type);
@@ -271,6 +281,9 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
       ) : null}
       {props.item.type === "session" ? (
         <MessagesSquareIcon className="size-4 shrink-0 text-muted-foreground/80" />
+      ) : null}
+      {props.item.type === "fabric-session" ? (
+        <CloudIcon className="size-4 shrink-0 text-muted-foreground/80" />
       ) : null}
       <span className="flex min-w-0 flex-1 items-center gap-2">
         <span className="shrink-0">{props.item.label}</span>

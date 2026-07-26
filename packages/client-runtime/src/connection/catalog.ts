@@ -118,6 +118,7 @@ export type ConnectionRegistration = typeof ConnectionRegistration.Type;
  */
 export const PlatformConnectionRegistration = Schema.Union([
   PrimaryConnectionRegistration,
+  SessionFabricConnectionRegistration,
   BearerConnectionRegistration,
 ]);
 export type PlatformConnectionRegistration = typeof PlatformConnectionRegistration.Type;
