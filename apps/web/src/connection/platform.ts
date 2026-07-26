@@ -43,6 +43,7 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
 
 import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
+import { readRuntimeBasePath } from "../runtimeBasePath";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import {
   readPrimaryEnvironmentTarget,
@@ -465,6 +466,7 @@ const platformConnectionSourceLayer = Layer.effect(
   Effect.gen(function* () {
     const fabricRegistration = sessionFabricRegistrationFromRoute({
       pathname: window.location.pathname,
+      runtimeBasePath: readRuntimeBasePath(),
       relayBaseUrl: configuredSessionFabricRelayUrl(
         import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
       ),
