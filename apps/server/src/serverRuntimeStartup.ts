@@ -37,7 +37,7 @@ import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReape
 import { forkParked } from "./serverActivation.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
-import { resolveAshlerOmpDefaultModel } from "./ashler/OmpModelPolicy.ts";
+import { ashlerOmpModelIsAllowed, resolveAshlerOmpDefaultModel } from "./ashler/OmpModelPolicy.ts";
 import {
   formatHeadlessServeOutput,
   formatHostForUrl,
@@ -178,7 +178,11 @@ export const getAutoBootstrapDefaultModelSelection = (
       provider.availability !== "unavailable" &&
       provider.status !== "error",
   );
-  const model = omp ? resolveAshlerOmpDefaultModel(omp.models) : undefined;
+  const model = omp
+    ? (omp.models.find(
+        (candidate) => candidate.isDefault && ashlerOmpModelIsAllowed(candidate.slug),
+      ) ?? resolveAshlerOmpDefaultModel(omp.models))
+    : undefined;
   return model ? { instanceId: OMP_INSTANCE_ID, model: model.slug } : null;
 };
 

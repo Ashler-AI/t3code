@@ -121,6 +121,33 @@ export function expandOmpSkillReferences(prompt: string): string {
 
 type OmpAcpRuntimeSettings = Pick<OmpSettings, "binaryPath">;
 
+const OMP_AGENT_MODEL_ENV = "OMP_AGENT_MODEL";
+const OMP_AGENT_ALLOWED_MODELS_ENV = "OMP_AGENT_ALLOWED_MODELS";
+const OMP_MODEL_ROUTE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
+
+function configuredOmpModelRoute(
+  environment: NodeJS.ProcessEnv,
+  variable: typeof OMP_AGENT_MODEL_ENV,
+): string | undefined {
+  const configured = environment[variable];
+  if (configured === undefined) return undefined;
+  const route = configured.trim();
+  if (!OMP_MODEL_ROUTE_PATTERN.test(route)) {
+    throw new Error(`${variable} must be a provider/model route.`);
+  }
+  return route;
+}
+
+function configuredOmpAllowedModelRoutes(environment: NodeJS.ProcessEnv): ReadonlyArray<string> {
+  const configured = environment[OMP_AGENT_ALLOWED_MODELS_ENV];
+  if (configured === undefined) return [];
+  const routes = configured.split(",").map((route) => route.trim());
+  if (routes.length === 0 || routes.some((route) => !OMP_MODEL_ROUTE_PATTERN.test(route))) {
+    throw new Error(`${OMP_AGENT_ALLOWED_MODELS_ENV} must be a comma-separated model route list.`);
+  }
+  return [...new Set(routes)];
+}
+
 type OmpConfigOptionSnapshot = {
   readonly configOptions?: ReadonlyArray<EffectAcpSchema.SessionConfigOption> | null;
 };
@@ -139,9 +166,21 @@ export function buildOmpAcpSpawnInput(
   cwd: string,
   environment?: NodeJS.ProcessEnv,
 ): AcpSessionRuntime.AcpSpawnInput {
+  const args = ["acp"];
+  if (environment) {
+    const model = configuredOmpModelRoute(environment, OMP_AGENT_MODEL_ENV);
+    const allowedModels = configuredOmpAllowedModelRoutes(environment);
+    if (model && allowedModels.length > 0 && !allowedModels.includes(model)) {
+      throw new Error(
+        `${OMP_AGENT_MODEL_ENV} must be included in ${OMP_AGENT_ALLOWED_MODELS_ENV}.`,
+      );
+    }
+    if (model) args.push("--model", model);
+    if (allowedModels.length > 0) args.push("--models", allowedModels.join(","));
+  }
   return {
     command: ompSettings?.binaryPath || "omp",
-    args: ["acp"],
+    args,
     cwd,
     ...(environment ? { env: environment } : {}),
   };
