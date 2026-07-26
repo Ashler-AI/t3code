@@ -22,6 +22,14 @@ import {
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
+import * as SessionFabricReferenceAuthority from "./toolkits/session-fabric-references/authority.ts";
+import { SessionFabricReferenceToolkitHandlersLive } from "./toolkits/session-fabric-references/handlers.ts";
+import {
+  SessionFabricContextTool,
+  SessionFabricMessageSendTool,
+  SessionFabricReferenceToolkit,
+  SessionFabricSearchTool,
+} from "./toolkits/session-fabric-references/tools.ts";
 import * as SessionReferenceAuthority from "./toolkits/session-references/authority.ts";
 import { SessionReferenceToolkitHandlersLive } from "./toolkits/session-references/handlers.ts";
 import {
@@ -344,6 +352,153 @@ export const SessionReferenceToolkitRegistrationLive = Layer.effectDiscard(
 const SessionReferenceToolkitRegistrationWithAuthorityLive =
   SessionReferenceToolkitRegistrationLive.pipe(Layer.provide(SessionReferenceAuthority.layer));
 
+const sessionFabricFailure = <E>(
+  operation: "search" | "context" | "send",
+  cause: Cause.Cause<E>,
+) => {
+  if (Cause.hasInterrupts(cause) || cause.reasons.some(Cause.isDieReason)) {
+    return Effect.failCause(cause).pipe(Effect.orDie);
+  }
+  const firstFailure = cause.reasons.find(Cause.isFailReason)?.error;
+  const reason =
+    typeof firstFailure === "object" &&
+    firstFailure !== null &&
+    "_tag" in firstFailure &&
+    firstFailure._tag === "SessionFabricReferenceToolError" &&
+    "reason" in firstFailure &&
+    typeof firstFailure.reason === "string"
+      ? firstFailure.reason
+      : "unknown";
+  return Effect.succeed(
+    new McpSchema.CallToolResult({
+      isError: true,
+      structuredContent: {
+        error: { _tag: "SessionFabricReferenceToolError", operation, reason },
+      },
+      content: [{ type: "text", text: `Session fabric ${operation} failed: ${reason}.` }],
+    }),
+  );
+};
+
+const sessionFabricSuccess = (encodedResult: unknown) =>
+  Effect.succeed(
+    new McpSchema.CallToolResult({
+      isError: false,
+      structuredContent: encodedResult as Record<string, unknown>,
+      content: [{ type: "text", text: JSON.stringify(encodedResult) }],
+    }),
+  );
+
+const registerSessionFabricReferenceTools = Effect.fn(
+  "McpHttpServer.registerSessionFabricReferenceTools",
+)(function* () {
+  const server = yield* McpServer.McpServer;
+  const authority = yield* SessionFabricReferenceAuthority.SessionFabricReferenceAuthority;
+  const built = yield* SessionFabricReferenceToolkit;
+
+  yield* server.addTool({
+    tool: new McpSchema.Tool({
+      name: SessionFabricSearchTool.name,
+      description: Tool.getDescription(SessionFabricSearchTool),
+      inputSchema: Tool.getJsonSchema(SessionFabricSearchTool),
+      annotations: sessionReferenceAnnotations(SessionFabricSearchTool),
+    }),
+    annotations: SessionFabricSearchTool.annotations,
+    handle: (payload) =>
+      Effect.withFiber((fiber) => {
+        const invocation = Context.getUnsafe(
+          fiber.context,
+          McpInvocationContext.McpInvocationContext,
+        );
+        return built.handle("session_fabric_search", payload).pipe(
+          Stream.unwrap,
+          Stream.run(Sink.last()),
+          Effect.flatMap(Effect.fromOption),
+          Effect.provideService(
+            SessionFabricReferenceAuthority.SessionFabricReferenceAuthority,
+            authority,
+          ),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.matchCauseEffect({
+            onFailure: (cause) => sessionFabricFailure("search", cause),
+            onSuccess: ({ encodedResult }) => sessionFabricSuccess(encodedResult),
+          }),
+        );
+      }),
+  });
+
+  yield* server.addTool({
+    tool: new McpSchema.Tool({
+      name: SessionFabricContextTool.name,
+      description: Tool.getDescription(SessionFabricContextTool),
+      inputSchema: Tool.getJsonSchema(SessionFabricContextTool),
+      annotations: sessionReferenceAnnotations(SessionFabricContextTool),
+    }),
+    annotations: SessionFabricContextTool.annotations,
+    handle: (payload) =>
+      Effect.withFiber((fiber) => {
+        const invocation = Context.getUnsafe(
+          fiber.context,
+          McpInvocationContext.McpInvocationContext,
+        );
+        return built.handle("session_fabric_context", payload).pipe(
+          Stream.unwrap,
+          Stream.run(Sink.last()),
+          Effect.flatMap(Effect.fromOption),
+          Effect.provideService(
+            SessionFabricReferenceAuthority.SessionFabricReferenceAuthority,
+            authority,
+          ),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.matchCauseEffect({
+            onFailure: (cause) => sessionFabricFailure("context", cause),
+            onSuccess: ({ encodedResult }) => sessionFabricSuccess(encodedResult),
+          }),
+        );
+      }),
+  });
+
+  yield* server.addTool({
+    tool: new McpSchema.Tool({
+      name: SessionFabricMessageSendTool.name,
+      description: Tool.getDescription(SessionFabricMessageSendTool),
+      inputSchema: Tool.getJsonSchema(SessionFabricMessageSendTool),
+      annotations: sessionReferenceAnnotations(SessionFabricMessageSendTool),
+    }),
+    annotations: SessionFabricMessageSendTool.annotations,
+    handle: (payload) =>
+      Effect.withFiber((fiber) => {
+        const invocation = Context.getUnsafe(
+          fiber.context,
+          McpInvocationContext.McpInvocationContext,
+        );
+        return built.handle("session_fabric_message_send", payload).pipe(
+          Stream.unwrap,
+          Stream.run(Sink.last()),
+          Effect.flatMap(Effect.fromOption),
+          Effect.provideService(
+            SessionFabricReferenceAuthority.SessionFabricReferenceAuthority,
+            authority,
+          ),
+          Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+          Effect.matchCauseEffect({
+            onFailure: (cause) => sessionFabricFailure("send", cause),
+            onSuccess: ({ encodedResult }) => sessionFabricSuccess(encodedResult),
+          }),
+        );
+      }),
+  });
+});
+
+export const SessionFabricReferenceToolkitRegistrationLive = Layer.effectDiscard(
+  registerSessionFabricReferenceTools(),
+).pipe(Layer.provide(SessionFabricReferenceToolkitHandlersLive));
+
+const SessionFabricReferenceToolkitRegistrationWithAuthorityLive =
+  SessionFabricReferenceToolkitRegistrationLive.pipe(
+    Layer.provide(SessionFabricReferenceAuthority.layer),
+  );
+
 const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
@@ -353,4 +508,5 @@ const McpTransportLive = McpServer.layerHttp({
 export const layer = Layer.mergeAll(
   PreviewToolkitRegistrationLive,
   SessionReferenceToolkitRegistrationWithAuthorityLive,
+  SessionFabricReferenceToolkitRegistrationWithAuthorityLive,
 ).pipe(Layer.provideMerge(McpTransportLive));
