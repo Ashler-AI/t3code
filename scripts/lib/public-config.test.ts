@@ -27,6 +27,8 @@ describe("loadRepoEnv", () => {
     expect(env.EXPO_PUBLIC_CLERK_JWT_TEMPLATE).toBeUndefined();
     expect(env.T3CODE_RELAY_URL).toBeUndefined();
     expect(env.VITE_T3CODE_RELAY_URL).toBeUndefined();
+    expect(env.T3CODE_SESSION_FABRIC_RELAY_URL).toBeUndefined();
+    expect(env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL).toBeUndefined();
     expect(env.T3CODE_MOBILE_OTLP_TRACES_URL).toBeUndefined();
     expect(env.T3CODE_MOBILE_OTLP_TRACES_DATASET).toBeUndefined();
     expect(env.T3CODE_MOBILE_OTLP_TRACES_TOKEN).toBeUndefined();
@@ -94,6 +96,7 @@ describe("loadRepoEnv", () => {
       clerkJwtTemplate: "template_legacy",
       clerkCliOAuthClientId: "oauth_canonical",
       relayUrl: "https://legacy.example.test",
+      sessionFabricRelayUrl: undefined,
       mobileOtlpTracesUrl: "https://api.axiom.co/v1/traces",
       mobileOtlpTracesDataset: "mobile-traces",
       mobileOtlpTracesToken: "mobile-token",
@@ -101,6 +104,33 @@ describe("loadRepoEnv", () => {
       relayClientOtlpTracesDataset: undefined,
       relayClientOtlpTracesToken: undefined,
     });
+  });
+
+  it("projects the canonical session fabric Relay URL to the web build alias", () => {
+    expect(
+      loadRepoEnv({
+        baseEnv: {
+          T3CODE_SESSION_FABRIC_RELAY_URL: " https://fabric.example.test/base ",
+        },
+        repoRoot: makeTemporaryDirectory(),
+      }),
+    ).toEqual({
+      T3CODE_SESSION_FABRIC_RELAY_URL: "https://fabric.example.test/base",
+      VITE_T3CODE_SESSION_FABRIC_RELAY_URL: "https://fabric.example.test/base",
+    });
+  });
+
+  it("fails closed for an invalid session fabric Relay URL", () => {
+    expect(
+      resolvePublicConfig({
+        T3CODE_SESSION_FABRIC_RELAY_URL: "file:///tmp/session-fabric",
+      }).sessionFabricRelayUrl,
+    ).toBeUndefined();
+    expect(
+      resolvePublicConfig({
+        T3CODE_SESSION_FABRIC_RELAY_URL: "not a URL",
+      }).sessionFabricRelayUrl,
+    ).toBeUndefined();
   });
 
   it("projects canonical relay client tracing values to web build aliases", () => {

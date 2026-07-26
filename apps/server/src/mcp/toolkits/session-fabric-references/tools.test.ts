@@ -62,11 +62,18 @@ const TestLayer = McpHttpServer.SessionFabricReferenceToolkitRegistrationLive.pi
 it.effect("registers distinct global search/context/send tools with independent capabilities", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
+    const sendTool = server.tools.find(({ tool }) => tool.name === "session_fabric_message_send");
     expect(server.tools.map(({ tool }) => tool.name).toSorted()).toEqual([
       "session_fabric_context",
       "session_fabric_message_send",
       "session_fabric_search",
     ]);
+    expect(sendTool?.tool.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    });
+    expect(sendTool?.tool.description).toContain("executes as a new user turn on the remote");
 
     const search = yield* server
       .callTool({

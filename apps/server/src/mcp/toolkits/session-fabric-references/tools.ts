@@ -62,7 +62,7 @@ export const SessionFabricContextTool = Tool.make("session_fabric_context", {
 
 export const SessionFabricMessageSendTool = Tool.make("session_fabric_message_send", {
   description:
-    "Send a bounded message to the runner that owns a global fabric sessionId. The command remains queued by the fabric until the local or Scaffold runner accepts it.",
+    "Send a bounded message that executes as a new user turn on the remote local or Scaffold runner that owns a global fabric sessionId. The command remains queued by the fabric until that runner accepts it and may cause the remote agent to run tools or modify its environment.",
   parameters: SessionFabricMessageSendInput,
   success: SessionFabricMessageSendResult,
   failure: SessionFabricReferenceAuthority.SessionFabricReferenceToolError,
@@ -70,7 +70,7 @@ export const SessionFabricMessageSendTool = Tool.make("session_fabric_message_se
 })
   .annotate(Tool.Title, "Message shared agent session")
   .annotate(Tool.Readonly, false)
-  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, false);
 
 export const SessionFabricReferenceToolkit = Toolkit.make(

@@ -9,6 +9,7 @@ export interface T3CodePublicConfig {
   readonly clerkJwtTemplate: string | undefined;
   readonly clerkCliOAuthClientId: string | undefined;
   readonly relayUrl: string | undefined;
+  readonly sessionFabricRelayUrl: string | undefined;
   readonly mobileOtlpTracesUrl: string | undefined;
   readonly mobileOtlpTracesDataset: string | undefined;
   readonly mobileOtlpTracesToken: string | undefined;
@@ -62,6 +63,12 @@ export function loadRepoEnv({
       ? {
           T3CODE_RELAY_URL: config.relayUrl,
           VITE_T3CODE_RELAY_URL: config.relayUrl,
+        }
+      : {}),
+    ...(config.sessionFabricRelayUrl
+      ? {
+          T3CODE_SESSION_FABRIC_RELAY_URL: config.sessionFabricRelayUrl,
+          VITE_T3CODE_SESSION_FABRIC_RELAY_URL: config.sessionFabricRelayUrl,
         }
       : {}),
     ...(config.mobileOtlpTracesUrl
@@ -123,6 +130,11 @@ export function resolvePublicConfig(...sources: readonly Environment[]): T3CodeP
       "VITE_CLERK_CLI_OAUTH_CLIENT_ID",
     ),
     relayUrl: firstNonEmpty(sources, "T3CODE_RELAY_URL", "VITE_T3CODE_RELAY_URL"),
+    sessionFabricRelayUrl: firstHttpUrl(
+      sources,
+      "T3CODE_SESSION_FABRIC_RELAY_URL",
+      "VITE_T3CODE_SESSION_FABRIC_RELAY_URL",
+    ),
     mobileOtlpTracesUrl: firstNonEmpty(
       sources,
       "T3CODE_MOBILE_OTLP_TRACES_URL",
@@ -166,6 +178,18 @@ function firstNonEmpty(sources: readonly Environment[], ...names: readonly strin
     }
   }
   return undefined;
+}
+
+function firstHttpUrl(sources: readonly Environment[], ...names: readonly string[]) {
+  const value = firstNonEmpty(sources, ...names);
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readEnvFile(path: string): Record<string, string | undefined> {

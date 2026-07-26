@@ -24,7 +24,10 @@ const scope: McpInvocationContext.McpInvocationScope = {
   expiresAt: Number.MAX_SAFE_INTEGER,
 };
 
-const makeAuthority = (commands: SessionFabricCommand[]) =>
+const makeAuthority = (
+  commands: SessionFabricCommand[],
+  overrides: Partial<SessionFabricGateway.SessionFabricGatewayShape> = {},
+) =>
   make.pipe(
     Effect.provideService(
       SessionFabricGateway.SessionFabricGateway,
@@ -52,6 +55,7 @@ const makeAuthority = (commands: SessionFabricCommand[]) =>
               updatedAt: TEST_NOW,
             };
           }),
+        ...overrides,
       }),
     ),
     Effect.provide(NodeServices.layer),
@@ -101,6 +105,147 @@ describe("SessionFabricReferenceAuthority", () => {
           },
         },
       });
+    }),
+  );
+
+  it.effect("rejects sending to the invoking environment and thread", () =>
+    Effect.gen(function* () {
+      const commands: SessionFabricCommand[] = [];
+      const selfContext = {
+        ...TEST_SESSION_CONTEXT,
+        session: {
+          ...TEST_SESSION_CONTEXT.session,
+          location: {
+            ...TEST_SESSION_CONTEXT.session.location,
+            environmentId: scope.environmentId,
+            threadId: scope.threadId,
+          },
+        },
+        snapshot: {
+          ...TEST_SESSION_CONTEXT.snapshot,
+          session: {
+            ...TEST_SESSION_CONTEXT.snapshot.session,
+            location: {
+              ...TEST_SESSION_CONTEXT.snapshot.session.location,
+              environmentId: scope.environmentId,
+              threadId: scope.threadId,
+            },
+          },
+          thread: {
+            ...TEST_SESSION_CONTEXT.snapshot.thread,
+            thread: {
+              ...TEST_SESSION_CONTEXT.snapshot.thread.thread,
+              id: scope.threadId,
+            },
+          },
+        },
+      };
+      const authority = yield* makeAuthority(commands, {
+        context: () => Effect.succeed(selfContext),
+      });
+
+      const error = yield* authority
+        .send(scope, TEST_SESSION_RECORD.sessionId, "Please continue the fix.")
+        .pipe(Effect.flip);
+
+      expect(error.reason).toBe("self_reference");
+      expect(commands).toEqual([]);
+    }),
+  );
+
+  it.effect("rejects context whose snapshot location does not match its session location", () =>
+    Effect.gen(function* () {
+      const mismatchedLocation = {
+        ...TEST_SESSION_CONTEXT,
+        snapshot: {
+          ...TEST_SESSION_CONTEXT.snapshot,
+          thread: {
+            ...TEST_SESSION_CONTEXT.snapshot.thread,
+            thread: {
+              ...TEST_SESSION_CONTEXT.snapshot.thread.thread,
+              id: ThreadId.make("thread-from-another-location"),
+            },
+          },
+        },
+      };
+      const authority = yield* makeAuthority([], {
+        context: () => Effect.succeed(mismatchedLocation),
+      });
+
+      const error = yield* authority
+        .context(scope, TEST_SESSION_RECORD.sessionId, true, true)
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        reason: "relay_unavailable",
+        sessionId: TEST_SESSION_RECORD.sessionId,
+      });
+    }),
+  );
+
+  it.effect("rejects context whose bundle or snapshot identifies a different session", () =>
+    Effect.gen(function* () {
+      const otherSessionId = SessionFabricSessionId.make("global-session-other");
+      const mismatchedBundle = {
+        ...TEST_SESSION_CONTEXT,
+        session: { ...TEST_SESSION_CONTEXT.session, sessionId: otherSessionId },
+      };
+      const mismatchedSnapshot = {
+        ...TEST_SESSION_CONTEXT,
+        snapshot: {
+          ...TEST_SESSION_CONTEXT.snapshot,
+          session: { ...TEST_SESSION_CONTEXT.snapshot.session, sessionId: otherSessionId },
+        },
+      };
+      const bundleAuthority = yield* makeAuthority([], {
+        context: () => Effect.succeed(mismatchedBundle),
+      });
+      const snapshotAuthority = yield* makeAuthority([], {
+        context: () => Effect.succeed(mismatchedSnapshot),
+      });
+
+      const bundleError = yield* bundleAuthority
+        .context(scope, TEST_SESSION_RECORD.sessionId, true, true)
+        .pipe(Effect.flip);
+      const snapshotError = yield* snapshotAuthority
+        .context(scope, TEST_SESSION_RECORD.sessionId, true, true)
+        .pipe(Effect.flip);
+
+      expect(bundleError).toMatchObject({
+        reason: "relay_unavailable",
+        sessionId: TEST_SESSION_RECORD.sessionId,
+      });
+      expect(snapshotError).toMatchObject({
+        reason: "relay_unavailable",
+        sessionId: TEST_SESSION_RECORD.sessionId,
+      });
+    }),
+  );
+
+  it.effect("rejects a command receipt for a different session", () =>
+    Effect.gen(function* () {
+      const commands: SessionFabricCommand[] = [];
+      const authority = yield* makeAuthority(commands, {
+        submit: ({ command }) =>
+          Effect.succeed({
+            sessionId: SessionFabricSessionId.make("global-session-other"),
+            commandId: command.commandId,
+            status: "accepted",
+            resultSequence: 42,
+            detail: null,
+            updatedAt: TEST_NOW,
+          }),
+      });
+
+      const error = yield* authority
+        .send(scope, TEST_SESSION_RECORD.sessionId, "Please continue the fix.")
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        reason: "dispatch_rejected",
+        sessionId: TEST_SESSION_RECORD.sessionId,
+      });
+      expect(commands).toEqual([]);
     }),
   );
 

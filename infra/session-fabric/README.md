@@ -23,7 +23,11 @@ Worker has the stable name `ashler-session-fabric-proof` and uses its
 `workers.dev` URL; no DNS mutation is required.
 
 After deployment, configure a proof T3 runner with the workflow's `relay_url`
-output as `T3CODE_SESSION_FABRIC_RELAY_URL`. Run the live acceptance check with:
+output as `T3CODE_SESSION_FABRIC_RELAY_URL`. The shared public-config loader
+validates this HTTP(S) URL and projects it to
+`VITE_T3CODE_SESSION_FABRIC_RELAY_URL` for web development and builds. Missing
+or invalid values leave browser route bootstrap and composer session search
+disabled. Run the live acceptance check with:
 
 ```sh
 pnpm --dir infra/session-fabric smoke:scaffold \
