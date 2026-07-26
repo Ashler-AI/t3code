@@ -329,9 +329,9 @@ export const resolveServerConfig = (
     const resourceMonitorPath = bootstrap?.resourceMonitorPath;
     const autoBootstrapProjectFromCwd = Option.getOrElse(
       resolveOptionPrecedence(
+        normalizedFlags.autoBootstrapProjectFromCwd,
         Option.fromUndefinedOr(options?.forceAutoBootstrapProjectFromCwd),
         isHeadlessStartup ? Option.some(false) : Option.none(),
-        normalizedFlags.autoBootstrapProjectFromCwd,
         Option.fromUndefinedOr(env.autoBootstrapProjectFromCwd),
       ),
       () => mode === "web",
