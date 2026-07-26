@@ -71,6 +71,43 @@ describe("buildOmpAcpSpawnInput", () => {
       env: { OMP_CONFIG_DIR: "/tmp/omp-home" },
     });
   });
+
+  it("passes Scaffold model routing through OMP's native ACP CLI flags", () => {
+    expect(
+      buildOmpAcpSpawnInput({ binaryPath: "/opt/omp" }, "/tmp/project", {
+        OMP_AGENT_MODEL: " openai/gpt-5.6-sol ",
+        OMP_AGENT_ALLOWED_MODELS:
+          "openai/gpt-5.6-sol, anthropic/claude-sonnet-5,openai/gpt-5.6-sol",
+      }),
+    ).toMatchObject({
+      args: [
+        "acp",
+        "--model",
+        "openai/gpt-5.6-sol",
+        "--models",
+        "openai/gpt-5.6-sol,anthropic/claude-sonnet-5",
+      ],
+    });
+  });
+
+  it("fails closed on malformed or inconsistent configured model routes", () => {
+    expect(() =>
+      buildOmpAcpSpawnInput(undefined, "/tmp/project", {
+        OMP_AGENT_MODEL: "gpt-5.6-sol",
+      }),
+    ).toThrow("OMP_AGENT_MODEL must be a provider/model route");
+    expect(() =>
+      buildOmpAcpSpawnInput(undefined, "/tmp/project", {
+        OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol,",
+      }),
+    ).toThrow("OMP_AGENT_ALLOWED_MODELS must be a comma-separated model route list");
+    expect(() =>
+      buildOmpAcpSpawnInput(undefined, "/tmp/project", {
+        OMP_AGENT_MODEL: "openai/gpt-5.6-sol",
+        OMP_AGENT_ALLOWED_MODELS: "anthropic/claude-sonnet-5",
+      }),
+    ).toThrow("OMP_AGENT_MODEL must be included in OMP_AGENT_ALLOWED_MODELS");
+  });
 });
 
 describe("OMP config selection", () => {

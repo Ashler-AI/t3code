@@ -49,6 +49,7 @@ interface PackageJson {
   engines: Record<string, string>;
   files: string[];
   dependencies: Record<string, string>;
+  bundleDependencies?: ReadonlyArray<string>;
   overrides?: Record<string, string>;
 }
 
@@ -141,7 +142,13 @@ const assertBuildAssets = Effect.fn("assertBuildAssets")(function* (serverDir: s
 });
 
 const prepareProductionPackageReplacements = Effect.fn("prepareProductionPackageReplacements")(
-  function* (repoRoot: string, serverDir: string, version: string, includeOverrides = true) {
+  function* (
+    repoRoot: string,
+    serverDir: string,
+    version: string,
+    includeOverrides = true,
+    bundleDependencies: ReadonlyArray<string> = [],
+  ) {
     const path = yield* Path.Path;
     const workspaceConfig = yield* readWorkspaceConfig();
     const workspaceCatalog = workspaceConfig.catalog ?? {};
@@ -159,6 +166,7 @@ const prepareProductionPackageReplacements = Effect.fn("prepareProductionPackage
         workspaceCatalog,
         "apps/server",
       ),
+      ...(bundleDependencies.length > 0 ? { bundleDependencies } : {}),
       ...(includeOverrides
         ? {
             overrides: resolveCatalogDependencies(
@@ -396,6 +404,29 @@ const verifyPackedArtifact = Effect.fn("verifyPackedArtifact")(function* (artifa
       shell: hostPlatform === "win32",
     }),
   );
+
+  const installedPackageDir = path.join(installDir, "node_modules", serverPackageJson.name);
+  yield* runCommand(
+    ChildProcess.make(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        [
+          'import { RequestId } from "effect/unstable/rpc/RpcMessage";',
+          'const actual = RequestId("153e751db470c503").toString();',
+          'const expected = BigInt("0x153e751db470c503").toString();',
+          "if (actual !== expected) throw new Error(`Unexpected MCP request id: ${actual}`);",
+        ].join("\n"),
+      ],
+      {
+        cwd: installedPackageDir,
+        stdout: "ignore",
+        stderr: "inherit",
+        shell: false,
+      },
+    ),
+  );
 });
 
 const packCmd = Command.make(
@@ -427,9 +458,17 @@ const packCmd = Command.make(
         serverDir,
         version,
         false,
+        ["effect"],
       );
       yield* withTemporaryPackageStage(serverDir, replacements, (stageDirectory) =>
         Effect.gen(function* () {
+          const bundledEffectSource = yield* fs.realPath(
+            path.join(serverDir, "node_modules", "effect"),
+          );
+          const bundledEffectTarget = path.join(stageDirectory, "node_modules", "effect");
+          yield* fs.makeDirectory(path.dirname(bundledEffectTarget), { recursive: true });
+          yield* fs.copy(bundledEffectSource, bundledEffectTarget);
+
           const packCommand = yield* resolveSpawnCommand("npm", [
             "pack",
             "--silent",
