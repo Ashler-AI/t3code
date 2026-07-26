@@ -20,6 +20,29 @@ describe("session fabric route bootstrap", () => {
     expect(registration?.target.relayBaseUrl).toBe("https://relay.example/fabric/");
   });
 
+  it("creates the same registration beneath a validated Scaffold runtime mount", () => {
+    const registration = sessionFabricRegistrationFromRoute({
+      pathname: "/sessions/ses_scaffold/agent/session-fabric%3Aglobal-session-1/thread-1",
+      runtimeBasePath: "/sessions/ses_scaffold/agent",
+      relayBaseUrl: "https://relay.example/fabric/",
+      clientId: "browser-window-scaffold",
+    });
+
+    expect(registration?.target.environmentId).toBe("session-fabric:global-session-1");
+    expect(registration?.target.sessionId).toBe("global-session-1");
+  });
+
+  it("fails closed when the browser path is outside the supplied runtime mount", () => {
+    expect(
+      sessionFabricRegistrationFromRoute({
+        pathname: "/session-fabric%3Aglobal-session-1/thread-1",
+        runtimeBasePath: "/sessions/ses_scaffold/agent",
+        relayBaseUrl: "https://relay.example/fabric/",
+        clientId: "browser-window-scaffold",
+      }),
+    ).toBeNull();
+  });
+
   it("does not turn an ordinary local route into a fabric connection", () => {
     expect(
       sessionFabricRegistrationFromRoute({
