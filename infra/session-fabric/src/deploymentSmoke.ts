@@ -1,0 +1,317 @@
+// @effect-diagnostics globalFetch:off globalTimers:off globalDate:off - This host-side deployment probe uses bounded native HTTP and WebSocket clients.
+import {
+  SESSION_FABRIC_PROTOCOL_VERSION,
+  SessionFabricClientFrame,
+  SessionFabricSessionId,
+  SessionFabricSnapshot,
+  type SessionFabricClientFrame as SessionFabricClientFrameType,
+  type SessionFabricSnapshot as SessionFabricSnapshotType,
+} from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+
+export const DEPLOYMENT_SMOKE_EMPTY_SESSION_ID = SessionFabricSessionId.make(
+  "deployment-smoke-empty-v1",
+);
+export const DEPLOYMENT_SMOKE_SESSION_ID = SessionFabricSessionId.make("deployment-smoke-proof-v1");
+
+const DEPLOYMENT_SMOKE_RUNNER_ID = "deployment-smoke-runner-v1";
+const DEPLOYMENT_SMOKE_ENVIRONMENT_ID = "deployment-smoke-environment-v1";
+const DEPLOYMENT_SMOKE_PROJECT_ID = "deployment-smoke-project-v1";
+const DEPLOYMENT_SMOKE_THREAD_ID = "deployment-smoke-thread-v1";
+const DEPLOYMENT_SMOKE_RUNNER_GENERATION = 1;
+const DEPLOYMENT_SMOKE_SNAPSHOT_SEQUENCE = 1;
+
+const decodeClientFrame = Schema.decodeUnknownSync(SessionFabricClientFrame);
+const decodeSnapshot = Schema.decodeUnknownSync(SessionFabricSnapshot);
+const encodeClientFrame = Schema.encodeSync(Schema.fromJsonString(SessionFabricClientFrame));
+
+export interface DeploymentSmokeSocket {
+  readonly readyState: number;
+  addEventListener(
+    type: "open" | "error",
+    listener: () => void,
+    options?: { once?: boolean },
+  ): void;
+  removeEventListener(type: "open" | "error", listener: () => void): void;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+}
+
+export interface RunDeploymentSmokeInput {
+  readonly relayUrl: URL;
+  readonly marker: string;
+  readonly timeoutMs: number;
+  readonly fetch: typeof fetch;
+  readonly createWebSocket: (url: URL) => DeploymentSmokeSocket;
+  readonly pollIntervalMs?: number;
+}
+
+export interface DeploymentSmokeResult {
+  readonly marker: string;
+  readonly sessionId: typeof DEPLOYMENT_SMOKE_SESSION_ID;
+  readonly runnerId: string;
+}
+
+function sessionResourceUrl(
+  relayUrl: URL,
+  sessionId: typeof DEPLOYMENT_SMOKE_SESSION_ID,
+  resource: "connect" | "snapshot",
+): URL {
+  const url = new URL(relayUrl);
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/v1/session-fabric/sessions/${encodeURIComponent(sessionId)}/${resource}`;
+  url.search = "";
+  url.hash = "";
+  if (resource === "connect") {
+    if (url.protocol === "https:") url.protocol = "wss:";
+    else if (url.protocol === "http:") url.protocol = "ws:";
+    else throw new Error("The Relay URL must use http or https.");
+  }
+  return url;
+}
+
+const markerTitle = (marker: string): string => `Session fabric deployment smoke ${marker}`;
+
+export function buildDeploymentSmokeFrames(input: {
+  readonly marker: string;
+  readonly now: string;
+}): readonly [SessionFabricClientFrameType, SessionFabricClientFrameType] {
+  if (input.marker.trim().length === 0) throw new Error("The deployment smoke marker is required.");
+  const title = markerTitle(input.marker);
+  const location = {
+    environmentKind: "local",
+    environmentId: DEPLOYMENT_SMOKE_ENVIRONMENT_ID,
+    projectId: DEPLOYMENT_SMOKE_PROJECT_ID,
+    threadId: DEPLOYMENT_SMOKE_THREAD_ID,
+    repositoryRoot: null,
+    worktreePath: null,
+    scaffoldSessionId: null,
+    scaffoldSessionUrl: null,
+  } as const;
+  const snapshot = {
+    session: {
+      sessionId: DEPLOYMENT_SMOKE_SESSION_ID,
+      title,
+      publication: "local_only",
+      runnerState: "online",
+      location,
+      initialPrompt: input.marker,
+      searchableText: title,
+      summary: null,
+      cursor: { eventSequence: 0, snapshotSequence: DEPLOYMENT_SMOKE_SNAPSHOT_SEQUENCE },
+      lastEventAt: null,
+      createdAt: input.now,
+      updatedAt: input.now,
+    },
+    shell: {
+      snapshotSequence: DEPLOYMENT_SMOKE_SNAPSHOT_SEQUENCE,
+      projects: [],
+      threads: [],
+      updatedAt: input.now,
+    },
+    thread: {
+      snapshotSequence: DEPLOYMENT_SMOKE_SNAPSHOT_SEQUENCE,
+      thread: {
+        id: DEPLOYMENT_SMOKE_THREAD_ID,
+        projectId: DEPLOYMENT_SMOKE_PROJECT_ID,
+        title,
+        modelSelection: {
+          instanceId: "deployment-smoke-provider-v1",
+          model: "deployment-smoke-model-v1",
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: "deployment-smoke",
+        worktreePath: null,
+        latestTurn: null,
+        createdAt: input.now,
+        updatedAt: input.now,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        deletedAt: null,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+        session: null,
+      },
+    },
+    compactedThroughEventSequence: 0,
+  };
+
+  return [
+    decodeClientFrame({
+      type: "runner.hello",
+      hello: {
+        protocolVersion: SESSION_FABRIC_PROTOCOL_VERSION,
+        sessionId: DEPLOYMENT_SMOKE_SESSION_ID,
+        runnerId: DEPLOYMENT_SMOKE_RUNNER_ID,
+        runnerGeneration: DEPLOYMENT_SMOKE_RUNNER_GENERATION,
+        location,
+        publication: "local_only",
+        lastCommittedEventSequence: 0,
+        connectedAt: input.now,
+      },
+    }),
+    decodeClientFrame({
+      type: "session.publish-snapshot",
+      published: {
+        sessionId: DEPLOYMENT_SMOKE_SESSION_ID,
+        runnerId: DEPLOYMENT_SMOKE_RUNNER_ID,
+        runnerGeneration: DEPLOYMENT_SMOKE_RUNNER_GENERATION,
+        snapshot,
+      },
+    }),
+  ];
+}
+
+export function verifyDeploymentSmokeSnapshot(
+  value: unknown,
+  marker: string,
+): SessionFabricSnapshotType {
+  const snapshot = decodeSnapshot(value);
+  if (!matchesDeploymentSmokeSnapshot(snapshot, marker)) {
+    throw new Error(
+      "The deployment smoke snapshot did not match the published marker and identity.",
+    );
+  }
+  return snapshot;
+}
+
+function matchesDeploymentSmokeSnapshot(
+  snapshot: SessionFabricSnapshotType,
+  marker: string,
+): boolean {
+  return (
+    snapshot.session.sessionId === DEPLOYMENT_SMOKE_SESSION_ID &&
+    snapshot.session.title === markerTitle(marker) &&
+    snapshot.session.initialPrompt === marker &&
+    snapshot.session.publication === "local_only" &&
+    snapshot.session.location.environmentKind === "local" &&
+    snapshot.session.location.environmentId === DEPLOYMENT_SMOKE_ENVIRONMENT_ID &&
+    snapshot.session.location.projectId === DEPLOYMENT_SMOKE_PROJECT_ID &&
+    snapshot.session.location.threadId === DEPLOYMENT_SMOKE_THREAD_ID &&
+    snapshot.thread.thread.id === DEPLOYMENT_SMOKE_THREAD_ID &&
+    snapshot.thread.thread.projectId === DEPLOYMENT_SMOKE_PROJECT_ID
+  );
+}
+
+const remainingMs = (deadline: number): number => Math.max(0, deadline - Date.now());
+
+async function fetchBeforeDeadline(
+  fetchClient: typeof fetch,
+  url: URL,
+  deadline: number,
+): Promise<Response> {
+  const timeoutMs = remainingMs(deadline);
+  if (timeoutMs === 0) throw new Error("The session fabric deployment smoke timed out.");
+  const signal = AbortSignal.timeout(timeoutMs);
+  const request = fetchClient(url, {
+    headers: { "cache-control": "no-cache" },
+    signal,
+  });
+  const timeout = new Promise<never>((_, reject) => {
+    signal.addEventListener(
+      "abort",
+      () => reject(new Error("The session fabric deployment smoke timed out.")),
+      { once: true },
+    );
+  });
+  return await Promise.race([request, timeout]);
+}
+
+async function openSocket(socket: DeploymentSmokeSocket, deadline: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timeoutMs = remainingMs(deadline);
+    if (timeoutMs === 0) {
+      reject(new Error("The session fabric deployment smoke timed out."));
+      return;
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("error", onError);
+    };
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("The session fabric deployment smoke WebSocket failed to connect."));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("The session fabric deployment smoke timed out opening WebSocket."));
+    }, timeoutMs);
+    socket.addEventListener("open", onOpen, { once: true });
+    socket.addEventListener("error", onError, { once: true });
+  });
+}
+
+async function waitForPoll(deadline: number, pollIntervalMs: number): Promise<void> {
+  const delayMs = Math.min(pollIntervalMs, remainingMs(deadline));
+  if (delayMs === 0) throw new Error("The session fabric deployment smoke timed out.");
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+export async function runDeploymentSmoke(
+  input: RunDeploymentSmokeInput,
+): Promise<DeploymentSmokeResult> {
+  if (!Number.isFinite(input.timeoutMs) || input.timeoutMs <= 0) {
+    throw new Error("The deployment smoke timeout must be a positive number of milliseconds.");
+  }
+  const pollIntervalMs = input.pollIntervalMs ?? 250;
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw new Error("The deployment smoke poll interval must be positive.");
+  }
+  const deadline = Date.now() + input.timeoutMs;
+  const emptySnapshotUrl = sessionResourceUrl(
+    input.relayUrl,
+    DEPLOYMENT_SMOKE_EMPTY_SESSION_ID,
+    "snapshot",
+  );
+  const emptyResponse = await fetchBeforeDeadline(input.fetch, emptySnapshotUrl, deadline);
+  if (emptyResponse.status !== 404) {
+    throw new Error(
+      `The stable empty coordinator returned status ${emptyResponse.status}, not 404.`,
+    );
+  }
+
+  const frames = buildDeploymentSmokeFrames({
+    marker: input.marker,
+    now: new Date().toISOString(),
+  });
+  const socket = input.createWebSocket(
+    sessionResourceUrl(input.relayUrl, DEPLOYMENT_SMOKE_SESSION_ID, "connect"),
+  );
+  try {
+    await openSocket(socket, deadline);
+    for (const frame of frames) socket.send(encodeClientFrame(frame));
+
+    const snapshotUrl = sessionResourceUrl(input.relayUrl, DEPLOYMENT_SMOKE_SESSION_ID, "snapshot");
+    while (true) {
+      const response = await fetchBeforeDeadline(input.fetch, snapshotUrl, deadline);
+      if (response.status === 200) {
+        const snapshot = decodeSnapshot(await response.json());
+        if (matchesDeploymentSmokeSnapshot(snapshot, input.marker)) {
+          return {
+            marker: input.marker,
+            sessionId: DEPLOYMENT_SMOKE_SESSION_ID,
+            runnerId: DEPLOYMENT_SMOKE_RUNNER_ID,
+          };
+        }
+        await waitForPoll(deadline, pollIntervalMs);
+        continue;
+      }
+      if (response.status !== 404) {
+        throw new Error(
+          `The deployment smoke snapshot returned unexpected status ${response.status}.`,
+        );
+      }
+      await waitForPoll(deadline, pollIntervalMs);
+    }
+  } finally {
+    socket.close(1000, "deployment smoke complete");
+  }
+}

@@ -631,7 +631,11 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         alarm: () => updateDirectory,
         fetch: Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
-          const url = new URL(request.url);
+          // Durable Object fetch forwarding may preserve only the relative request
+          // target in local runtimes, even when the outer Worker received an
+          // absolute URL. Accept both forms so WebSocket upgrades work in dev and
+          // production.
+          const url = new URL(request.url, "http://session-fabric.local");
           const sessionId = pathSessionId(url);
           if (sessionId === null) {
             return HttpServerResponse.text("Not found", { status: 404 });
