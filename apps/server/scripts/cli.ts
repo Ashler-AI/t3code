@@ -53,6 +53,15 @@ interface PackageJson {
   overrides?: Record<string, string>;
 }
 
+const PACKED_EFFECT_RUNTIME_DEPENDENCIES = [
+  "effect",
+  "@effect/platform-node",
+  "@effect/platform-node-shared",
+  "mime",
+  "undici",
+  "ws",
+] as const;
+
 const PackageJsonPrettyJson = fromJsonStringPretty(Schema.Unknown);
 const encodePackageJson = Schema.encodeEffect(PackageJsonPrettyJson);
 const VerifyInstallPackageJson = Schema.Struct({ private: Schema.Literal(true) });
@@ -427,6 +436,18 @@ const verifyPackedArtifact = Effect.fn("verifyPackedArtifact")(function* (artifa
       },
     ),
   );
+
+  const mcpSmokeScript = yield* fs.readFileString(
+    path.join(yield* RepoRoot, "apps/server/scripts/packedArtifactMcpSmoke.mjs"),
+  );
+  yield* runCommand(
+    ChildProcess.make(process.execPath, ["--input-type=module", "--eval", mcpSmokeScript], {
+      cwd: installedPackageDir,
+      stdout: "ignore",
+      stderr: "inherit",
+      shell: false,
+    }),
+  );
 });
 
 const packCmd = Command.make(
@@ -458,16 +479,21 @@ const packCmd = Command.make(
         serverDir,
         version,
         false,
-        ["effect"],
+        PACKED_EFFECT_RUNTIME_DEPENDENCIES,
       );
       yield* withTemporaryPackageStage(serverDir, replacements, (stageDirectory) =>
         Effect.gen(function* () {
-          const bundledEffectSource = yield* fs.realPath(
-            path.join(serverDir, "node_modules", "effect"),
-          );
-          const bundledEffectTarget = path.join(stageDirectory, "node_modules", "effect");
-          yield* fs.makeDirectory(path.dirname(bundledEffectTarget), { recursive: true });
-          yield* fs.copy(bundledEffectSource, bundledEffectTarget);
+          for (const dependency of PACKED_EFFECT_RUNTIME_DEPENDENCIES) {
+            const serverDependencyPath = path.join(serverDir, "node_modules", dependency);
+            const bundledDependencySource = yield* fs.realPath(
+              (yield* fs.exists(serverDependencyPath))
+                ? serverDependencyPath
+                : path.join(repoRoot, "node_modules/.pnpm/node_modules", dependency),
+            );
+            const bundledDependencyTarget = path.join(stageDirectory, "node_modules", dependency);
+            yield* fs.makeDirectory(path.dirname(bundledDependencyTarget), { recursive: true });
+            yield* fs.copy(bundledDependencySource, bundledDependencyTarget);
+          }
 
           const packCommand = yield* resolveSpawnCommand("npm", [
             "pack",
