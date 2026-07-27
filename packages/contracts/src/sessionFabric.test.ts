@@ -5,6 +5,7 @@ import { CommandId, EnvironmentId, ProjectId, ThreadId } from "./baseSchemas.ts"
 import {
   SESSION_FABRIC_PROTOCOL_VERSION,
   SessionFabricClientFrame,
+  SessionFabricCapabilityClaims,
   SessionFabricClientId,
   SessionFabricCommand,
   SessionFabricCommandReceipt,
@@ -14,9 +15,16 @@ import {
   SessionFabricSessionId,
 } from "./sessionFabric.ts";
 
+const decodeRunnerHello = Schema.decodeUnknownSync(SessionFabricRunnerHello);
+const decodeCapabilityClaims = Schema.decodeUnknownSync(SessionFabricCapabilityClaims);
+const decodeClientFrame = Schema.decodeUnknownSync(SessionFabricClientFrame);
+const decodeSearchRequest = Schema.decodeUnknownSync(SessionFabricSearchRequest);
+const decodeCommandReceipt = Schema.decodeUnknownSync(SessionFabricCommandReceipt);
+const decodeCommand = Schema.decodeUnknownSync(SessionFabricCommand);
+
 describe("session fabric contracts", () => {
   it("keeps global identity independent from the current execution location", () => {
-    const hello = Schema.decodeUnknownSync(SessionFabricRunnerHello)({
+    const hello = decodeRunnerHello({
       protocolVersion: SESSION_FABRIC_PROTOCOL_VERSION,
       sessionId: "global-session-1",
       runnerId: "runner-1",
@@ -30,6 +38,7 @@ describe("session fabric contracts", () => {
         worktreePath: null,
         scaffoldSessionId: "ses_123",
         scaffoldSessionUrl: "https://scaffold.example/ses_123",
+        scaffoldLifecycleEpoch: 7,
       },
       publication: "public",
       lastCommittedEventSequence: 41,
@@ -41,10 +50,46 @@ describe("session fabric contracts", () => {
     expect(hello.location.environmentId).toBe(EnvironmentId.make("scaffold-environment-2"));
     expect(hello.location.projectId).toBe(ProjectId.make("project-1"));
     expect(hello.location.threadId).toBe(ThreadId.make("thread-9"));
+    expect(hello.location.scaffoldLifecycleEpoch).toBe(7);
+  });
+
+  it("keeps global viewer authority separate from exact controller and runner bindings", () => {
+    const decode = decodeCapabilityClaims;
+    expect(
+      decode({
+        v: 1,
+        iss: "https://scaffold.example",
+        aud: "ashler-session-fabric",
+        sub: "user-1",
+        jti: "viewer-1",
+        iat: 100,
+        nbf: 100,
+        exp: 200,
+        role: "viewer",
+        actorId: "user-1",
+        scopes: ["directory:read", "session:read"],
+      }).role,
+    ).toBe("viewer");
+    expect(() =>
+      decode({
+        v: 1,
+        iss: "https://scaffold.example",
+        aud: "ashler-session-fabric",
+        sub: "user-1",
+        jti: "viewer-1",
+        iat: 100,
+        nbf: 100,
+        exp: 200,
+        role: "viewer",
+        actorId: "user-1",
+        scopes: ["directory:read", "session:read"],
+        fabricSessionId: "must-not-bind-viewers",
+      }),
+    ).toThrow();
   });
 
   it("carries the original idempotent orchestration command", () => {
-    const frame = Schema.decodeUnknownSync(SessionFabricClientFrame)({
+    const frame = decodeClientFrame({
       type: "command.submit",
       command: {
         sessionId: "global-session-1",
@@ -68,13 +113,11 @@ describe("session fabric contracts", () => {
   });
 
   it("rejects invalid semantic search limits", () => {
-    expect(() =>
-      Schema.decodeUnknownSync(SessionFabricSearchRequest)({ query: "harness", limit: 51 }),
-    ).toThrow();
+    expect(() => decodeSearchRequest({ query: "harness", limit: 51 })).toThrow();
   });
 
   it("requires accepted receipts to preserve their original result sequence", () => {
-    const decode = Schema.decodeUnknownSync(SessionFabricCommandReceipt);
+    const decode = decodeCommandReceipt;
     expect(
       decode({
         sessionId: "global-session-1",
@@ -111,7 +154,7 @@ describe("session fabric contracts", () => {
 
   it("rejects unrecognized runner payloads before they reach the stream authority", () => {
     expect(() =>
-      Schema.decodeUnknownSync(SessionFabricCommand)({
+      decodeCommand({
         sessionId: "global-session-1",
         commandId: "command-1",
         clientId: "client-2",
@@ -125,7 +168,7 @@ describe("session fabric contracts", () => {
   });
 
   it("accepts heavy code context as a runner-only publication frame", () => {
-    const frame = Schema.decodeUnknownSync(SessionFabricClientFrame)({
+    const frame = decodeClientFrame({
       type: "session.publish-context",
       published: {
         sessionId: "global-session-1",

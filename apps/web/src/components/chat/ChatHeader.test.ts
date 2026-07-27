@@ -71,11 +71,14 @@ describe("OMP account assignment presentation", () => {
     });
   });
 
-  it("explains automatic quota failover without exposing raw provider details", () => {
+  it.each([
+    ["quota-exhausted", "Switched accounts because the previous account reached its quota."],
+    ["account-unavailable", "Switched accounts because the previous account became unavailable."],
+  ] as const)("explains %s failover without exposing raw provider details", (reason, detail) => {
     const presentation = getOmpAccountAssignmentPresentation({
       threadId: ThreadId.make("thread-visible"),
       automatic: true,
-      reassignmentReason: "quota-exhausted",
+      reassignmentReason: reason,
       account: {
         accountRef: OmpAccountRef.make("opaque-account-ref"),
         provider: "openai-codex",
@@ -89,10 +92,31 @@ describe("OMP account assignment presentation", () => {
 
     expect(presentation).toEqual({
       label: "ChatGPT · zh***er@gmail.com",
-      detail: "Automatically reassigned because another account exhausted its quota.",
+      detail,
     });
     expect(JSON.stringify(presentation)).not.toContain("thread-visible");
     expect(JSON.stringify(presentation)).not.toContain("opaque-account-ref");
+  });
+
+  it("keeps a sticky assignment visible when no reassignment reason is present", () => {
+    expect(
+      getOmpAccountAssignmentPresentation({
+        threadId: ThreadId.make("thread-sticky"),
+        automatic: true,
+        account: {
+          accountRef: OmpAccountRef.make("opaque-sticky-ref"),
+          provider: "anthropic-claude",
+          authKind: "oauth",
+          displayName: "Claude Max",
+          maskedEmail: "cz***en@ashler.ai",
+          state: "available",
+          managed: false,
+        },
+      }),
+    ).toEqual({
+      label: "Claude · cz***en@ashler.ai",
+      detail: "Assigned to this session.",
+    });
   });
 
   it("hides unassigned sessions", () => {

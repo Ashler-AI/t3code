@@ -6,7 +6,7 @@ import * as Fiber from "effect/Fiber";
 import * as Metric from "effect/Metric";
 import * as TestClock from "effect/testing/TestClock";
 
-import { withMetrics } from "./Metrics.ts";
+import { recordSessionFabricRunnerState, withMetrics } from "./Metrics.ts";
 
 const hasMetricSnapshot = (
   snapshots: ReadonlyArray<Metric.Metric.Snapshot>,
@@ -32,6 +32,25 @@ const findHistogramSnapshot = (
   );
 
 describe("withMetrics", () => {
+  it.effect("records bounded session-fabric runner state attributes", () =>
+    Effect.gen(function* () {
+      yield* recordSessionFabricRunnerState("connected", {
+        authMode: "required",
+        environmentKind: "scaffold",
+      });
+
+      const snapshots = yield* Metric.snapshot;
+      assert.equal(
+        hasMetricSnapshot(snapshots, "t3_session_fabric_runner_state_transitions_total", {
+          state: "connected",
+          authMode: "required",
+          environmentKind: "scaffold",
+        }),
+        true,
+      );
+    }),
+  );
+
   it.effect("supports pipe-style usage", () =>
     Effect.gen(function* () {
       const counter = Metric.counter("with_metrics_pipe_total");

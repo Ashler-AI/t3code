@@ -158,6 +158,39 @@ describe("Ashler command palette root", () => {
     expect(getCommandPaletteInputPlaceholder("root")).toBe("Search commands...");
   });
 
+  it("adds an eligible copy command to the sessions group", () => {
+    const newSessionItem: CommandPaletteSubmenuItem = {
+      kind: "submenu",
+      value: "action:new-session",
+      searchTerms: ["new session"],
+      title: "New Session",
+      icon: null,
+      addonIcon: null,
+      groups: [],
+    };
+    const copySessionItem: CommandPaletteSubmenuItem = {
+      kind: "submenu",
+      value: "action:copy-to-scaffold",
+      searchTerms: ["copy to scaffold"],
+      title: "Copy to Scaffold",
+      icon: null,
+      addonIcon: null,
+      groups: [],
+    };
+
+    const groups = buildAshlerRootGroups({
+      newSessionItem,
+      copySessionItem,
+      accountItems: [],
+      planUsageItems: [],
+    });
+
+    expect(groups[0]?.items.map((item) => item.value)).toEqual([
+      "action:new-session",
+      "action:copy-to-scaffold",
+    ]);
+  });
+
   it("waits for cached usage before starting the synchronous refresh", () => {
     expect(shouldRefreshOmpOverviewOnOpen({ cacheHydrated: false, hasEnvironment: true })).toBe(
       false,

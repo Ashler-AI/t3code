@@ -20,7 +20,6 @@ export interface ScaffoldSessionUiEntry {
   readonly deployment: ScaffoldDeployment;
   readonly actionId: string;
   readonly phase: ScaffoldSessionUiPhase;
-  readonly queuedSend: boolean;
   readonly environmentId: EnvironmentId | null;
   readonly sessionId: string | null;
   readonly lifecycleEpoch: number;
@@ -34,13 +33,11 @@ interface ScaffoldSessionUiState {
   begin: (
     entry: Omit<
       ScaffoldSessionUiEntry,
-      "phase" | "queuedSend" | "environmentId" | "lifecycleEpoch" | "links" | "error"
+      "phase" | "environmentId" | "lifecycleEpoch" | "links" | "error"
     >,
   ) => void;
   connected: (draftId: DraftId, binding: ScaffoldEnvironmentBinding) => void;
   fail: (draftId: DraftId, error: string) => void;
-  queueSend: (draftId: DraftId) => void;
-  clearQueuedSend: (draftId: DraftId) => void;
   setPhase: (draftId: DraftId, phase: ScaffoldSessionUiPhase) => void;
   remove: (draftId: DraftId) => void;
 }
@@ -60,7 +57,6 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
             [entry.draftId]: {
               ...entry,
               phase: "creating",
-              queuedSend: false,
               environmentId: null,
               lifecycleEpoch: 0,
               links: null,
@@ -96,28 +92,6 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
             entriesByDraftId: {
               ...state.entriesByDraftId,
               [draftId]: { ...current, phase: "failed", error },
-            },
-          };
-        }),
-      queueSend: (draftId) =>
-        set((state) => {
-          const current = state.entriesByDraftId[draftId];
-          if (!current || current.queuedSend) return state;
-          return {
-            entriesByDraftId: {
-              ...state.entriesByDraftId,
-              [draftId]: { ...current, queuedSend: true },
-            },
-          };
-        }),
-      clearQueuedSend: (draftId) =>
-        set((state) => {
-          const current = state.entriesByDraftId[draftId];
-          if (!current || !current.queuedSend) return state;
-          return {
-            entriesByDraftId: {
-              ...state.entriesByDraftId,
-              [draftId]: { ...current, queuedSend: false },
             },
           };
         }),

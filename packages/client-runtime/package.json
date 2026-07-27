@@ -47,6 +47,10 @@
       "types": "./src/session-source/index.ts",
       "default": "./src/session-source/index.ts"
     },
+    "./session-transfer": {
+      "types": "./src/sessionTransfer/index.ts",
+      "default": "./src/sessionTransfer/index.ts"
+    },
     "./state/auth": {
       "types": "./src/state/auth.ts",
       "default": "./src/state/auth.ts"

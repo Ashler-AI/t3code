@@ -55,11 +55,25 @@ interface PackageJson {
 
 const PACKED_EFFECT_RUNTIME_DEPENDENCIES = [
   "effect",
+  "@standard-schema/spec",
+  "fast-check",
+  "find-my-way-ts",
+  "ini",
+  "kubernetes-types",
+  "msgpackr",
+  "multipasta",
+  "toml",
+  "uuid",
+  "yaml",
   "@effect/platform-node",
-  "@effect/platform-node-shared",
   "mime",
   "undici",
+  "@effect/platform-node-shared",
+  "@types/ws",
   "ws",
+  "pure-rand",
+  "@types/node",
+  "undici-types",
 ] as const;
 
 const PackageJsonPrettyJson = fromJsonStringPretty(Schema.Unknown);
@@ -385,6 +399,10 @@ const verifyPackedArtifact = Effect.fn("verifyPackedArtifact")(function* (artifa
     "--no-audit",
     "--no-fund",
     "--no-save",
+    // Hoisting can accidentally satisfy an incomplete bundled dependency
+    // island from an unrelated top-level package. Nested installation proves
+    // the packed Effect runtime is closed under its production dependencies.
+    "--install-strategy=nested",
     artifactPath,
   ]);
   yield* runCommand(

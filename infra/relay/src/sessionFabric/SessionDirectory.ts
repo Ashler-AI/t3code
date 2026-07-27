@@ -18,6 +18,10 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
+import {
+  isPublicScaffoldSessionRecord,
+  isPublicScaffoldSnapshot,
+} from "@t3tools/shared/sessionFabricCapability";
 
 import { rankSessionDirectoryEntries } from "./SessionDirectoryModel.ts";
 
@@ -43,6 +47,7 @@ const SessionRecordJson = Schema.fromJsonString(SessionFabricSessionRecordSchema
 const EmbeddingJson = Schema.fromJsonString(Schema.Array(Schema.Number));
 const encodeSessionRecord = Schema.encodeSync(SessionRecordJson);
 const decodeSessionRecord = Schema.decodeUnknownEffect(SessionRecordJson);
+const decodeSnapshot = Schema.decodeUnknownEffect(SessionFabricSnapshotSchema);
 const encodeEmbedding = Schema.encodeSync(EmbeddingJson);
 const decodeEmbedding = Schema.decodeUnknownEffect(EmbeddingJson);
 
@@ -106,7 +111,11 @@ export default class SessionDirectory extends Cloudflare.DurableObjectNamespace<
           }).pipe(Effect.option),
         ).pipe(
           Effect.map((entries) =>
-            entries.flatMap((entry) => (Option.isSome(entry) ? [entry.value] : [])),
+            entries.flatMap((entry) =>
+              Option.isSome(entry) && isPublicScaffoldSessionRecord(entry.value.session)
+                ? [entry.value]
+                : [],
+            ),
           ),
         );
       });
@@ -114,8 +123,8 @@ export default class SessionDirectory extends Cloudflare.DurableObjectNamespace<
       const upsert = Effect.fn("session_fabric_directory.upsert")(function* (
         snapshot: SessionFabricSnapshot,
       ) {
-        const validated = yield* Schema.decodeUnknownEffect(SessionFabricSnapshotSchema)(snapshot);
-        if (validated.session.publication !== "public") {
+        const validated = yield* decodeSnapshot(snapshot);
+        if (!isPublicScaffoldSnapshot(validated)) {
           yield* sql
             .exec("DELETE FROM sessions WHERE session_id = ?", validated.session.sessionId)
             .pipe(Effect.asVoid);

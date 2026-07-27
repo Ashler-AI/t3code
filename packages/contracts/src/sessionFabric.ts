@@ -18,6 +18,10 @@ import {
 } from "./orchestration.ts";
 
 export const SESSION_FABRIC_PROTOCOL_VERSION = 1 as const;
+export const SESSION_FABRIC_CAPABILITY_VERSION = 1 as const;
+export const SESSION_FABRIC_CAPABILITY_TYP = "ashler-session-fabric-capability+jwt" as const;
+export const SESSION_FABRIC_WS_PROTOCOL = "t3.session-fabric.v1" as const;
+export const SESSION_FABRIC_WS_CAPABILITY_PREFIX = "t3.session-fabric.capability." as const;
 
 const makeId = <Brand extends string>(brand: Brand) =>
   TrimmedNonEmptyString.pipe(Schema.brand(brand));
@@ -67,8 +71,102 @@ export const SessionFabricExecutionLocation = Schema.Struct({
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   scaffoldSessionId: Schema.NullOr(TrimmedNonEmptyString),
   scaffoldSessionUrl: Schema.NullOr(TrimmedNonEmptyString),
+  scaffoldLifecycleEpoch: Schema.optional(Schema.NullOr(NonNegativeInt)),
 });
 export type SessionFabricExecutionLocation = typeof SessionFabricExecutionLocation.Type;
+
+export const SessionFabricCapabilityScope = Schema.Literals([
+  "directory:read",
+  "session:read",
+  "session:command",
+  "session:publish",
+  "session:execute",
+]);
+export type SessionFabricCapabilityScope = typeof SessionFabricCapabilityScope.Type;
+
+export const SessionFabricCapabilityRole = Schema.Literals([
+  "viewer",
+  "controller",
+  "runner",
+  "tombstone",
+]);
+export type SessionFabricCapabilityRole = typeof SessionFabricCapabilityRole.Type;
+
+const SessionFabricCapabilityBaseClaims = {
+  v: Schema.Literal(SESSION_FABRIC_CAPABILITY_VERSION),
+  iss: TrimmedNonEmptyString,
+  aud: TrimmedNonEmptyString,
+  sub: TrimmedNonEmptyString,
+  jti: TrimmedNonEmptyString,
+  iat: NonNegativeInt,
+  nbf: NonNegativeInt,
+  exp: NonNegativeInt,
+} as const;
+
+export const SessionFabricViewerCapabilityClaims = Schema.Struct({
+  ...SessionFabricCapabilityBaseClaims,
+  role: Schema.Literal("viewer"),
+  actorId: TrimmedNonEmptyString,
+  scopes: Schema.Tuple([Schema.Literal("directory:read"), Schema.Literal("session:read")]),
+});
+export type SessionFabricViewerCapabilityClaims = typeof SessionFabricViewerCapabilityClaims.Type;
+
+export const SessionFabricControllerCapabilityClaims = Schema.Struct({
+  ...SessionFabricCapabilityBaseClaims,
+  role: Schema.Literal("controller"),
+  actorId: TrimmedNonEmptyString,
+  scopes: Schema.Tuple([Schema.Literal("session:read"), Schema.Literal("session:command")]),
+  fabricSessionId: SessionFabricSessionId,
+  scaffoldSessionId: TrimmedNonEmptyString,
+  scaffoldLifecycleEpoch: NonNegativeInt,
+});
+export type SessionFabricControllerCapabilityClaims =
+  typeof SessionFabricControllerCapabilityClaims.Type;
+
+export const SessionFabricRunnerCapabilityClaims = Schema.Struct({
+  ...SessionFabricCapabilityBaseClaims,
+  role: Schema.Literal("runner"),
+  runnerId: Schema.optional(TrimmedNonEmptyString),
+  scopes: Schema.Tuple([Schema.Literal("session:publish"), Schema.Literal("session:execute")]),
+  scaffoldSessionId: TrimmedNonEmptyString,
+  scaffoldLifecycleEpoch: NonNegativeInt,
+});
+export type SessionFabricRunnerCapabilityClaims = typeof SessionFabricRunnerCapabilityClaims.Type;
+
+export const SessionFabricTombstoneCapabilityClaims = Schema.Struct({
+  ...SessionFabricCapabilityBaseClaims,
+  role: Schema.Literal("tombstone"),
+  scopes: Schema.Tuple([]),
+  scaffoldSessionId: TrimmedNonEmptyString,
+  scaffoldLifecycleEpoch: NonNegativeInt,
+});
+export type SessionFabricTombstoneCapabilityClaims =
+  typeof SessionFabricTombstoneCapabilityClaims.Type;
+
+export const SessionFabricCapabilityClaims = Schema.Union([
+  SessionFabricViewerCapabilityClaims,
+  SessionFabricControllerCapabilityClaims,
+  SessionFabricRunnerCapabilityClaims,
+  SessionFabricTombstoneCapabilityClaims,
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type SessionFabricCapabilityClaims = typeof SessionFabricCapabilityClaims.Type;
+
+export const SessionFabricCapabilityGrant = Schema.Struct({
+  capability: TrimmedNonEmptyString,
+  tokenType: Schema.Literal("Bearer"),
+  role: SessionFabricCapabilityRole,
+  scopes: Schema.Array(SessionFabricCapabilityScope),
+  expiresAt: IsoDateTime,
+  issuer: TrimmedNonEmptyString,
+  audience: TrimmedNonEmptyString,
+  keyId: TrimmedNonEmptyString,
+  bindings: Schema.Struct({
+    fabricSessionId: Schema.optional(SessionFabricSessionId),
+    scaffoldSessionId: Schema.optional(TrimmedNonEmptyString),
+    scaffoldLifecycleEpoch: Schema.optional(NonNegativeInt),
+  }),
+});
+export type SessionFabricCapabilityGrant = typeof SessionFabricCapabilityGrant.Type;
 
 export const SessionFabricSessionRecord = Schema.Struct({
   sessionId: SessionFabricSessionId,

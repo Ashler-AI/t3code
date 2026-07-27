@@ -400,11 +400,16 @@ export function buildRootGroups(input: {
 
 export function buildAshlerRootGroups(input: {
   newSessionItem: CommandPaletteSubmenuItem;
+  copySessionItem?: CommandPaletteSubmenuItem;
   accountItems: ReadonlyArray<CommandPaletteActionItem>;
   planUsageItems: ReadonlyArray<CommandPaletteActionItem>;
 }): CommandPaletteGroup[] {
   return [
-    { value: "sessions", label: "Sessions", items: [input.newSessionItem] },
+    {
+      value: "sessions",
+      label: "Sessions",
+      items: [input.newSessionItem, ...(input.copySessionItem ? [input.copySessionItem] : [])],
+    },
     ...(input.accountItems.length > 0
       ? [{ value: "omp-accounts", label: "Accounts", items: input.accountItems }]
       : []),

@@ -26,6 +26,10 @@ import { fetchRemoteEnvironmentDescriptor } from "@t3tools/client-runtime/enviro
 import { managedRelayAccountChanges, managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { EnvironmentRpcRequestObserver } from "@t3tools/client-runtime/rpc";
 import {
+  installDefaultSessionFabricAuthorization,
+  makeRuntimeSessionFabricAuthorization,
+} from "@t3tools/client-runtime/session-source";
+import {
   AuthStandardClientScopes,
   type DesktopBridge,
   type DesktopEnvironmentBootstrap,
@@ -43,7 +47,7 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
 
 import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
-import { readRuntimeBasePath } from "../runtimeBasePath";
+import { readRuntimeBasePath, resolveRuntimePathname } from "../runtimeBasePath";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import {
   readPrimaryEnvironmentTarget,
@@ -281,6 +285,20 @@ const capabilitiesLayer = Layer.effectContext(
         });
       }),
     });
+    const relayBaseUrl = configuredSessionFabricRelayUrl(
+      import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
+    );
+    const sessionFabricAuthorization = makeRuntimeSessionFabricAuthorization({
+      endpoint: new URL(
+        resolveRuntimePathname("/api/session-fabric/capabilities"),
+        window.location.origin,
+      ),
+      authMode: import.meta.env.VITE_T3CODE_SESSION_FABRIC_AUTH_MODE,
+      appUrl: window.location.href,
+      relayBaseUrl,
+      localDevAutoAuthEnabled: import.meta.env.VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED === "true",
+    });
+    installDefaultSessionFabricAuthorization(sessionFabricAuthorization);
 
     return Context.make(CloudSession, cloudSession).pipe(
       Context.add(PrimaryEnvironmentAuth, primaryAuth),

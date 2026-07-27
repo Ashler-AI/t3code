@@ -18,6 +18,10 @@ import * as Schema from "effect/Schema";
 
 import { SessionFabricConnectionRegistration } from "../connection/catalog.ts";
 import { SessionFabricConnectionTarget } from "../connection/model.ts";
+import {
+  type SessionFabricAuthorizationShape,
+  sessionFabricAuthorizationHeaders,
+} from "./sessionFabricAuthorization.ts";
 
 export class SessionFabricDirectoryClientError extends Schema.TaggedErrorClass<SessionFabricDirectoryClientError>()(
   "SessionFabricDirectoryClientError",
@@ -29,6 +33,7 @@ export class SessionFabricDirectoryClientError extends Schema.TaggedErrorClass<S
 
 export interface SessionFabricDirectoryClientOptions {
   readonly relayBaseUrl: string | URL;
+  readonly authorization: SessionFabricAuthorizationShape;
   readonly fetch?: typeof globalThis.fetch;
 }
 
@@ -73,10 +78,29 @@ export function makeSessionFabricDirectoryClient(
   }): Effect.Effect<A, SessionFabricDirectoryClientError> =>
     Effect.tryPromise({
       try: async () => {
-        const response = await fetchImplementation(
-          fabricApiUrl(options.relayBaseUrl, input.resource),
-          input.init,
-        );
+        const send = async (forceRefresh: boolean): Promise<Response> => {
+          const grant = await Effect.runPromise(options.authorization.viewer({ forceRefresh }));
+          const response = await fetchImplementation(
+            fabricApiUrl(options.relayBaseUrl, input.resource),
+            {
+              ...input.init,
+              headers: {
+                ...Object.fromEntries(new Headers(input.init?.headers).entries()),
+                ...sessionFabricAuthorizationHeaders(grant),
+              },
+            },
+          );
+          if (
+            response.status === 401 &&
+            !forceRefresh &&
+            options.authorization.mode === "capability"
+          ) {
+            options.authorization.invalidate("viewer");
+            return send(true);
+          }
+          return response;
+        };
+        const response = await send(false);
         if (!response.ok) throw new Error(`request failed with status ${response.status}`);
         return (await response.json()) as unknown;
       },

@@ -6,6 +6,7 @@ import { ShellSnapshotLoader } from "../state/shellSnapshotHttp.ts";
 import { ThreadSnapshotLoader } from "../state/threadSnapshotHttp.ts";
 import { makeDirectEnvironmentUiSessionSource } from "./directEnvironment.ts";
 import { makeRelaySessionFabricUiSessionSource } from "./relaySessionFabric.ts";
+import { readDefaultSessionFabricAuthorization } from "./sessionFabricAuthorization.ts";
 import { UiSessionSource } from "./source.ts";
 
 export const resolveUiSessionSource = Effect.gen(function* () {
@@ -26,6 +27,7 @@ export const resolveUiSessionSource = Effect.gen(function* () {
       clientId: target.clientId,
       environmentId: target.environmentId,
       environmentLabel: target.label,
+      authorization: readDefaultSessionFabricAuthorization(),
     });
   }
 
@@ -43,5 +45,6 @@ export const resolveUiSessionSource = Effect.gen(function* () {
 
 export * from "./directEnvironment.ts";
 export * from "./relaySessionFabric.ts";
+export * from "./sessionFabricAuthorization.ts";
 export * from "./sessionFabricDirectory.ts";
 export * from "./source.ts";

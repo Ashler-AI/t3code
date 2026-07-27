@@ -13,6 +13,7 @@ import {
   type SessionFabricServerFrame as SessionFabricServerFrameType,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import { sessionFabricWebSocketProtocols } from "@t3tools/shared/sessionFabricCapability";
 
 import {
   buildScaffoldSessionProofCommand,
@@ -67,10 +68,12 @@ function sessionUrl(resource: "connect" | "snapshot"): URL {
   return url;
 }
 
+const viewerCapability = process.env.SESSION_FABRIC_SMOKE_VIEWER_CAPABILITY;
 const snapshotResponse = await fetchScaffoldProofSnapshotResponse({
   url: sessionUrl("snapshot"),
   timeoutMs,
   fetch,
+  ...(viewerCapability === undefined ? {} : { capability: viewerCapability }),
 });
 if (!snapshotResponse.ok) {
   throw new Error(`Session snapshot failed with status ${snapshotResponse.status}.`);
@@ -83,7 +86,15 @@ searchUrl.search = "";
 searchUrl.hash = "";
 const searchResponse = await fetch(searchUrl, {
   method: "POST",
-  headers: { "content-type": "application/json", "cache-control": "no-cache" },
+  headers: {
+    "content-type": "application/json",
+    "cache-control": "no-cache",
+    ...(process.env.SESSION_FABRIC_SMOKE_VIEWER_CAPABILITY === undefined
+      ? {}
+      : {
+          authorization: `Bearer ${process.env.SESSION_FABRIC_SMOKE_VIEWER_CAPABILITY}`,
+        }),
+  },
   body: JSON.stringify({ query: values["semantic-query"], limit: 50 }),
   signal: AbortSignal.timeout(timeoutMs),
 });
@@ -105,9 +116,12 @@ class ProofClient {
     readonly resolve: (frame: SessionFabricServerFrameType) => void;
   }>();
 
-  constructor(clientId: string) {
+  constructor(clientId: string, capability: string | undefined) {
     this.clientId = SessionFabricClientId.make(clientId);
-    this.socket = new WebSocket(sessionUrl("connect"));
+    this.socket = new WebSocket(
+      sessionUrl("connect"),
+      capability === undefined ? undefined : [...sessionFabricWebSocketProtocols(capability)],
+    );
     this.socket.addEventListener("message", (event) => {
       if (typeof event.data !== "string") return;
       const frame = decodeServerFrame(event.data);
@@ -179,8 +193,12 @@ class ProofClient {
 }
 
 const clients = [
-  new ProofClient("scaffold-proof-client-1"),
-  new ProofClient("scaffold-proof-client-2"),
+  new ProofClient(
+    "scaffold-proof-client-1",
+    process.env.SESSION_FABRIC_SMOKE_CONTROLLER_CAPABILITY ??
+      process.env.SESSION_FABRIC_SMOKE_VIEWER_CAPABILITY,
+  ),
+  new ProofClient("scaffold-proof-client-2", process.env.SESSION_FABRIC_SMOKE_VIEWER_CAPABILITY),
 ];
 try {
   await Promise.all(clients.map((client) => client.connect()));

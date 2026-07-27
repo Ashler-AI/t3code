@@ -1,9 +1,10 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, SessionFabricSessionId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   makeScaffoldControlPlaneClient,
   parseScaffoldSessionObservation,
+  requestScaffoldRunnerCapability,
 } from "./ScaffoldControlPlaneClient.ts";
 
 const target = {
@@ -137,5 +138,165 @@ describe("ScaffoldControlPlaneClient", () => {
     await expect(
       missingEnvironment.issueT3Transport({ sessionId: "ses_1", lifecycleEpoch: 2 }),
     ).rejects.toMatchObject({ code: "scaffold_invalid_transport" });
+  });
+
+  it("forwards viewer capability requests with server auth and never puts auth in the body", async () => {
+    let request: { readonly url: string; readonly init?: RequestInit } | undefined;
+    const client = makeScaffoldControlPlaneClient({
+      target,
+      now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+      fetch: async (input, init) => {
+        request = { url: String(input), ...(init ? { init } : {}) };
+        return json({
+          capability: "header.payload.signature",
+          tokenType: "Bearer",
+          role: "viewer",
+          scopes: ["directory:read", "session:read"],
+          expiresAt: "2026-07-24T20:05:00.000Z",
+          issuer: "scaffold",
+          audience: "session-fabric",
+          keyId: "proof-1",
+          bindings: {},
+        });
+      },
+    });
+    await expect(client.issueSessionFabricCapability({ role: "viewer" })).resolves.toMatchObject({
+      role: "viewer",
+      bindings: {},
+    });
+    expect(request?.url).toBe(
+      "https://scaffold-staging.example.com/api/session-fabric/capabilities",
+    );
+    expect(new Headers(request?.init?.headers).get("authorization")).toBe("Bearer server-only");
+    expect(String(request?.init?.body)).toBe('{"role":"viewer"}');
+    expect(String(request?.init?.body)).not.toContain("server-only");
+  });
+
+  it("forwards the canonical controller lifecycle binding without an alias", async () => {
+    let request: { readonly init?: RequestInit } | undefined;
+    const fabricSessionId = SessionFabricSessionId.make("global-session-1");
+    const client = makeScaffoldControlPlaneClient({
+      target,
+      now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+      fetch: async (_input, init) => {
+        request = init ? { init } : {};
+        return json({
+          capability: "header.payload.signature",
+          tokenType: "Bearer",
+          role: "controller",
+          scopes: ["session:read", "session:command"],
+          expiresAt: "2026-07-24T20:01:00.000Z",
+          issuer: "scaffold",
+          audience: "session-fabric",
+          keyId: "proof-1",
+          bindings: {
+            fabricSessionId,
+            scaffoldSessionId: "ses_1",
+            scaffoldLifecycleEpoch: 7,
+          },
+        });
+      },
+    });
+    await expect(
+      client.issueSessionFabricCapability({
+        role: "controller",
+        fabricSessionId,
+        scaffoldSessionId: "ses_1",
+        scaffoldLifecycleEpoch: 7,
+      }),
+    ).resolves.toMatchObject({ role: "controller" });
+    expect(String(request?.init?.body)).toBe(
+      JSON.stringify({
+        role: "controller",
+        fabricSessionId,
+        scaffoldSessionId: "ses_1",
+        scaffoldLifecycleEpoch: 7,
+      }),
+    );
+    expect(String(request?.init?.body)).not.toContain('"lifecycleEpoch"');
+  });
+
+  it("issues an exact epoch-bound runner capability with only the runtime token header", async () => {
+    let request: { readonly url: string; readonly init?: RequestInit } | undefined;
+    const capability = "header.payload.signature";
+    await expect(
+      requestScaffoldRunnerCapability({
+        baseUrl: "https://scaffold-staging.example.com/",
+        runtimeApiToken: "runtime-secret",
+        scaffoldSessionId: "ses_1",
+        lifecycleEpoch: 7,
+        now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+        fetch: async (input, init) => {
+          request = { url: String(input), ...(init ? { init } : {}) };
+          return json({
+            capability,
+            tokenType: "Bearer",
+            role: "runner",
+            scopes: ["session:publish", "session:execute"],
+            expiresAt: "2026-07-24T20:15:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "proof-1",
+            bindings: { scaffoldSessionId: "ses_1", scaffoldLifecycleEpoch: 7 },
+          });
+        },
+      }),
+    ).resolves.toMatchObject({ role: "runner", capability });
+    expect(request?.url).toBe(
+      "https://scaffold-staging.example.com/api/sessions/ses_1/session-fabric/runner-capability",
+    );
+    expect(new Headers(request?.init?.headers).get("x-scaffold-runtime-api-token")).toBe(
+      "runtime-secret",
+    );
+    expect(String(request?.init?.body)).toBe('{"lifecycleEpoch":7}');
+    expect(String(request?.init?.body)).not.toContain("runtime-secret");
+  });
+
+  it("rejects mismatched runner bindings without reflecting either secret", async () => {
+    const error = await requestScaffoldRunnerCapability({
+      baseUrl: "https://scaffold-staging.example.com/",
+      runtimeApiToken: "runtime-secret",
+      scaffoldSessionId: "ses_1",
+      lifecycleEpoch: 7,
+      now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+      fetch: async () =>
+        json({
+          capability: "header.payload.signature",
+          tokenType: "Bearer",
+          role: "runner",
+          scopes: ["session:publish", "session:execute"],
+          expiresAt: "2026-07-24T20:15:00.000Z",
+          issuer: "scaffold",
+          audience: "session-fabric",
+          keyId: "proof-1",
+          bindings: { scaffoldSessionId: "ses_other", scaffoldLifecycleEpoch: 7 },
+        }),
+    }).catch((cause: unknown) => cause);
+    expect(error).toMatchObject({ code: "scaffold_invalid_session_fabric_capability" });
+    expect(String(error)).not.toContain("runtime-secret");
+    expect(String(error)).not.toContain("header.payload.signature");
+  });
+
+  it("bounds runner capability issuance and reports a non-secret network error", async () => {
+    const error = await requestScaffoldRunnerCapability({
+      baseUrl: "https://scaffold-staging.example.com/",
+      runtimeApiToken: "runtime-secret",
+      scaffoldSessionId: "ses_1",
+      lifecycleEpoch: 7,
+      timeoutMs: 5,
+      fetch: async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    }).catch((cause: unknown) => cause);
+    expect(error).toMatchObject({
+      code: "scaffold_session_fabric_capability_network_error",
+      status: 0,
+    });
+    expect(String(error)).not.toContain("runtime-secret");
   });
 });

@@ -358,6 +358,43 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
     }),
   );
 
+  it.effect("issues view pairing credentials with orchestration read scope only", () =>
+    Effect.gen(function* () {
+      const baseDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-cli-auth-view-pairing-test-"),
+      );
+
+      const createdOutput = yield* captureStdout(
+        runCli([
+          "auth",
+          "pairing",
+          "create",
+          "--base-dir",
+          baseDir,
+          "--access-mode",
+          "view",
+          "--json",
+        ]),
+      );
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const created = JSON.parse(createdOutput.output) as {
+        readonly id: string;
+        readonly scopes: ReadonlyArray<string>;
+      };
+      const listedOutput = yield* captureStdout(
+        runCli(["auth", "pairing", "list", "--base-dir", baseDir, "--json"]),
+      );
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      const listed = JSON.parse(listedOutput.output) as ReadonlyArray<{
+        readonly id: string;
+        readonly scopes: ReadonlyArray<string>;
+      }>;
+
+      assert.deepEqual(created.scopes, ["orchestration:read"]);
+      assert.deepEqual(listed.find((row) => row.id === created.id)?.scopes, ["orchestration:read"]);
+    }),
+  );
+
   it.effect("executes auth session subcommands and redacts secrets from list output", () =>
     Effect.gen(function* () {
       const baseDir = NodeFS.mkdtempSync(

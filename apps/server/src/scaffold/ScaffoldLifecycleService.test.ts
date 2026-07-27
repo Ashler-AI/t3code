@@ -49,11 +49,90 @@ function fakeClient(
       attachCredential: "attach-secret",
       expiresAt: "2026-07-24T21:00:00.000Z",
     }),
+    issueSessionFabricCapability: async () => ({
+      capability: "header.payload.signature",
+      tokenType: "Bearer",
+      role: "viewer",
+      scopes: ["directory:read", "session:read"],
+      expiresAt: "2026-07-24T21:00:00.000Z",
+      issuer: "scaffold",
+      audience: "session-fabric",
+      keyId: "proof-1",
+      bindings: {},
+    }),
     ...overrides,
   };
 }
 
 describe("ScaffoldLifecycleService", () => {
+  it("uses the sole configured deployment and propagates viewer/controller policy", async () => {
+    const issueSessionFabricCapability = vi.fn(async (input) => ({
+      capability: "header.payload.signature",
+      tokenType: "Bearer" as const,
+      role: input.role,
+      scopes:
+        input.role === "viewer"
+          ? (["directory:read", "session:read"] as const)
+          : (["session:read", "session:command"] as const),
+      expiresAt: "2026-07-24T21:00:00.000Z",
+      issuer: "scaffold",
+      audience: "session-fabric",
+      keyId: "proof-1",
+      bindings:
+        input.role === "viewer"
+          ? {}
+          : {
+              fabricSessionId: input.fabricSessionId,
+              scaffoldSessionId: input.scaffoldSessionId,
+              scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch,
+            },
+    }));
+    const client = fakeClient({ issueSessionFabricCapability });
+    const service = makeScaffoldLifecycleService({
+      environment: { T3CODE_SCAFFOLD_STAGING_URL: "https://scaffold-staging.example.com/" },
+      client: (deployment) => {
+        expect(deployment).toBe("staging");
+        return client;
+      },
+    });
+    await expect(
+      service.issueSessionFabricCapability({ capability: { role: "viewer" } }),
+    ).resolves.toMatchObject({ role: "viewer" });
+    await expect(
+      service.issueSessionFabricCapability({
+        capability: {
+          role: "controller",
+          fabricSessionId: GLOBAL_SESSION_ID,
+          scaffoldSessionId: "ses_1",
+          scaffoldLifecycleEpoch: 3,
+        },
+      }),
+    ).resolves.toMatchObject({
+      role: "controller",
+      bindings: { scaffoldSessionId: "ses_1", scaffoldLifecycleEpoch: 3 },
+    });
+    expect(issueSessionFabricCapability).toHaveBeenNthCalledWith(1, { role: "viewer" });
+    expect(issueSessionFabricCapability).toHaveBeenNthCalledWith(2, {
+      role: "controller",
+      fabricSessionId: GLOBAL_SESSION_ID,
+      scaffoldSessionId: "ses_1",
+      scaffoldLifecycleEpoch: 3,
+    });
+  });
+
+  it("fails closed when local capability routing has two configured deployments and no default", async () => {
+    const service = makeScaffoldLifecycleService({
+      environment: {
+        T3CODE_SCAFFOLD_STAGING_URL: "https://scaffold-staging.example.com/",
+        T3CODE_SCAFFOLD_PRODUCTION_URL: "https://scaffold.example.com/",
+      },
+      client: () => fakeClient(),
+    });
+    await expect(
+      service.issueSessionFabricCapability({ capability: { role: "viewer" } }),
+    ).rejects.toMatchObject({ code: "scaffold_not_configured" });
+  });
+
   it("preserves global session, thread, and environment identity while lifecycle and transport authority rotate", async () => {
     const issueT3Transport = vi
       .fn<ScaffoldControlPlaneClient["issueT3Transport"]>()

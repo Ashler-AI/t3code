@@ -8,8 +8,8 @@ import type {
   OrchestrationThread,
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadShell,
-  ProjectId,
   SessionFabricClientFrame,
+  SessionFabricCapabilityGrant,
   SessionFabricCommand,
   SessionFabricCommandReceipt,
   SessionFabricContextPublication,
@@ -31,6 +31,8 @@ import {
 import * as Cause from "effect/Cause";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -48,11 +50,13 @@ import * as Socket from "effect/unstable/socket/Socket";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerConfig from "../config.ts";
+import { recordSessionFabricRunnerState } from "../observability/Metrics.ts";
 import { normalizeDispatchCommand } from "../orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as CheckpointDiffQuery from "../checkpointing/CheckpointDiffQuery.ts";
+import { requestScaffoldRunnerCapability } from "../scaffold/ScaffoldControlPlaneClient.ts";
 
 const SessionFabricRunnerEnvConfig = Config.all({
   relayUrl: Config.url("T3CODE_SESSION_FABRIC_RELAY_URL").pipe(Config.option),
@@ -70,6 +74,11 @@ const SessionFabricRunnerEnvConfig = Config.all({
   overrideThreadId: Config.string("T3CODE_SESSION_FABRIC_THREAD_ID").pipe(Config.option),
   scaffoldSessionId: Config.string("SCAFFOLD_SESSION_ID").pipe(Config.option),
   scaffoldSessionUrl: Config.string("SCAFFOLD_SESSION_URL").pipe(Config.option),
+  scaffoldLifecycleEpoch: Config.int("SCAFFOLD_LIFECYCLE_EPOCH").pipe(Config.option),
+  runtimeApiToken: Config.string("SCAFFOLD_RUNTIME_API_TOKEN").pipe(Config.option),
+  authMode: Config.literals(["required", "disabled"], "T3CODE_SESSION_FABRIC_AUTH_MODE").pipe(
+    Config.withDefault("required"),
+  ),
 });
 
 export interface SessionFabricRunnerConfig {
@@ -81,6 +90,9 @@ export interface SessionFabricRunnerConfig {
   readonly overrideThreadId: ThreadId | null;
   readonly scaffoldSessionId: string | null;
   readonly scaffoldSessionUrl: string | null;
+  readonly scaffoldLifecycleEpoch: number | null;
+  readonly runtimeApiToken: string | null;
+  readonly authMode: "required" | "disabled";
 }
 
 interface SessionFabricRunnerSession {
@@ -106,10 +118,18 @@ export function resolveSessionFabricRunnerConfig(
   const configuredEnvironmentKind = optionValue(config.environmentKind);
   const overrideSessionId = optionValue(config.overrideSessionId);
   const overrideThreadId = optionValue(config.overrideThreadId);
+  const environmentKind =
+    configuredEnvironmentKind ?? (scaffoldSessionId === null ? "local" : "scaffold");
+  if (config.authMode === "disabled" && environmentKind !== "local") {
+    throw new Error("Session fabric authentication can only be disabled for a local runner.");
+  }
+  const scaffoldLifecycleEpoch = optionValue(config.scaffoldLifecycleEpoch);
+  if (scaffoldLifecycleEpoch !== null && scaffoldLifecycleEpoch < 0) {
+    throw new Error("Scaffold lifecycle epoch must be non-negative.");
+  }
   return {
     relayUrl: optionValue(config.relayUrl),
-    environmentKind:
-      configuredEnvironmentKind ?? (scaffoldSessionId === null ? "local" : "scaffold"),
+    environmentKind,
     publication: config.publication,
     runnerGeneration: Math.max(0, config.runnerGeneration),
     overrideSessionId:
@@ -117,6 +137,9 @@ export function resolveSessionFabricRunnerConfig(
     overrideThreadId: overrideThreadId === null ? null : (overrideThreadId as ThreadId),
     scaffoldSessionId,
     scaffoldSessionUrl: optionValue(config.scaffoldSessionUrl),
+    scaffoldLifecycleEpoch,
+    runtimeApiToken: optionValue(config.runtimeApiToken),
+    authMode: config.authMode,
   };
 }
 
@@ -148,6 +171,18 @@ export function makeSessionFabricWebSocketUrl(
   url.search = "";
   url.hash = "";
   return url;
+}
+
+export function makeSessionFabricWebSocketProtocols(
+  grant: SessionFabricCapabilityGrant | null,
+): ReadonlyArray<string> {
+  return grant === null
+    ? []
+    : ["t3.session-fabric.v1", `t3.session-fabric.capability.${grant.capability}`];
+}
+
+export function sessionFabricCapabilityRefreshDelayMs(expiresAt: string, now: number): number {
+  return Math.max(0, Date.parse(expiresAt) - now - 30_000);
 }
 
 export function orchestrationEventThreadId(event: OrchestrationEvent): ThreadId | null {
@@ -184,6 +219,7 @@ export function buildSessionFabricSnapshot(input: {
   readonly environmentKind: SessionFabricEnvironmentKind;
   readonly scaffoldSessionId: string | null;
   readonly scaffoldSessionUrl: string | null;
+  readonly scaffoldLifecycleEpoch: number | null;
   readonly publication: "public" | "local_only";
   readonly acknowledgedEventSequence: number;
   readonly shell: OrchestrationShellSnapshot;
@@ -210,6 +246,7 @@ export function buildSessionFabricSnapshot(input: {
     worktreePath: input.detail.thread.worktreePath,
     scaffoldSessionId: input.scaffoldSessionId,
     scaffoldSessionUrl: input.scaffoldSessionUrl,
+    scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch,
   };
   return {
     session: {
@@ -288,6 +325,12 @@ export class SessionFabricRunner extends Context.Service<
   }
 >()("t3/sessionFabric/SessionFabricRunner") {}
 
+class SessionFabricRunnerCapabilityError extends Data.TaggedError(
+  "SessionFabricRunnerCapabilityError",
+)<{
+  readonly reason: "configuration" | "unavailable";
+}> {}
+
 export const make = Effect.gen(function* () {
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const engine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -301,6 +344,10 @@ export const make = Effect.gen(function* () {
   const environmentId = yield* environment.getEnvironmentId;
   const runnerId = SessionFabricRunnerId.make(`runner:${environmentId}`);
   const sessionsRef = yield* Ref.make(new Map<ThreadId, SessionFabricRunnerSession>());
+  const runnerMetricAttributes = {
+    authMode: config.authMode,
+    environmentKind: config.environmentKind,
+  } as const;
 
   const loadSnapshot = Effect.fn("session_fabric_runner.load_snapshot")(function* (
     sessionId: SessionFabricSessionId,
@@ -318,6 +365,7 @@ export const make = Effect.gen(function* () {
       environmentKind: config.environmentKind,
       scaffoldSessionId: config.scaffoldSessionId,
       scaffoldSessionUrl: config.scaffoldSessionUrl,
+      scaffoldLifecycleEpoch: config.scaffoldLifecycleEpoch,
       publication: config.publication,
       acknowledgedEventSequence,
       shell,
@@ -339,6 +387,41 @@ export const make = Effect.gen(function* () {
     const initialSnapshot = yield* loadSnapshot(session.sessionId, session.threadId, 0);
     if (initialSnapshot === null) return;
 
+    const capability =
+      config.authMode === "disabled"
+        ? null
+        : yield* Effect.gen(function* () {
+            if (
+              config.environmentKind !== "scaffold" ||
+              config.scaffoldSessionId === null ||
+              config.scaffoldSessionUrl === null ||
+              config.scaffoldLifecycleEpoch === null ||
+              config.runtimeApiToken === null
+            ) {
+              return yield* new SessionFabricRunnerCapabilityError({
+                reason: "configuration",
+              });
+            }
+            const scaffoldSessionUrl = config.scaffoldSessionUrl;
+            const runtimeApiToken = config.runtimeApiToken;
+            const scaffoldSessionId = config.scaffoldSessionId;
+            const scaffoldLifecycleEpoch = config.scaffoldLifecycleEpoch;
+            const baseUrl = yield* Effect.try({
+              try: () => new URL(scaffoldSessionUrl).origin,
+              catch: () => new SessionFabricRunnerCapabilityError({ reason: "configuration" }),
+            });
+            return yield* Effect.tryPromise({
+              try: () =>
+                requestScaffoldRunnerCapability({
+                  baseUrl,
+                  runtimeApiToken,
+                  scaffoldSessionId,
+                  lifecycleEpoch: scaffoldLifecycleEpoch,
+                }),
+              catch: () => new SessionFabricRunnerCapabilityError({ reason: "unavailable" }),
+            });
+          });
+
     const acknowledgedEventSequence = yield* Ref.make(0);
     const contextCache = yield* Ref.make<{
       readonly checkpointTurnCount: number;
@@ -347,6 +430,7 @@ export const make = Effect.gen(function* () {
     const socket = yield* Socket.makeWebSocket(socketUrl.toString(), {
       closeCodeIsError: () => true,
       openTimeout: "10 seconds",
+      protocols: [...makeSessionFabricWebSocketProtocols(capability)],
     });
     const write = yield* socket.writer;
     const ready = yield* Deferred.make<void>();
@@ -491,6 +575,7 @@ export const make = Effect.gen(function* () {
     };
 
     const onOpen = Effect.gen(function* () {
+      yield* recordSessionFabricRunnerState("connected", runnerMetricAttributes);
       const latestSequence = yield* engine.latestSequence;
       yield* send({
         type: "runner.hello",
@@ -539,20 +624,35 @@ export const make = Effect.gen(function* () {
         Effect.forever(Queue.take(session.events).pipe(Effect.flatMap(publishLiveEvent))),
       ),
     );
-    yield* Effect.raceFirst(incoming, outgoing);
+    const connection = Effect.raceFirst(incoming, outgoing);
+    const currentTimeMillis = yield* Clock.currentTimeMillis;
+    yield* capability === null
+      ? connection
+      : Effect.raceFirst(
+          connection,
+          Effect.sleep(
+            sessionFabricCapabilityRefreshDelayMs(capability.expiresAt, currentTimeMillis),
+          ),
+        );
   });
 
   const runSession = (session: SessionFabricRunnerSession) =>
     Effect.forever(
-      runConnection(session).pipe(
+      recordSessionFabricRunnerState("connecting", runnerMetricAttributes).pipe(
+        Effect.andThen(runConnection(session)),
         Effect.provide(Socket.layerWebSocketConstructorGlobal),
         Effect.catchCause((cause) =>
-          Effect.logWarning("session fabric runner connection failed", {
-            sessionId: session.sessionId,
-            threadId: session.threadId,
-            cause: Cause.pretty(cause),
-          }),
+          recordSessionFabricRunnerState("connection_failed", runnerMetricAttributes).pipe(
+            Effect.andThen(
+              Effect.logWarning("session fabric runner connection failed", {
+                sessionId: session.sessionId,
+                threadId: session.threadId,
+                cause: Cause.pretty(cause),
+              }),
+            ),
+          ),
         ),
+        Effect.andThen(recordSessionFabricRunnerState("reconnect_wait", runnerMetricAttributes)),
         Effect.andThen(Effect.sleep("1 second")),
       ),
     );
@@ -581,6 +681,7 @@ export const make = Effect.gen(function* () {
   const start: SessionFabricRunner["Service"]["start"] = Effect.fn("session_fabric_runner.start")(
     function* () {
       if (config.relayUrl === null) {
+        yield* recordSessionFabricRunnerState("disabled", runnerMetricAttributes);
         yield* Effect.logDebug("session fabric runner disabled; relay URL is not configured");
         return;
       }

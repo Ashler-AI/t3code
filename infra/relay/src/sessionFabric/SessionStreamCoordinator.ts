@@ -1,5 +1,6 @@
 // @effect-diagnostics returnEffectInGen:off -- Alchemy Durable Objects intentionally use a two-phase outer/inner Effect.
 import type {
+  SessionFabricCapabilityClaims,
   SessionFabricClientFrame,
   SessionFabricCommand,
   SessionFabricCommandReceipt,
@@ -19,19 +20,38 @@ import {
   SessionFabricServerFrame as SessionFabricServerFrameSchema,
   SessionFabricSessionId as SessionFabricSessionIdSchema,
   SessionFabricSnapshot as SessionFabricSnapshotSchema,
+  SESSION_FABRIC_WS_PROTOCOL,
 } from "@t3tools/contracts/session-fabric";
+import {
+  authorizationCapability,
+  capabilityCanControlSession,
+  capabilityCanReadSession,
+  capabilityCanRunSession,
+  isLoopbackSessionFabricRequestUrl,
+  isPublicScaffoldLocation,
+  makeSessionFabricCapabilityVerifierConfig,
+  SessionFabricCapabilityError,
+  verifySessionFabricCapability,
+  websocketCapability,
+} from "@t3tools/shared/sessionFabricCapability";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Clock from "effect/Clock";
+import * as Config from "effect/Config";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 
 import {
+  decideAuthorizedCommandSubmit,
   decideCommandSubmit,
   decideEventAppend,
-  decideRunnerGeneration,
+  isCurrentRunnerAttachment,
+  runnerHelloMatchesLease,
+  SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
+  SESSION_FABRIC_PERMISSION_CLOSE_CODE,
   shouldReplayCommand,
 } from "./SessionStreamModel.ts";
 import SessionDirectory from "./SessionDirectory.ts";
@@ -41,11 +61,13 @@ interface SocketAttachment {
   readonly sessionId: string;
   readonly peerId: string | null;
   readonly runnerGeneration: number | null;
+  readonly capability: SessionFabricCapabilityClaims | null;
 }
 
 interface MetaRow {
   readonly [key: string]: string | number | null;
   readonly session_id: string | null;
+  readonly runner_id: string | null;
   readonly runner_generation: number;
   readonly runner_state: string;
   readonly snapshot_json: string | null;
@@ -118,15 +140,35 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
   "SessionStreamCoordinator",
   Effect.gen(function* () {
     const directory = yield* SessionDirectory;
+    const authMode = yield* Config.string("SESSION_FABRIC_AUTH_MODE").pipe(Config.option);
+    const authIssuer = yield* Config.string("SESSION_FABRIC_CAPABILITY_ISSUER").pipe(Config.option);
+    const authAudience = yield* Config.string("SESSION_FABRIC_CAPABILITY_AUDIENCE").pipe(
+      Config.option,
+    );
+    const authPublicKeys = yield* Config.string("SESSION_FABRIC_CAPABILITY_PUBLIC_KEYS_JSON").pipe(
+      Config.option,
+    );
+    const verifierConfig = makeSessionFabricCapabilityVerifierConfig({
+      mode: Option.getOrUndefined(authMode),
+      issuer: Option.getOrUndefined(authIssuer),
+      audience: Option.getOrUndefined(authAudience),
+      publicKeysJson: Option.getOrUndefined(authPublicKeys),
+    });
     return Effect.gen(function* () {
       const state = yield* Cloudflare.DurableObjectState;
       const { sql } = state.storage;
 
       yield* sql
         .exec(
-          "CREATE TABLE IF NOT EXISTS session_meta (id INTEGER PRIMARY KEY CHECK (id = 1), session_id TEXT, runner_generation INTEGER NOT NULL DEFAULT 0, runner_state TEXT NOT NULL DEFAULT 'offline', snapshot_json TEXT, snapshot_sequence INTEGER NOT NULL DEFAULT 0)",
+          "CREATE TABLE IF NOT EXISTS session_meta (id INTEGER PRIMARY KEY CHECK (id = 1), session_id TEXT, runner_id TEXT, runner_generation INTEGER NOT NULL DEFAULT 0, runner_state TEXT NOT NULL DEFAULT 'offline', snapshot_json TEXT, snapshot_sequence INTEGER NOT NULL DEFAULT 0)",
         )
         .pipe(Effect.asVoid);
+      const metaColumns = yield* sql.exec<{ readonly name: string }>(
+        "PRAGMA table_info(session_meta)",
+      );
+      if (!(yield* metaColumns.toArray()).some((column) => column.name === "runner_id")) {
+        yield* sql.exec("ALTER TABLE session_meta ADD COLUMN runner_id TEXT").pipe(Effect.asVoid);
+      }
       yield* sql
         .exec(
           "CREATE TABLE IF NOT EXISTS session_events (stream_sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL)",
@@ -150,7 +192,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
 
       const readMeta = Effect.fn("session_fabric.read_meta")(function* () {
         const cursor = yield* sql.exec<MetaRow>(
-          "SELECT session_id, runner_generation, runner_state, snapshot_json, snapshot_sequence FROM session_meta WHERE id = 1",
+          "SELECT session_id, runner_id, runner_generation, runner_state, snapshot_json, snapshot_sequence FROM session_meta WHERE id = 1",
         );
         return yield* cursor.one();
       });
@@ -166,6 +208,51 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         const meta = yield* readMeta();
         return meta.snapshot_json === null ? null : decodeSnapshot(meta.snapshot_json);
       });
+
+      const nowEpochSeconds = Clock.currentTimeMillis.pipe(
+        Effect.map((milliseconds) => Math.floor(milliseconds / 1_000)),
+      );
+
+      const verifyCapability = Effect.fn("session_fabric.verify_capability")(function* (
+        token: string | null,
+        requestUrl: string,
+      ) {
+        if (verifierConfig === null) {
+          return yield* new SessionFabricCapabilityError({ reason: "unavailable" });
+        }
+        if (verifierConfig.mode === "disabled") {
+          // Relative targets can only arrive through the bound outer Worker,
+          // which already enforces that disabled mode is loopback-only.
+          return isLoopbackSessionFabricRequestUrl(requestUrl) || requestUrl.startsWith("/")
+            ? null
+            : yield* new SessionFabricCapabilityError({ reason: "unavailable" });
+        }
+        if (token === null) {
+          return yield* new SessionFabricCapabilityError({ reason: "missing" });
+        }
+        return yield* verifySessionFabricCapability({
+          config: verifierConfig,
+          token,
+          nowEpochSeconds: yield* nowEpochSeconds,
+        });
+      });
+
+      const capabilityIsCurrent = Effect.fn("session_fabric.capability_is_current")(function* (
+        capability: SessionFabricCapabilityClaims | null,
+      ) {
+        if (verifierConfig?.mode === "disabled") return true;
+        if (capability === null) return false;
+        const now = yield* nowEpochSeconds;
+        return capability.nbf <= now && capability.exp > now;
+      });
+
+      const canReadSnapshot = Effect.fn("session_fabric.can_read_snapshot")(
+        (capability: SessionFabricCapabilityClaims | null, snapshot: SessionFabricSnapshot) =>
+          Effect.succeed(
+            verifierConfig?.mode === "disabled" ||
+              (capability !== null && capabilityCanReadSession(capability, snapshot)),
+          ),
+      );
 
       const readContext = Effect.fn("session_fabric.read_context")(function* (
         includeCodeDiff: boolean,
@@ -212,9 +299,49 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         role: SocketAttachment["role"],
       ) {
         const sockets = yield* state.getWebSockets();
-        return sockets.filter(
-          (socket) => socket.deserializeAttachment<SocketAttachment>()?.role === role,
-        );
+        const current: Array<Cloudflare.DurableWebSocket> = [];
+        for (const socket of sockets) {
+          const attachment = socket.deserializeAttachment<SocketAttachment>();
+          if (attachment?.role !== role) continue;
+          if (!(yield* capabilityIsCurrent(attachment.capability))) {
+            yield* socket.close(
+              SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
+              "Session fabric capability expired",
+            );
+            continue;
+          }
+          current.push(socket);
+        }
+        return current;
+      });
+
+      const eligibleRunners = Effect.fn("session_fabric.eligible_runners")(function* (
+        snapshot: SessionFabricSnapshot,
+        meta: MetaRow,
+      ) {
+        const eligible: Array<Cloudflare.DurableWebSocket> = [];
+        for (const runner of yield* socketsForRole("runner")) {
+          const attachment = runner.deserializeAttachment<SocketAttachment>();
+          if (
+            attachment !== null &&
+            isCurrentRunnerAttachment({
+              attachmentGeneration: attachment.runnerGeneration,
+              attachmentRunnerId: attachment.peerId,
+              currentGeneration: meta.runner_generation,
+              currentRunnerId: meta.runner_id,
+            }) &&
+            (verifierConfig?.mode === "disabled" ||
+              (attachment.capability?.role === "runner" &&
+                isPublicScaffoldLocation(snapshot.session.location) &&
+                attachment.capability.scaffoldSessionId ===
+                  snapshot.session.location.scaffoldSessionId &&
+                attachment.capability.scaffoldLifecycleEpoch ===
+                  snapshot.session.location.scaffoldLifecycleEpoch))
+          ) {
+            eligible.push(runner);
+          }
+        }
+        return eligible;
       });
 
       const broadcast = Effect.fn("session_fabric.broadcast")(function* (
@@ -222,7 +349,21 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         frame: SessionFabricServerFrame,
       ) {
         const payload = encodeFrame(frame);
+        const snapshot = role === "client" ? yield* readSnapshot() : null;
         for (const socket of yield* socketsForRole(role)) {
+          const attachment = socket.deserializeAttachment<SocketAttachment>();
+          if (
+            role === "client" &&
+            (attachment === null ||
+              snapshot === null ||
+              !(yield* canReadSnapshot(attachment.capability, snapshot)))
+          ) {
+            yield* socket.close(
+              SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+              "Session read capability denied",
+            );
+            continue;
+          }
           yield* socket.send(payload);
         }
       });
@@ -285,6 +426,16 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       const storeReceipt = Effect.fn("session_fabric.store_receipt")(function* (
         receipt: SessionFabricCommandReceipt,
       ) {
+        const existing = yield* sql
+          .exec<CommandRow>(
+            "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
+            receipt.commandId,
+          )
+          .pipe(
+            Effect.flatMap((cursor) => cursor.toArray()),
+            Effect.map((rows) => rows.at(0)),
+          );
+        if (existing === undefined || !shouldReplayCommand(existing.status)) return;
         yield* sql
           .exec(
             "UPDATE session_commands SET status = ?, result_sequence = ?, detail = ?, updated_at = ? WHERE command_id = ?",
@@ -298,10 +449,35 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         yield* broadcast("client", { type: "command.receipt", receipt });
       });
 
+      const rejectPendingCommands = Effect.fn("session_fabric.reject_pending_commands")(function* (
+        detail: string,
+      ) {
+        const cursor = yield* sql.exec<CommandRow>(
+          "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE status IN ('queued', 'delivered') ORDER BY rowid ASC",
+        );
+        for (const row of yield* cursor.toArray()) {
+          const command = decodeCommand(row.payload_json);
+          yield* storeReceipt({
+            sessionId: command.sessionId,
+            commandId: command.commandId,
+            status: "rejected",
+            resultSequence: null,
+            detail,
+            updatedAt: yield* currentIso,
+          });
+        }
+      });
+
       const dispatchPendingCommands = Effect.fn("session_fabric.dispatch_pending_commands")(
         function* () {
-          const runners = yield* socketsForRole("runner");
-          if (runners.length === 0) return;
+          const snapshot = yield* readSnapshot();
+          if (snapshot === null) return;
+          const meta = yield* readMeta();
+          const runners = yield* eligibleRunners(snapshot, meta);
+          const runner = runners.at(0);
+          if (runner === undefined || meta.runner_state !== "online") {
+            return yield* rejectPendingCommands("Session runner is offline");
+          }
           const cursor = yield* sql.exec<CommandRow>(
             "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE status IN ('queued', 'delivered') ORDER BY rowid ASC",
           );
@@ -309,7 +485,18 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             if (!shouldReplayCommand(row.status)) continue;
             const command = decodeCommand(row.payload_json);
             const frame = encodeFrame({ type: "command.dispatch", command });
-            for (const runner of runners) yield* runner.send(frame);
+            const sent = yield* runner.send(frame).pipe(Effect.result);
+            if (sent._tag === "Failure") {
+              yield* storeReceipt({
+                sessionId: command.sessionId,
+                commandId: command.commandId,
+                status: "rejected",
+                resultSequence: null,
+                detail: "Session runner disconnected",
+                updatedAt: yield* currentIso,
+              });
+              continue;
+            }
             if (row.status === "queued") {
               const updatedAt = yield* currentIso;
               yield* storeReceipt({
@@ -329,11 +516,16 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         socket: Cloudflare.DurableWebSocket,
         sessionId: SessionFabricSessionId,
         afterEventSequence: number,
+        capability: SessionFabricCapabilityClaims | null,
       ) {
         const snapshot = yield* readSnapshot();
-        if (snapshot !== null) {
-          yield* socket.send(encodeFrame({ type: "session.snapshot", snapshot }));
+        if (snapshot === null || !(yield* canReadSnapshot(capability, snapshot))) {
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Session read capability required",
+          );
         }
+        yield* socket.send(encodeFrame({ type: "session.snapshot", snapshot }));
         const batch = yield* readEvents(sessionId, afterEventSequence);
         for (const event of batch.events) {
           yield* socket.send(
@@ -370,18 +562,45 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         frame: Extract<SessionFabricClientFrame, { type: "runner.hello" }>,
       ) {
         if (frame.hello.sessionId !== expectedSessionId) {
-          return yield* socket.close(1008, "Session identity mismatch");
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Session identity mismatch",
+          );
+        }
+        const attachment = socket.deserializeAttachment<SocketAttachment>();
+        if (
+          attachment === null ||
+          (verifierConfig?.mode !== "disabled" &&
+            (attachment.capability === null ||
+              !capabilityCanRunSession(attachment.capability, frame.hello)))
+        ) {
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Runner capability mismatch",
+          );
         }
         const meta = yield* readMeta();
         if (
-          decideRunnerGeneration(meta.runner_generation, frame.hello.runnerGeneration) === "stale"
+          !runnerHelloMatchesLease({
+            currentGeneration: meta.runner_generation,
+            currentRunnerId: meta.runner_id,
+            incomingGeneration: frame.hello.runnerGeneration,
+            incomingRunnerId: frame.hello.runnerId,
+          })
         ) {
-          return yield* socket.close(1008, "Stale runner generation");
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Stale runner generation",
+          );
+        }
+        if (frame.hello.runnerGeneration > meta.runner_generation) {
+          yield* rejectPendingCommands("Runner generation changed");
         }
         yield* sql
           .exec(
-            "UPDATE session_meta SET session_id = ?, runner_generation = ?, runner_state = 'online' WHERE id = 1",
+            "UPDATE session_meta SET session_id = ?, runner_id = ?, runner_generation = ?, runner_state = 'online' WHERE id = 1",
             frame.hello.sessionId,
+            frame.hello.runnerId,
             frame.hello.runnerGeneration,
           )
           .pipe(Effect.asVoid);
@@ -390,6 +609,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           sessionId: expectedSessionId,
           peerId: frame.hello.runnerId,
           runnerGeneration: frame.hello.runnerGeneration,
+          capability: attachment.capability,
         });
         yield* setRunnerState("online");
         yield* dispatchPendingCommands();
@@ -401,15 +621,36 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         frame: Extract<SessionFabricClientFrame, { type: "client.hello" }>,
       ) {
         if (frame.hello.sessionId !== expectedSessionId) {
-          return yield* socket.close(1008, "Session identity mismatch");
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Session identity mismatch",
+          );
+        }
+        const attachment = socket.deserializeAttachment<SocketAttachment>();
+        if (
+          attachment === null ||
+          (verifierConfig?.mode !== "disabled" &&
+            attachment.capability?.role !== "viewer" &&
+            attachment.capability?.role !== "controller")
+        ) {
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Client capability mismatch",
+          );
         }
         socket.serializeAttachment<SocketAttachment>({
           role: "client",
           sessionId: expectedSessionId,
           peerId: frame.hello.clientId,
           runnerGeneration: null,
+          capability: attachment.capability,
         });
-        yield* synchronizeClient(socket, frame.hello.sessionId, frame.hello.afterEventSequence);
+        yield* synchronizeClient(
+          socket,
+          frame.hello.sessionId,
+          frame.hello.afterEventSequence,
+          attachment.capability,
+        );
       });
 
       const handlePublishedEvent = Effect.fn("session_fabric.handle_published_event")(function* (
@@ -426,6 +667,16 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           return;
         }
         const meta = yield* readMeta();
+        if (
+          !isCurrentRunnerAttachment({
+            attachmentGeneration: attachment.runnerGeneration,
+            attachmentRunnerId: attachment.peerId,
+            currentGeneration: meta.runner_generation,
+            currentRunnerId: meta.runner_id,
+          })
+        ) {
+          return;
+        }
         const existingCursor = yield* sql.exec<{ event_id: string; stream_sequence: number }>(
           "SELECT event_id, stream_sequence FROM session_events WHERE event_id = ? LIMIT 1",
           published.event.eventId,
@@ -498,9 +749,28 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           ) {
             return;
           }
+          if (
+            verifierConfig?.mode !== "disabled" &&
+            (attachment.capability?.role !== "runner" ||
+              published.snapshot.session.sessionId !== attachment.sessionId ||
+              published.snapshot.session.publication !== "public" ||
+              !isPublicScaffoldLocation(published.snapshot.session.location) ||
+              attachment.capability.scaffoldSessionId !==
+                published.snapshot.session.location.scaffoldSessionId ||
+              attachment.capability.scaffoldLifecycleEpoch !==
+                published.snapshot.session.location.scaffoldLifecycleEpoch)
+          ) {
+            return;
+          }
           const meta = yield* readMeta();
           if (
-            decideRunnerGeneration(meta.runner_generation, published.runnerGeneration) === "stale"
+            !isCurrentRunnerAttachment({
+              attachmentGeneration: attachment.runnerGeneration,
+              attachmentRunnerId: attachment.peerId,
+              currentGeneration: meta.runner_generation,
+              currentRunnerId: meta.runner_id,
+            }) ||
+            published.runnerGeneration !== meta.runner_generation
           ) {
             return;
           }
@@ -532,7 +802,13 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           }
           const meta = yield* readMeta();
           if (
-            decideRunnerGeneration(meta.runner_generation, published.runnerGeneration) === "stale"
+            !isCurrentRunnerAttachment({
+              attachmentGeneration: attachment.runnerGeneration,
+              attachmentRunnerId: attachment.peerId,
+              currentGeneration: meta.runner_generation,
+              currentRunnerId: meta.runner_id,
+            }) ||
+            published.runnerGeneration !== meta.runner_generation
           ) {
             return;
           }
@@ -548,6 +824,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       );
 
       const handleCommand = Effect.fn("session_fabric.handle_command")(function* (
+        socket: Cloudflare.DurableWebSocket,
         attachment: SocketAttachment,
         command: SessionFabricCommand,
       ) {
@@ -559,11 +836,69 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         ) {
           return;
         }
+        const snapshot = yield* readSnapshot();
+        const commandAuthorized =
+          snapshot !== null &&
+          (verifierConfig?.mode === "disabled" ||
+            (attachment.capability !== null &&
+              capabilityCanControlSession({
+                claims: attachment.capability,
+                sessionId: command.sessionId,
+                location: snapshot.session.location,
+              })));
+        const meta = yield* readMeta();
+        const runners = snapshot === null ? [] : yield* eligibleRunners(snapshot, meta);
         const existingCursor = yield* sql.exec<CommandRow>(
           "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
           command.commandId,
         );
-        const decision = decideCommandSubmit((yield* existingCursor.toArray()).at(0));
+        const existing = (yield* existingCursor.toArray()).at(0);
+        if (commandAuthorized && existing !== undefined) {
+          yield* socket.send(
+            encodeFrame({
+              type: "command.receipt",
+              receipt: decodeCommandReceipt({
+                sessionId: command.sessionId,
+                commandId: command.commandId,
+                status: existing.status,
+                resultSequence: existing.result_sequence,
+                detail: existing.detail,
+                updatedAt: existing.updated_at,
+              }),
+            }),
+          );
+          return;
+        }
+        const authorizationDecision = decideAuthorizedCommandSubmit({
+          controllerMatchesSession: commandAuthorized,
+          runnerState: meta.runner_state,
+          eligibleRunnerCount: runners.length,
+        });
+        if (authorizationDecision.type === "rejected") {
+          const updatedAt = yield* currentIso;
+          const receipt = {
+            sessionId: command.sessionId,
+            commandId: command.commandId,
+            status: "rejected" as const,
+            resultSequence: null,
+            detail: authorizationDecision.detail,
+            updatedAt,
+          };
+          if (commandAuthorized) {
+            yield* sql
+              .exec(
+                "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at) VALUES (?, ?, 'rejected', NULL, ?, ?)",
+                command.commandId,
+                encodeCommand(command),
+                authorizationDecision.detail,
+                updatedAt,
+              )
+              .pipe(Effect.asVoid);
+          }
+          yield* socket.send(encodeFrame({ type: "command.receipt", receipt }));
+          return;
+        }
+        const decision = decideCommandSubmit(existing);
         if (decision.type === "accepted") {
           yield* sql
             .exec(
@@ -615,12 +950,23 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           case "session.publish-context":
             return yield* handlePublishedContext(attachment, frame.published);
           case "command.submit":
-            return yield* handleCommand(attachment, frame.command);
-          case "command.receipt":
-            if (attachment.role === "runner" && frame.receipt.sessionId === attachment.sessionId) {
+            return yield* handleCommand(socket, attachment, frame.command);
+          case "command.receipt": {
+            const meta = yield* readMeta();
+            if (
+              attachment.role === "runner" &&
+              frame.receipt.sessionId === attachment.sessionId &&
+              isCurrentRunnerAttachment({
+                attachmentGeneration: attachment.runnerGeneration,
+                attachmentRunnerId: attachment.peerId,
+                currentGeneration: meta.runner_generation,
+                currentRunnerId: meta.runner_id,
+              })
+            ) {
               return yield* storeReceipt(frame.receipt);
             }
             return;
+          }
         }
       });
 
@@ -636,6 +982,19 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           // absolute URL. Accept both forms so WebSocket upgrades work in dev and
           // production.
           const url = new URL(request.url, "http://session-fabric.local");
+          const isWebSocket = request.headers.upgrade?.toLowerCase() === "websocket";
+          const capabilityResult = yield* verifyCapability(
+            isWebSocket
+              ? websocketCapability(request.headers["sec-websocket-protocol"])
+              : authorizationCapability(request.headers.authorization),
+            request.url,
+          ).pipe(Effect.result);
+          if (capabilityResult._tag === "Failure") {
+            return HttpServerResponse.text("Session fabric authorization required", {
+              status: capabilityResult.failure.reason === "unavailable" ? 503 : 401,
+            });
+          }
+          const capability = capabilityResult.success;
           const sessionId = pathSessionId(url);
           if (sessionId === null) {
             return HttpServerResponse.text("Not found", { status: 404 });
@@ -644,11 +1003,17 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             const snapshot = yield* readSnapshot();
             return snapshot === null
               ? HttpServerResponse.empty({ status: 404 })
-              : HttpServerResponse.jsonUnsafe(snapshot, {
-                  headers: { "cache-control": "no-store" },
-                });
+              : !(yield* canReadSnapshot(capability, snapshot))
+                ? HttpServerResponse.empty({ status: 404 })
+                : HttpServerResponse.jsonUnsafe(snapshot, {
+                    headers: { "cache-control": "no-store" },
+                  });
           }
           if (url.pathname.endsWith("/events")) {
+            const snapshot = yield* readSnapshot();
+            if (snapshot === null || !(yield* canReadSnapshot(capability, snapshot))) {
+              return HttpServerResponse.empty({ status: 404 });
+            }
             const after = Number(url.searchParams.get("after") ?? "0");
             const batch = yield* readEvents(
               sessionId,
@@ -659,6 +1024,10 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             });
           }
           if (url.pathname.endsWith("/context")) {
+            const snapshot = yield* readSnapshot();
+            if (snapshot === null || !(yield* canReadSnapshot(capability, snapshot))) {
+              return HttpServerResponse.empty({ status: 404 });
+            }
             const context = yield* readContext(
               url.searchParams.get("includeCodeDiff") !== "false",
               url.searchParams.get("includeContinuation") !== "false",
@@ -678,13 +1047,27 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             sessionId,
             peerId: null,
             runnerGeneration: null,
+            capability,
           });
-          return response;
+          return verifierConfig?.mode === "disabled"
+            ? response
+            : HttpServerResponse.setHeader(
+                response,
+                "sec-websocket-protocol",
+                SESSION_FABRIC_WS_PROTOCOL,
+              );
         }),
         webSocketMessage: Effect.fnUntraced(function* (
           socket: Cloudflare.DurableWebSocket,
           message: string | ArrayBuffer,
         ) {
+          const attachment = socket.deserializeAttachment<SocketAttachment>();
+          if (attachment === null || !(yield* capabilityIsCurrent(attachment.capability))) {
+            return yield* socket.close(
+              SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
+              "Session fabric capability expired",
+            );
+          }
           yield* parseMessage(message).pipe(
             Effect.flatMap((frame) => handleFrame(socket, frame)),
             Effect.catch(() => socket.close(1003, "Invalid session fabric frame")),
@@ -697,10 +1080,23 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           _wasClean: boolean,
         ) {
           const attachment = socket.deserializeAttachment<SocketAttachment>();
-          if (attachment?.role === "runner") yield* setRunnerState("offline");
+          if (attachment?.role === "runner") {
+            const meta = yield* readMeta();
+            if (
+              isCurrentRunnerAttachment({
+                attachmentGeneration: attachment.runnerGeneration,
+                attachmentRunnerId: attachment.peerId,
+                currentGeneration: meta.runner_generation,
+                currentRunnerId: meta.runner_id,
+              })
+            ) {
+              yield* setRunnerState("offline");
+              yield* rejectPendingCommands("Session runner disconnected");
+            }
+          }
           yield* socket.close(code, reason);
         }),
       };
     });
-  }),
+  }).pipe(Effect.orDie),
 ) {}

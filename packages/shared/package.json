@@ -127,6 +127,10 @@
       "types": "./src/relayJwt.ts",
       "import": "./src/relayJwt.ts"
     },
+    "./sessionFabricCapability": {
+      "types": "./src/sessionFabricCapability.ts",
+      "import": "./src/sessionFabricCapability.ts"
+    },
     "./oauthScope": {
       "types": "./src/oauthScope.ts",
       "import": "./src/oauthScope.ts"

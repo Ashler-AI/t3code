@@ -10,7 +10,7 @@ import { DraftId } from "./composerDraftStore";
 import { useScaffoldSessionUiStore } from "./scaffoldSessionUiStore";
 
 describe("scaffoldSessionUiStore", () => {
-  it("persists only the safe lifecycle projection and keeps a queued first send", () => {
+  it("persists only the safe lifecycle projection without transcript or send state", () => {
     const draftId = DraftId.make("draft-scaffold");
     const store = useScaffoldSessionUiStore.getState();
     store.begin({
@@ -22,7 +22,6 @@ describe("scaffoldSessionUiStore", () => {
       sessionId: "ses_1",
       createdAt: "2026-07-24T00:00:00.000Z",
     });
-    store.queueSend(draftId);
     store.connected(
       draftId,
       new ScaffoldEnvironmentBinding({
@@ -42,7 +41,6 @@ describe("scaffoldSessionUiStore", () => {
 
     expect(useScaffoldSessionUiStore.getState().entriesByDraftId[draftId]).toMatchObject({
       phase: "ready",
-      queuedSend: true,
       environmentId: "remote",
       sessionId: "ses_1",
       lifecycleEpoch: 2,
@@ -50,5 +48,8 @@ describe("scaffoldSessionUiStore", () => {
     expect(
       JSON.stringify(useScaffoldSessionUiStore.getState().entriesByDraftId[draftId]),
     ).not.toContain("credential");
+    expect(
+      JSON.stringify(useScaffoldSessionUiStore.getState().entriesByDraftId[draftId]),
+    ).not.toContain("queuedSend");
   });
 });

@@ -13,6 +13,7 @@ import {
   makeSessionFabricDirectoryClient,
   sessionFabricConnectionForContext,
 } from "./sessionFabricDirectory.ts";
+import { makeSessionFabricCapabilityAuthorization } from "./sessionFabricAuthorization.ts";
 
 const record = {
   sessionId: SessionFabricSessionId.make("global-session-1"),
@@ -117,10 +118,28 @@ describe("sessionFabricDirectory", () => {
   it.effect("searches and loads code plus continuation without browser storage", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly body: unknown }> = [];
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+        fetch: (async () =>
+          Response.json({
+            capability: "viewer-secret",
+            tokenType: "Bearer",
+            role: "viewer",
+            scopes: ["directory:read", "session:read"],
+            expiresAt: "2026-07-24T21:00:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings: {},
+          })) as typeof fetch,
+      });
       const client = makeSessionFabricDirectoryClient({
         relayBaseUrl: "https://relay.example/base/",
+        authorization,
         fetch: async (input, init) => {
           const url = String(input);
+          expect(new Headers(init?.headers).get("authorization")).toBe("Bearer viewer-secret");
           calls.push({ url, body: init?.body });
           if (url.endsWith("/search")) {
             return Response.json({
@@ -167,4 +186,46 @@ describe("sessionFabricDirectory", () => {
     expect(registration?.target.clientId).toBe(SessionFabricClientId.make("fresh-client"));
     expect(registration?.target.environmentId).toBe("session-fabric:global-session-1");
   });
+
+  it.effect("refreshes a rejected viewer capability once and still reads an offline session", () =>
+    Effect.gen(function* () {
+      let capabilityCalls = 0;
+      const relayAuthorizationHeaders: Array<string | null> = [];
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+        fetch: (async () => {
+          capabilityCalls += 1;
+          return Response.json({
+            capability: `viewer-${capabilityCalls}`,
+            tokenType: "Bearer",
+            role: "viewer",
+            scopes: ["directory:read", "session:read"],
+            expiresAt: "2026-07-24T21:00:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings: {},
+          });
+        }) as typeof fetch,
+      });
+      const client = makeSessionFabricDirectoryClient({
+        relayBaseUrl: "https://relay.example/",
+        authorization,
+        fetch: (async (_input, init) => {
+          const header = new Headers(init?.headers).get("authorization");
+          relayAuthorizationHeaders.push(header);
+          if (header === "Bearer viewer-1") return new Response(null, { status: 401 });
+          return Response.json({
+            sessions: [{ ...record, runnerState: "offline" }],
+          });
+        }) as typeof fetch,
+      });
+
+      const listed = yield* client.list();
+      expect(listed.sessions[0]?.runnerState).toBe("offline");
+      expect(capabilityCalls).toBe(2);
+      expect(relayAuthorizationHeaders).toEqual(["Bearer viewer-1", "Bearer viewer-2"]);
+    }),
+  );
 });

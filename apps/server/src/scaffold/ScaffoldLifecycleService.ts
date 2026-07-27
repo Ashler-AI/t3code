@@ -7,11 +7,13 @@ import {
   ScaffoldSessionLinks,
   type ScaffoldSessionObservation,
   type ScaffoldPrepareConnectionInput,
+  type SessionFabricCapabilityGrant,
 } from "@t3tools/contracts";
 
 import {
   makeScaffoldControlPlaneClient,
   type ScaffoldControlPlaneClient,
+  type ScaffoldSessionFabricCapabilityInput,
 } from "./ScaffoldControlPlaneClient.ts";
 import { resolveScaffoldTarget, ScaffoldConfigurationError } from "./ScaffoldConfig.ts";
 import * as DateTime from "effect/DateTime";
@@ -28,6 +30,19 @@ export interface ScaffoldLifecycleServiceOptions {
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly readinessTimeoutMs?: number;
   readonly readinessIntervalMs?: number;
+}
+
+function configuredCapabilityDeployment(
+  requested: ScaffoldDeployment | undefined,
+  environment: Readonly<Record<string, string | undefined>>,
+): ScaffoldDeployment {
+  if (requested !== undefined) return requested;
+  const configured = environment.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT?.trim().toLowerCase();
+  if (configured === "staging" || configured === "production") return configured;
+  const hasStaging = Boolean(environment.T3CODE_SCAFFOLD_STAGING_URL?.trim());
+  const hasProduction = Boolean(environment.T3CODE_SCAFFOLD_PRODUCTION_URL?.trim());
+  if (hasStaging !== hasProduction) return hasStaging ? "staging" : "production";
+  throw configurationError();
 }
 
 function configurationError(): ScaffoldLifecycleError {
@@ -60,6 +75,7 @@ function stableLinks(baseUrl: string, sessionId: string): ScaffoldSessionLinks {
 }
 
 export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOptions = {}) {
+  const serviceEnvironment = options.environment ?? process.env;
   const now = options.now ?? Date.now;
   const sleep =
     options.sleep ?? ((milliseconds: number) => NodeTimersPromises.setTimeout(milliseconds));
@@ -70,7 +86,7 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
     if (options.client) return options.client(deployment);
     try {
       return makeScaffoldControlPlaneClient({
-        target: resolveScaffoldTarget(deployment, options.environment),
+        target: resolveScaffoldTarget(deployment, serviceEnvironment),
       });
     } catch (error) {
       if (error instanceof ScaffoldConfigurationError) throw configurationError();
@@ -231,7 +247,15 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
     });
   };
 
-  return { prepare, pause };
+  const issueSessionFabricCapability = async (input: {
+    readonly deployment?: ScaffoldDeployment;
+    readonly capability: ScaffoldSessionFabricCapabilityInput;
+  }): Promise<SessionFabricCapabilityGrant> => {
+    const deployment = configuredCapabilityDeployment(input.deployment, serviceEnvironment);
+    return clientFor(deployment).issueSessionFabricCapability(input.capability);
+  };
+
+  return { prepare, pause, issueSessionFabricCapability };
 }
 
 export type ScaffoldLifecycleService = ReturnType<typeof makeScaffoldLifecycleService>;

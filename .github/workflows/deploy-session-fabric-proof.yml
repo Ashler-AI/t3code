@@ -31,6 +31,10 @@ jobs:
       ALCHEMY_TELEMETRY_DISABLED: "1"
       CI: "true"
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      SESSION_FABRIC_ALLOWED_ORIGINS: ${{ vars.SESSION_FABRIC_ALLOWED_ORIGINS }}
+      SESSION_FABRIC_AUTH_MODE: required
+      SESSION_FABRIC_CAPABILITY_AUDIENCE: t3code-session-fabric-proof
+      SESSION_FABRIC_CAPABILITY_ISSUER: https://session-fabric-proof.t3.tools
     outputs:
       relay_url: ${{ steps.endpoint.outputs.relay_url }}
     steps:
@@ -43,6 +47,10 @@ jobs:
           node-version-file: package.json
           cache: true
           run-install: true
+
+      - name: Generate ephemeral proof verifier
+        if: inputs.operation == 'deploy'
+        run: node infra/session-fabric/scripts/deployment-proof-auth.ts verifier
 
       - name: Apply isolated proof stack
         if: inputs.operation == 'deploy'
@@ -75,13 +83,23 @@ jobs:
           echo "### Session fabric proof" >> "$GITHUB_STEP_SUMMARY"
           echo "Relay URL: ${relay_url}" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Mint short-lived viewer and runner capabilities
+        if: inputs.operation == 'deploy'
+        run: node infra/session-fabric/scripts/deployment-proof-auth.ts capabilities
+
       - name: Verify deployed session fabric behavior
         if: inputs.operation == 'deploy'
         run: >-
           vp run --filter @t3tools/session-fabric-worker smoke:deployment --
           --relay-url "${{ steps.endpoint.outputs.relay_url }}"
+          --scaffold-origin "${SESSION_FABRIC_SMOKE_SCAFFOLD_ORIGIN}"
           --marker "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           --timeout 30000
+
+      - name: Remove ephemeral proof signing key
+        if: always() && inputs.operation == 'deploy'
+        shell: bash
+        run: rm -f "${SESSION_FABRIC_PROOF_PRIVATE_KEY_PATH:-}"
 
       - name: Destroy isolated proof stack
         if: inputs.operation == 'destroy'

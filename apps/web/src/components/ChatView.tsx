@@ -2,7 +2,7 @@ import {
   type ApprovalRequestId,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
-  type EnvironmentId,
+  EnvironmentId,
   type MessageId,
   type ModelSelection,
   type ProjectScript,
@@ -69,10 +69,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { isElectron } from "../env";
 import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
-import {
-  collapseExpandedComposerCursor,
-  parseStandaloneComposerSlashCommand,
-} from "../composer-logic";
+import { parseStandaloneComposerSlashCommand } from "../composer-logic";
 import {
   derivePendingApprovals,
   derivePendingUserInputs,
@@ -276,7 +273,6 @@ import {
   LastInvokedScriptByProjectSchema,
   type LocalDispatchSnapshot,
   PullRequestDialogState,
-  cloneComposerImageForRetry,
   deriveLockedProvider,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
@@ -1255,23 +1251,8 @@ function ChatViewContent(props: ChatViewProps) {
   const composerActiveProvider = useComposerDraftStore(
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
   );
-  const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
-  const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
-  const setComposerDraftTerminalContexts = useComposerDraftStore(
-    (store) => store.setTerminalContexts,
-  );
-  const setComposerDraftElementContexts = useComposerDraftStore(
-    (store) => store.setElementContexts,
-  );
-  const setComposerDraftPreviewAnnotations = useComposerDraftStore(
-    (store) => store.setPreviewAnnotations,
-  );
-  const setComposerDraftReviewComments = useComposerDraftStore((store) => store.setReviewComments);
   const addComposerDraftTranscriptAnnotation = useComposerDraftStore(
     (store) => store.addTranscriptAnnotation,
-  );
-  const setComposerDraftTranscriptAnnotations = useComposerDraftStore(
-    (store) => store.setTranscriptAnnotations,
   );
   const setComposerDraftModelSelection = useComposerDraftStore((store) => store.setModelSelection);
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
@@ -1689,10 +1670,8 @@ function ChatViewContent(props: ChatViewProps) {
     ? scaffoldSessionForEnvironment(scaffoldSessionsByDraftId, activeThread.environmentId)
     : null;
   const scaffoldSendPending =
-    (scaffoldSessionUi ?? activeScaffoldSession)?.queuedSend === true &&
-    ((scaffoldSessionUi ?? activeScaffoldSession)?.phase === "creating" ||
-      (scaffoldSessionUi ?? activeScaffoldSession)?.phase === "resuming" ||
-      activeProject === null);
+    (scaffoldSessionUi ?? activeScaffoldSession)?.phase === "creating" ||
+    (scaffoldSessionUi ?? activeScaffoldSession)?.phase === "resuming";
   const activeEnvironmentConnectionPhase = activeEnvironment?.connection.phase ?? "available";
   const activeEnvironmentUnavailable =
     activeEnvironment !== null &&
@@ -4857,11 +4836,6 @@ function ChatViewContent(props: ChatViewProps) {
       }
       return;
     }
-    if (draftId && scaffoldSessionBusy) {
-      useScaffoldSessionUiStore.getState().queueSend(draftId);
-      flushComposerDraftStorage();
-      return;
-    }
     if (draftId && scaffoldSessionUi?.phase === "failed") {
       setThreadError(
         activeThread.id,
@@ -4869,18 +4843,15 @@ function ChatViewContent(props: ChatViewProps) {
       );
       return;
     }
-    if (draftId && scaffoldSessionUi && activeProject === null) {
-      useScaffoldSessionUiStore.getState().queueSend(draftId);
-      flushComposerDraftStorage();
-      return;
-    }
+    const scaffoldDeliveryDeferred =
+      scaffoldSessionBusy ||
+      activeScaffoldSession?.phase === "paused" ||
+      activeScaffoldSession?.phase === "resuming" ||
+      activeProject === null;
     if (activeScaffoldSession?.phase === "paused") {
       const scaffoldUi = useScaffoldSessionUiStore.getState();
-      scaffoldUi.queueSend(activeScaffoldSession.draftId);
       scaffoldUi.setPhase(activeScaffoldSession.draftId, "resuming");
-      flushComposerDraftStorage();
       void handleReconnectActiveEnvironment(activeThread.environmentId);
-      return;
     }
     if (!activeProject) {
       toastManager.add(
@@ -5018,9 +4989,6 @@ function ChatViewContent(props: ChatViewProps) {
         }),
       );
     }
-    promptRef.current = "";
-    clearComposerDraftContent(composerDraftTarget);
-    composerRef.current?.resetCursorState();
 
     let firstComposerAttachmentName: string | null = null;
     let firstComposerAttachmentType: "image" | "file" | null = null;
@@ -5052,7 +5020,7 @@ function ChatViewContent(props: ChatViewProps) {
 
     let failure: AtomCommandResult<unknown, unknown> | null = null;
     let pendingTurnPersistenceError: Error | null = null;
-    let firstMessagePersistedToOutbox = false;
+    let messagePersistedToOutbox = false;
     // Auto-title from first message
     if (isFirstMessage && isServerThread) {
       const titleResult = await updateThreadMetadata({
@@ -5136,70 +5104,60 @@ function ChatViewContent(props: ChatViewProps) {
         ...(bootstrap ? { bootstrap } : {}),
         createdAt: messageCreatedAt,
       };
-      if (isFirstMessage) {
-        try {
-          await enqueuePendingTurn(browserPendingTurnOutbox, {
-            idempotencyKey: commandIdForSend,
+      const outboxEnvironmentId =
+        scaffoldSessionUi?.environmentId === null
+          ? EnvironmentId.make(`scaffold-pending:${scaffoldSessionUi.draftId}`)
+          : environmentId;
+      try {
+        await enqueuePendingTurn(browserPendingTurnOutbox, {
+          idempotencyKey: commandIdForSend,
+          environmentId: outboxEnvironmentId,
+          threadId: threadIdForSend,
+          messageId: messageIdForSend,
+          draftId,
+          input: turnStartInput,
+          createdAt: messageCreatedAt,
+        });
+        messagePersistedToOutbox = true;
+        promptRef.current = "";
+        clearComposerDraftContent(composerDraftTarget);
+        composerRef.current?.resetCursorState();
+        flushComposerDraftStorage();
+      } catch (error) {
+        pendingTurnPersistenceError =
+          error instanceof Error ? error : new Error("Could not save the pending message.");
+      }
+
+      if (pendingTurnPersistenceError === null && messagePersistedToOutbox) {
+        if (scaffoldDeliveryDeferred || activeEnvironmentConnectionPhase !== "connected") {
+          turnStartSucceeded = true;
+        } else {
+          const results = await drainPendingTurnOutbox({
+            storage: browserPendingTurnOutbox,
             environmentId,
             threadId: threadIdForSend,
-            messageId: messageIdForSend,
-            draftId,
-            input: turnStartInput,
-            createdAt: messageCreatedAt,
+            idempotencyKey: commandIdForSend,
+            dispatch: async (entry) => {
+              const startResult = await startThreadTurn({ environmentId, input: entry.input });
+              if (startResult._tag === "Failure") {
+                throw squashAtomCommandFailure(startResult);
+              }
+            },
           });
-          firstMessagePersistedToOutbox = true;
-        } catch (error) {
-          pendingTurnPersistenceError =
-            error instanceof Error ? error : new Error("Could not save the pending message.");
+          turnStartSucceeded = results.some(
+            (result) => result.outcome === "sent" || result.outcome === "acknowledged",
+          );
+          const drainFailure = results.find((result) => result.outcome === "failed");
+          if (drainFailure)
+            pendingTurnPersistenceError = new Error(
+              drainFailure.error ?? "Failed to send message.",
+            );
         }
-      }
-
-      let startResult: Awaited<ReturnType<typeof startThreadTurn>> | null = null;
-      let drainedFirstTurn = false;
-      if (pendingTurnPersistenceError === null && firstMessagePersistedToOutbox) {
-        const results = await drainPendingTurnOutbox({
-          storage: browserPendingTurnOutbox,
-          environmentId,
-          threadId: threadIdForSend,
-          idempotencyKey: commandIdForSend,
-          dispatch: async (entry) => {
-            startResult = await startThreadTurn({ environmentId, input: entry.input });
-            if (startResult._tag === "Failure") {
-              throw squashAtomCommandFailure(startResult);
-            }
-          },
-        });
-        drainedFirstTurn = results.some(
-          (result) => result.outcome === "sent" || result.outcome === "acknowledged",
-        );
-      } else if (pendingTurnPersistenceError === null) {
-        startResult = await startThreadTurn({ environmentId, input: turnStartInput });
-      }
-
-      if (pendingTurnPersistenceError !== null) {
-        // The durable write is part of accepting a first prompt. If it fails,
-        // leave the composer intact and do not create an untracked server turn.
-      } else if (startResult?._tag === "Failure") {
-        failure = startResult;
-      } else if (drainedFirstTurn || startResult?._tag === "Success") {
-        turnStartSucceeded = true;
       }
     }
 
     if (failure !== null || pendingTurnPersistenceError !== null) {
-      if (
-        !firstMessagePersistedToOutbox &&
-        promptRef.current.length === 0 &&
-        composerImagesRef.current.length === 0 &&
-        composerTerminalContextsRef.current.length === 0 &&
-        composerElementContextsRef.current.length === 0 &&
-        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.previewAnnotations
-          .length ?? 0) === 0 &&
-        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.reviewComments
-          .length ?? 0) === 0 &&
-        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)
-          ?.transcriptAnnotations.length ?? 0) === 0
-      ) {
+      if (!messagePersistedToOutbox) {
         setOptimisticUserMessages((existing) => {
           const removed = existing.filter((message) => message.id === messageIdForSend);
           for (const message of removed) {
@@ -5207,26 +5165,6 @@ function ChatViewContent(props: ChatViewProps) {
           }
           const next = existing.filter((message) => message.id !== messageIdForSend);
           return next.length === existing.length ? existing : next;
-        });
-        promptRef.current = promptForSend;
-        const retryComposerImages = composerImagesSnapshot.map(cloneComposerImageForRetry);
-        composerImagesRef.current = retryComposerImages;
-        composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
-        composerElementContextsRef.current = composerElementContextsSnapshot;
-        setComposerDraftPrompt(composerDraftTarget, promptForSend);
-        addComposerDraftImages(composerDraftTarget, retryComposerImages);
-        setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
-        setComposerDraftElementContexts(composerDraftTarget, composerElementContextsSnapshot);
-        setComposerDraftPreviewAnnotations(composerDraftTarget, composerPreviewAnnotationsSnapshot);
-        setComposerDraftReviewComments(composerDraftTarget, composerReviewCommentsSnapshot);
-        setComposerDraftTranscriptAnnotations(
-          composerDraftTarget,
-          composerTranscriptAnnotationsSnapshot,
-        );
-        composerRef.current?.resetCursorState({
-          cursor: collapseExpandedComposerCursor(promptForSend, promptForSend.length),
-          prompt: promptForSend,
-          detectTrigger: true,
         });
       }
       if (pendingTurnPersistenceError !== null) {
@@ -5249,29 +5187,10 @@ function ChatViewContent(props: ChatViewProps) {
   };
 
   useEffect(() => {
-    const queuedScaffoldSession = scaffoldSessionUi ?? activeScaffoldSession;
-    if (
-      !queuedScaffoldSession ||
-      (queuedScaffoldSession.phase !== "ready" && queuedScaffoldSession.phase !== "resuming") ||
-      !queuedScaffoldSession.queuedSend ||
-      activeProject === null ||
-      activeEnvironmentConnectionPhase !== "connected"
-    ) {
-      return;
-    }
-    const scaffoldUi = useScaffoldSessionUiStore.getState();
-    scaffoldUi.setPhase(queuedScaffoldSession.draftId, "ready");
-    scaffoldUi.clearQueuedSend(queuedScaffoldSession.draftId);
-    composerRef.current?.submit();
-  }, [
-    activeEnvironmentConnectionPhase,
-    activeProject,
-    composerRef,
-    activeScaffoldSession,
-    draftId,
-    scaffoldSessionUi?.phase,
-    scaffoldSessionUi?.queuedSend,
-  ]);
+    const session = scaffoldSessionUi ?? activeScaffoldSession;
+    if (session?.phase !== "resuming" || activeEnvironmentConnectionPhase !== "connected") return;
+    useScaffoldSessionUiStore.getState().setPhase(session.draftId, "ready");
+  }, [activeEnvironmentConnectionPhase, activeScaffoldSession, scaffoldSessionUi]);
 
   const onInterrupt = async () => {
     if (!activeThread) return;
