@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import * as NodeOS from "node:os";
+import * as NodeCrypto from "node:crypto";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -22,7 +23,13 @@ import { ChildProcess } from "effect/unstable/process";
 import { type DevShareError, shareDevServer, unshareDevServer } from "./lib/dev-share.ts";
 import { loadRepoEnv } from "./lib/public-config.ts";
 
-Object.assign(process.env, loadRepoEnv());
+const repoEnvironment = loadRepoEnv();
+// Scaffold owns these only inside an actual sandbox runtime. Never synthesize
+// them from repository env files for a local child process; ambient runtime
+// values already present in process.env remain authoritative.
+delete repoEnvironment.SCAFFOLD_RUNTIME_DIR;
+delete repoEnvironment.SCAFFOLD_SESSION_ID;
+Object.assign(process.env, repoEnvironment);
 
 const BASE_SERVER_PORT = 13773;
 const BASE_WEB_PORT = 5733;
@@ -66,6 +73,7 @@ export function isProxiableBindHost(host: string): boolean {
     normalized === "[::]"
   );
 }
+const LOCAL_DEV_BOOTSTRAP_TOKEN_BYTES = 32;
 
 export const DEFAULT_T3_HOME = Effect.map(Effect.service(Path.Path), (path) =>
   path.join(NodeOS.homedir(), ".t3"),
@@ -302,6 +310,20 @@ interface CreateDevRunnerEnvInput {
   readonly host: string | undefined;
   readonly port: number | undefined;
   readonly devUrl: URL | undefined;
+  readonly localDevBootstrapToken?: string;
+}
+
+function isLoopbackDevHostname(hostname: string): boolean {
+  const normalized = hostname
+    .trim()
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, "$1");
+  const octets = normalized.split(".");
+  const isIpv4Loopback =
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255);
+  return normalized === "localhost" || normalized === "::1" || isIpv4Loopback;
 }
 
 export function createDevRunnerEnv({
@@ -316,6 +338,7 @@ export function createDevRunnerEnv({
   host,
   port,
   devUrl,
+  localDevBootstrapToken,
 }: CreateDevRunnerEnvInput): Effect.Effect<NodeJS.ProcessEnv, never, Path.Path> {
   return Effect.gen(function* () {
     const serverPort = port ?? BASE_SERVER_PORT + serverOffset;
@@ -415,6 +438,37 @@ export function createDevRunnerEnv({
     if (isDesktopMode) {
       output.HOST = DESKTOP_DEV_LOOPBACK_HOST;
       delete output.T3CODE_DESKTOP_WS_URL;
+    }
+
+    delete output.T3CODE_LOCAL_DEV_AUTO_AUTH;
+    delete output.T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN;
+    delete output.VITE_T3CODE_SESSION_FABRIC_AUTH_MODE;
+    const devServerUrl = new URL(output.VITE_DEV_SERVER_URL!);
+    const localDevAutoAuthEnabled =
+      mode === "dev" &&
+      isLoopbackDevHostname(devServerUrl.hostname) &&
+      (host === undefined || isLoopbackDevHostname(host)) &&
+      typeof localDevBootstrapToken === "string" &&
+      localDevBootstrapToken.length > 0;
+    const isCombinedLoopbackDev =
+      mode === "dev" &&
+      isLoopbackDevHostname(devServerUrl.hostname) &&
+      (host === undefined || isLoopbackDevHostname(host));
+    const configuredSessionFabricAuthMode =
+      output.T3CODE_SESSION_FABRIC_AUTH_MODE?.trim().toLowerCase();
+    if (isCombinedLoopbackDev) {
+      if (configuredSessionFabricAuthMode === undefined || configuredSessionFabricAuthMode === "") {
+        output.T3CODE_SESSION_FABRIC_AUTH_MODE = "disabled";
+      }
+    } else if (configuredSessionFabricAuthMode === "disabled") {
+      delete output.T3CODE_SESSION_FABRIC_AUTH_MODE;
+    }
+    if (localDevAutoAuthEnabled) {
+      output.T3CODE_LOCAL_DEV_AUTO_AUTH = "1";
+      output.T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN = localDevBootstrapToken;
+    }
+    if (isCombinedLoopbackDev && output.T3CODE_SESSION_FABRIC_AUTH_MODE !== undefined) {
+      output.VITE_T3CODE_SESSION_FABRIC_AUTH_MODE = output.T3CODE_SESSION_FABRIC_AUTH_MODE;
     }
 
     return output;
@@ -677,6 +731,10 @@ export function runDevRunnerWithInput(input: DevRunnerCliInput) {
       (input.t3Home?.trim() || undefined) ??
       worktreeHome ??
       (hostEnvironment.T3CODE_HOME?.trim() || undefined);
+    const localDevBootstrapToken =
+      input.mode === "dev"
+        ? NodeCrypto.randomBytes(LOCAL_DEV_BOOTSTRAP_TOKEN_BYTES).toString("base64url")
+        : undefined;
     const env = yield* createDevRunnerEnv({
       mode: input.mode,
       baseEnv: hostEnvironment,
@@ -689,6 +747,7 @@ export function runDevRunnerWithInput(input: DevRunnerCliInput) {
       host: input.host,
       port: input.port,
       devUrl: input.devUrl,
+      ...(localDevBootstrapToken === undefined ? {} : { localDevBootstrapToken }),
     });
 
     const selectionSuffix =

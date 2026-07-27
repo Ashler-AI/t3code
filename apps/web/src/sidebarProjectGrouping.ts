@@ -37,6 +37,19 @@ export interface SidebarProjectPickerEntry {
   isPreferred: boolean;
 }
 
+function prioritizePreferredPickerEntry(
+  entries: SidebarProjectPickerEntry[],
+): SidebarProjectPickerEntry[] {
+  const preferredIndex = entries.findIndex((entry) => entry.isPreferred);
+  if (preferredIndex <= 0) return entries;
+
+  return [
+    entries[preferredIndex]!,
+    ...entries.slice(0, preferredIndex),
+    ...entries.slice(preferredIndex + 1),
+  ];
+}
+
 interface SidebarProjectGroupCandidate {
   readonly logicalKey: string;
   readonly project: Project;
@@ -222,7 +235,7 @@ export function buildSidebarProjectSnapshots(input: {
 export function buildSidebarProjectPickerEntries(input: {
   groups: ReadonlyArray<SidebarProjectSnapshot>;
   preferredProjectRef: ScopedProjectRef | null;
-}) {
+}): SidebarProjectPickerEntry[] {
   const entries = input.groups.flatMap((group): SidebarProjectPickerEntry[] => {
     const isPreferred = input.preferredProjectRef
       ? group.memberProjectRefs.some(
@@ -251,12 +264,41 @@ export function buildSidebarProjectPickerEntries(input: {
 
     return [{ group, targetProject, isPreferred }];
   });
-  const preferredIndex = entries.findIndex((entry) => entry.isPreferred);
-  if (preferredIndex <= 0) return entries;
 
-  return [
-    entries[preferredIndex]!,
-    ...entries.slice(0, preferredIndex),
-    ...entries.slice(preferredIndex + 1),
-  ];
+  return prioritizePreferredPickerEntry(entries);
+}
+
+export function buildLocalSidebarProjectPickerEntries(input: {
+  groups: ReadonlyArray<SidebarProjectSnapshot>;
+  preferredProjectRef: ScopedProjectRef | null;
+  primaryEnvironmentId: EnvironmentId | null;
+}): SidebarProjectPickerEntry[] {
+  if (input.primaryEnvironmentId === null) return [];
+
+  const entries = input.groups.flatMap((group): SidebarProjectPickerEntry[] => {
+    const preferredLocalProject =
+      input.preferredProjectRef?.environmentId === input.primaryEnvironmentId
+        ? group.memberProjects.find(
+            (project) =>
+              project.environmentId === input.primaryEnvironmentId &&
+              project.id === input.preferredProjectRef?.projectId,
+          )
+        : undefined;
+    const targetProject =
+      preferredLocalProject ??
+      group.memberProjects.find((project) => project.environmentId === input.primaryEnvironmentId);
+    if (!targetProject) return [];
+
+    const isPreferred = input.preferredProjectRef
+      ? group.memberProjectRefs.some(
+          (projectRef) =>
+            projectRef.environmentId === input.preferredProjectRef?.environmentId &&
+            projectRef.projectId === input.preferredProjectRef.projectId,
+        )
+      : false;
+
+    return [{ group, targetProject, isPreferred }];
+  });
+
+  return prioritizePreferredPickerEntry(entries);
 }

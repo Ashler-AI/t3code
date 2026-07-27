@@ -26,6 +26,7 @@ const prepared = new ScaffoldPreparedConnection({
   httpBaseUrl: "https://sandbox.example.test/",
   wsBaseUrl: "wss://sandbox.example.test/",
   bootstrapCredential: "one-time-bootstrap",
+  attachCredential: "attach-secret",
   expiresAt: "2026-07-24T20:05:00.000Z",
 });
 
@@ -52,6 +53,7 @@ describe("Scaffold connection lifecycle client", () => {
     );
 
     expect(result.bootstrapCredential).toBe("one-time-bootstrap");
+    expect(result.attachCredential).toBe("attach-secret");
     expect(calls).toHaveLength(1);
     const [url, init] = calls[0]!;
     expect(String(url)).toContain("/api/scaffold/connection");

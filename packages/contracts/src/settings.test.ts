@@ -182,8 +182,8 @@ describe("ServerSettings worktree defaults", () => {
     expect(decodeServerSettings({}).defaultThreadEnvMode).toBe("worktree");
   });
 
-  it("defaults start-from-origin on for legacy configs", () => {
-    expect(decodeServerSettings({}).newWorktreesStartFromOrigin).toBe(true);
+  it("defaults new worktrees to the selected repository's current checkout", () => {
+    expect(decodeServerSettings({}).newWorktreesStartFromOrigin).toBe(false);
   });
 
   it("accepts start-from-origin updates", () => {

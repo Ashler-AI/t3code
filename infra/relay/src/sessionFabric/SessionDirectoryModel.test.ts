@@ -21,14 +21,15 @@ const session = (input: {
     publication: "public",
     runnerState: "offline",
     location: {
-      environmentKind: "local",
+      environmentKind: "scaffold",
       environmentId: "environment-1",
       projectId: "project-1",
       threadId: `thread-${input.id}`,
       repositoryRoot: "/workspace/repo",
       worktreePath: `/workspace/${input.id}`,
-      scaffoldSessionId: null,
-      scaffoldSessionUrl: null,
+      scaffoldSessionId: `ses_${input.id}`,
+      scaffoldSessionUrl: `https://scaffold.example/sessions/ses_${input.id}`,
+      scaffoldLifecycleEpoch: 1,
     },
     initialPrompt: input.text,
     searchableText: input.text,
@@ -98,5 +99,75 @@ describe("SessionDirectoryModel", () => {
       ],
     });
     expect(results[0]?.session.sessionId).toBe(SessionFabricSessionId.make("relay"));
+  });
+
+  it("filters local and private sessions before ranking and limiting", () => {
+    const publicScaffold = session({
+      id: "public-scaffold",
+      text: "relay capacity",
+      updatedAt: "2026-07-24T21:00:00.000Z",
+    });
+    const local = {
+      ...session({
+        id: "local",
+        text: "relay capacity exact match",
+        updatedAt: "2026-07-24T23:00:00.000Z",
+      }),
+      location: {
+        ...publicScaffold.location,
+        environmentKind: "local" as const,
+        scaffoldSessionId: null,
+        scaffoldSessionUrl: null,
+        scaffoldLifecycleEpoch: null,
+      },
+    } as SessionFabricSessionRecord;
+    const privateScaffold = {
+      ...session({
+        id: "private",
+        text: "relay capacity exact match",
+        updatedAt: "2026-07-24T22:00:00.000Z",
+      }),
+      publication: "local_only" as const,
+    };
+    const results = rankSessionDirectoryEntries({
+      query: "relay capacity",
+      queryEmbedding: null,
+      limit: 1,
+      entries: [
+        { session: local, embedding: null },
+        { session: privateScaffold, embedding: null },
+        { session: publicScaffold, embedding: null },
+      ],
+    });
+    expect(results.map((result) => result.session.sessionId)).toEqual([
+      SessionFabricSessionId.make("public-scaffold"),
+    ]);
+  });
+
+  it("keeps offline pre-epoch public Scaffold sessions searchable", () => {
+    const currentPublicScaffold = session({
+      id: "legacy-public-scaffold",
+      text: "recover relay history",
+      updatedAt: "2026-07-20T21:00:00.000Z",
+    });
+    const legacyPublicScaffold = {
+      ...currentPublicScaffold,
+      location: {
+        ...currentPublicScaffold.location,
+        scaffoldLifecycleEpoch: undefined,
+      },
+    } as SessionFabricSessionRecord;
+
+    const results = rankSessionDirectoryEntries({
+      query: "relay history",
+      queryEmbedding: null,
+      limit: 10,
+      entries: [{ session: legacyPublicScaffold, embedding: null }],
+    });
+
+    expect(legacyPublicScaffold.runnerState).toBe("offline");
+    expect(results.map((result) => result.session.sessionId)).toEqual([
+      SessionFabricSessionId.make("legacy-public-scaffold"),
+    ]);
   });
 });

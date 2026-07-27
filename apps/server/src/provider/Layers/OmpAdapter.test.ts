@@ -33,6 +33,7 @@ import {
   ompPromptSettlementBelongsToContext,
   parseOmpResume,
   parseOmpSteerResult,
+  resumedOmpCursorForSession,
 } from "./OmpAdapter.ts";
 
 const decodeOmpSettings = Schema.decodeSync(OmpSettings);
@@ -101,15 +102,19 @@ it("uses OMP's native steering extension and recognizes its idle fallback", () =
   });
 });
 
-it("advances OMP replay cursors across gaps and rejects duplicate boundaries", () => {
+it("advances OMP replay cursors contiguously and rejects gaps and duplicate boundaries", () => {
   assert.deepEqual(advanceOmpEventCursor({ currentSequence: 4 }), {
     sequence: 5,
     duplicate: false,
   });
-  assert.deepEqual(advanceOmpEventCursor({ currentSequence: 4, sourceSequence: 7 }), {
-    sequence: 7,
+  assert.deepEqual(advanceOmpEventCursor({ currentSequence: 4, sourceSequence: 5 }), {
+    sequence: 5,
     duplicate: false,
   });
+  assert.throws(
+    () => advanceOmpEventCursor({ currentSequence: 4, sourceSequence: 7 }),
+    /expected 5, received 7/,
+  );
   assert.deepEqual(advanceOmpEventCursor({ currentSequence: 7, sourceSequence: 7 }), {
     sequence: 7,
     duplicate: true,
@@ -150,6 +155,17 @@ it("restores legacy and monotonic OMP resume cursors with stable event identitie
     makeOmpSourceEventId("omp-session", 9, "content:assistant_text"),
     "omp:omp-session:acp:9:content%3Aassistant_text",
   );
+});
+
+it("starts a fresh OMP runtime at sequence zero unless the durable session identity matches", () => {
+  const persisted = parseOmpResume({
+    schemaVersion: 3,
+    sessionId: "durable-session",
+    eventSequence: 41,
+    acpSequence: 9,
+  });
+  assert.deepEqual(resumedOmpCursorForSession("durable-session", persisted), persisted);
+  assert.isUndefined(resumedOmpCursorForSession("fresh-session", persisted));
 });
 
 it.layer(testLayer)("OmpAdapter", (it) => {

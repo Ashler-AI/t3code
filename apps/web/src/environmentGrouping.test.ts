@@ -9,6 +9,7 @@ import {
   resolveProjectGroupingMode,
 } from "./logicalProject";
 import {
+  buildLocalSidebarProjectPickerEntries,
   buildPhysicalToLogicalProjectKeyMap,
   buildSidebarProjectPickerEntries,
   buildSidebarProjectSnapshots,
@@ -316,6 +317,99 @@ describe("environment grouping", () => {
     });
     expect(entries[0]?.isPreferred).toBe(true);
     expect(entries[1]?.group.displayName).toBe("separate");
+  });
+
+  it("targets the primary project for local sessions when the preferred project is remote", () => {
+    const primary = makeProject({ repositoryIdentity });
+    const remote = makeProject({
+      id: ProjectId.make("project-remote"),
+      environmentId: remoteEnvironmentId,
+      repositoryIdentity,
+    });
+    const separate = makeProject({
+      id: ProjectId.make("project-separate"),
+      title: "separate",
+      workspaceRoot: "/tmp/separate",
+    });
+    const groups = buildSidebarProjectSnapshots({
+      projects: [separate, primary, remote],
+      settings: defaultGroupingSettings,
+      primaryEnvironmentId,
+      resolveEnvironmentLabel: () => null,
+    });
+
+    const entries = buildLocalSidebarProjectPickerEntries({
+      groups,
+      preferredProjectRef: {
+        environmentId: remoteEnvironmentId,
+        projectId: remote.id,
+      },
+      primaryEnvironmentId,
+    });
+
+    expect(entries).toHaveLength(2);
+    expect(entries[0]?.group.projectKey).toBe(repositoryIdentity.canonicalKey);
+    expect(entries[0]?.targetProject).toMatchObject({
+      environmentId: primaryEnvironmentId,
+      id: primary.id,
+    });
+    expect(entries[0]?.isPreferred).toBe(true);
+  });
+
+  it("omits remote-only projects from the local session picker", () => {
+    const remote = makeProject({
+      id: ProjectId.make("project-remote"),
+      environmentId: remoteEnvironmentId,
+      repositoryIdentity,
+    });
+    const groups = buildSidebarProjectSnapshots({
+      projects: [remote],
+      settings: defaultGroupingSettings,
+      primaryEnvironmentId,
+      resolveEnvironmentLabel: () => null,
+    });
+
+    expect(
+      buildLocalSidebarProjectPickerEntries({
+        groups,
+        preferredProjectRef: {
+          environmentId: remoteEnvironmentId,
+          projectId: remote.id,
+        },
+        primaryEnvironmentId,
+      }),
+    ).toEqual([]);
+  });
+
+  it("preserves the preferred local worktree within a grouped repository", () => {
+    const primary = makeProject({ repositoryIdentity });
+    const preferredWorktree = makeProject({
+      id: ProjectId.make("project-preferred-worktree"),
+      workspaceRoot: "/tmp/preferred-worktree",
+      repositoryIdentity,
+    });
+    const groups = buildSidebarProjectSnapshots({
+      projects: [primary, preferredWorktree],
+      settings: defaultGroupingSettings,
+      primaryEnvironmentId,
+      resolveEnvironmentLabel: () => null,
+    });
+
+    const entries = buildLocalSidebarProjectPickerEntries({
+      groups,
+      preferredProjectRef: {
+        environmentId: primaryEnvironmentId,
+        projectId: preferredWorktree.id,
+      },
+      primaryEnvironmentId,
+    });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.targetProject).toMatchObject({
+      environmentId: primaryEnvironmentId,
+      id: preferredWorktree.id,
+    });
+    expect(entries[0]?.isPreferred).toBe(true);
   });
 
   it("keeps manual project order when building grouped sidebar entries", () => {

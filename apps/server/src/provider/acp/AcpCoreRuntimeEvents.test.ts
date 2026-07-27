@@ -312,4 +312,70 @@ describe("AcpCoreRuntimeEvents", () => {
       payload: { taskId: "agent-2", status: "failed", summary: "Provider exhausted" },
     });
   });
+
+  it("maps the live OMP hub jobs shape and carries late model metadata", () => {
+    const [snapshot] = extractAcpSubagentSnapshots({
+      toolCallId: "hub-tool-1",
+      status: "completed",
+      data: {
+        rawOutput: {
+          details: {
+            jobs: [
+              {
+                id: "PackageNameScout",
+                type: "task",
+                status: "completed",
+                label: "PackageNameScout",
+                resolvedModel: "openai-codex/gpt-5.4-mini:low",
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(snapshot).toMatchObject({
+      taskId: "PackageNameScout",
+      status: "completed",
+      description: "PackageNameScout",
+      model: "openai-codex/gpt-5.4-mini",
+      effort: "low",
+    });
+    if (!snapshot) throw new Error("expected completed hub job snapshot");
+
+    const common = {
+      provider: ProviderDriverKind.make("omp"),
+      threadId: "thread-1" as never,
+      turnId: TurnId.make("turn-1"),
+      snapshot,
+      rawPayload: { sessionId: "session-1" },
+    };
+    expect(
+      makeAcpSubagentTaskEvent({
+        ...common,
+        stamp: { eventId: "event-task-progress-model" as never, createdAt: "2026-07-24T00:00:03Z" },
+        lifecycle: "progress",
+      }),
+    ).toMatchObject({
+      type: "task.progress",
+      payload: {
+        taskId: "PackageNameScout",
+        model: "openai-codex/gpt-5.4-mini",
+        effort: "low",
+      },
+    });
+    expect(
+      makeAcpSubagentTaskEvent({
+        ...common,
+        stamp: { eventId: "event-task-complete-model" as never, createdAt: "2026-07-24T00:00:04Z" },
+        lifecycle: "completed",
+      }),
+    ).toMatchObject({
+      type: "task.completed",
+      payload: {
+        taskId: "PackageNameScout",
+        model: "openai-codex/gpt-5.4-mini",
+        effort: "low",
+      },
+    });
+  });
 });

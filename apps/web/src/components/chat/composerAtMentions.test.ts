@@ -9,6 +9,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import { makeSessionFabricCapabilityAuthorization } from "@t3tools/client-runtime/session-source";
 
 import {
   compatibleComposerSessionMentions,
@@ -136,8 +137,25 @@ describe("fabric composer session mentions", () => {
     const mentions = await loadComposerFabricSessionMentions({
       relayBaseUrl: "https://relay.example/base/",
       query: "login regression",
+      authorization: makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+        fetch: (async () =>
+          Response.json({
+            capability: "viewer-secret",
+            tokenType: "Bearer",
+            role: "viewer",
+            scopes: ["directory:read", "session:read"],
+            expiresAt: "2026-07-24T21:00:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings: {},
+          })) as typeof fetch,
+      }),
       fetch: async (input, init) => {
         expect(String(input)).toBe("https://relay.example/base/v1/session-fabric/search");
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer viewer-secret");
         expect(JSON.parse(String(init?.body))).toEqual({ query: "login regression", limit: 10 });
         return Response.json({
           results: [{ session: record, score: 0.93, matchText: record.searchableText }],

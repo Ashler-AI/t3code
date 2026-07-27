@@ -8,7 +8,7 @@ import {
   useLocation,
   useNavigate,
 } from "@tanstack/react-router";
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 
 import { APP_BASE_NAME, APP_DISPLAY_NAME, APP_STAGE_LABEL } from "../branding";
 import { resolveServerBackedAppDisplayName } from "../branding.logic";
@@ -52,6 +52,12 @@ import {
   createKeybindingsUpdateToastController,
   type KeybindingsUpdateToastController,
 } from "../components/KeybindingsUpdateToast.logic";
+import {
+  copyScaffoldSessionAndRegister,
+  registerScaffoldSessionCopy,
+} from "../connection/scaffoldSessionTransfer";
+import type { StartSessionCopy } from "../sessionTransferUi";
+import { readPreparedConnection } from "../state/session";
 
 export const Route = createRootRoute({
   beforeLoad: async ({ location }) => {
@@ -87,6 +93,31 @@ function RootRouteView() {
   const pathname = useLocation({ select: (location) => location.pathname });
   const { authGateState } = Route.useRouteContext();
   const primaryEnvironmentAuthenticated = authGateState.status === "authenticated";
+  const registerSessionCopy = useAtomCommand(registerScaffoldSessionCopy, {
+    reportFailure: false,
+  });
+  const startSessionCopy: StartSessionCopy = useCallback(
+    async (input) => {
+      const prepared = readPreparedConnection(input.source.environmentId);
+      if (prepared === null) {
+        throw new Error("The selected local environment is not connected.");
+      }
+      return copyScaffoldSessionAndRegister({
+        deployment: input.deployment,
+        source: input.source,
+        prepared,
+        register: async (binding) => {
+          const registered = await registerSessionCopy({
+            binding,
+            label: `Scaffold ${input.deployment}`,
+          });
+          if (registered._tag === "Failure") throw squashAtomCommandFailure(registered);
+          return registered.value;
+        },
+      });
+    },
+    [registerSessionCopy],
+  );
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -116,7 +147,7 @@ function RootRouteView() {
   }
 
   const appShell = (
-    <CommandPalette>
+    <CommandPalette {...(primaryEnvironmentAuthenticated ? { startSessionCopy } : {})}>
       <AppSidebarLayout>
         <Outlet />
       </AppSidebarLayout>

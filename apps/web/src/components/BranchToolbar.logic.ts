@@ -190,6 +190,13 @@ export function resolveBranchToolbarPrBranch(input: {
   return input.activeThreadBranch === input.resolvedActiveBranch ? input.activeThreadBranch : null;
 }
 
+export function resolveInitialWorktreeBaseBranch(input: {
+  currentGitBranch: string | null;
+  defaultBranchName: string | null;
+}): string | null {
+  return input.currentGitBranch ?? input.defaultBranchName;
+}
+
 export function resolveLocalCheckoutBranchMismatch(input: {
   effectiveEnvMode: EnvMode;
   activeWorktreePath: string | null;

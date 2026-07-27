@@ -4,7 +4,14 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  EventId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  RuntimeSessionId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { it, assert } from "@effect/vitest";
 import { assertSome } from "@effect/vitest/utils";
 import * as Effect from "effect/Effect";
@@ -120,6 +127,59 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
           activeTurnId: "turn-1",
         });
       }
+    }));
+
+  it("fails closed when a persisted canonical source cursor is malformed", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = ThreadId.make("thread-malformed-canonical-cursor");
+
+      yield* runtimeRepository.upsert({
+        threadId,
+        providerName: "omp",
+        providerInstanceId: ProviderInstanceId.make("omp"),
+        adapterKey: "omp",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-01-01T00:00:00.000Z",
+        resumeCursor: null,
+        runtimePayload: {
+          canonicalSourceCursor: {
+            environmentId: "environment-malformed",
+            threadId,
+            providerInstanceId: "omp",
+            runtimeSessionId: "runtime-malformed",
+            sourceSequence: "not-a-sequence",
+            eventId: "event-malformed",
+          },
+        },
+      });
+
+      const readExit = yield* Effect.exit(directory.getBinding(threadId));
+      assert.equal(readExit._tag, "Failure");
+
+      const writeExit = yield* Effect.exit(
+        directory.upsert({
+          threadId,
+          provider: ProviderDriverKind.make("omp"),
+          providerInstanceId: ProviderInstanceId.make("omp"),
+          runtimePayload: { statusDetail: "must-not-overwrite-malformed-state" },
+        }),
+      );
+      assert.equal(writeExit._tag, "Failure");
+
+      const persisted = Option.getOrThrow(yield* runtimeRepository.getByThreadId({ threadId }));
+      assert.deepEqual(persisted.runtimePayload, {
+        canonicalSourceCursor: {
+          environmentId: "environment-malformed",
+          threadId,
+          providerInstanceId: "omp",
+          runtimeSessionId: "runtime-malformed",
+          sourceSequence: "not-a-sequence",
+          eventId: "event-malformed",
+        },
+      });
     }));
 
   it("lists persisted bindings with metadata in oldest-first order", () =>
@@ -268,4 +328,137 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
 
       NodeFS.rmSync(tempDir, { recursive: true, force: true });
     }));
+
+  it("rehydrates the canonical source cursor and prevents regression after restart", () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-provider-canonical-cursor-"),
+      );
+      const dbPath = NodePath.join(tempDir, "orchestration.sqlite");
+      const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+      const threadId = ThreadId.make("thread-canonical-cursor-restart");
+      const cursor = {
+        environmentId: EnvironmentId.make("environment-canonical-cursor"),
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("omp"),
+        runtimeSessionId: RuntimeSessionId.make("runtime-canonical-cursor"),
+        sourceSequence: 11,
+        eventId: EventId.make("event-canonical-cursor-11"),
+      };
+
+      yield* Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory;
+        for (let sourceSequence = 1; sourceSequence <= cursor.sourceSequence; sourceSequence += 1) {
+          yield* directory.upsert({
+            provider: ProviderDriverKind.make("omp"),
+            providerInstanceId: ProviderInstanceId.make("omp"),
+            threadId,
+            canonicalSourceCursor: {
+              ...cursor,
+              sourceSequence,
+              eventId:
+                sourceSequence === cursor.sourceSequence
+                  ? cursor.eventId
+                  : EventId.make(`event-canonical-cursor-${sourceSequence}`),
+            },
+          });
+        }
+      }).pipe(Effect.provide(makeDirectoryLayer(persistenceLayer)));
+
+      yield* Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory;
+        const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        assert.deepEqual(binding.canonicalSourceCursor, cursor);
+
+        const regression = yield* Effect.exit(
+          directory.upsert({
+            provider: ProviderDriverKind.make("omp"),
+            providerInstanceId: ProviderInstanceId.make("omp"),
+            threadId,
+            canonicalSourceCursor: {
+              ...cursor,
+              sourceSequence: 10,
+              eventId: EventId.make("event-canonical-cursor-10"),
+            },
+          }),
+        );
+        assert.equal(regression._tag, "Failure");
+
+        const gap = yield* Effect.exit(
+          directory.upsert({
+            provider: ProviderDriverKind.make("omp"),
+            providerInstanceId: ProviderInstanceId.make("omp"),
+            threadId,
+            canonicalSourceCursor: {
+              ...cursor,
+              sourceSequence: 13,
+              eventId: EventId.make("event-canonical-cursor-13"),
+            },
+          }),
+        );
+        assert.equal(gap._tag, "Failure");
+
+        const instanceChange = yield* Effect.exit(
+          directory.upsert({
+            provider: ProviderDriverKind.make("omp"),
+            providerInstanceId: ProviderInstanceId.make("omp-secondary"),
+            threadId,
+            canonicalSourceCursor: {
+              ...cursor,
+              providerInstanceId: ProviderInstanceId.make("omp-secondary"),
+              sourceSequence: 12,
+              eventId: EventId.make("event-canonical-cursor-12"),
+            },
+          }),
+        );
+        assert.equal(instanceChange._tag, "Failure");
+
+        const persisted = Option.getOrThrow(yield* directory.getBinding(threadId));
+        assert.deepEqual(persisted.canonicalSourceCursor, cursor);
+
+        const resetCursor = {
+          ...cursor,
+          runtimeSessionId: RuntimeSessionId.make("runtime-canonical-cursor-reset"),
+          sourceSequence: 1,
+          eventId: EventId.make("event-canonical-cursor-reset-1"),
+        };
+        const selfAuthorizedReset = yield* Effect.exit(
+          directory.upsert({
+            provider: ProviderDriverKind.make("omp"),
+            providerInstanceId: ProviderInstanceId.make("omp"),
+            threadId,
+            resumeCursor: {
+              schemaVersion: 3,
+              sessionId: resetCursor.runtimeSessionId,
+              eventSequence: 1,
+              acpSequence: 1,
+            },
+            canonicalSourceCursor: resetCursor,
+          }),
+        );
+        assert.equal(selfAuthorizedReset._tag, "Failure");
+
+        yield* directory.upsert({
+          provider: ProviderDriverKind.make("omp"),
+          providerInstanceId: ProviderInstanceId.make("omp"),
+          threadId,
+          resumeCursor: {
+            schemaVersion: 3,
+            sessionId: resetCursor.runtimeSessionId,
+            eventSequence: 0,
+            acpSequence: 0,
+          },
+        });
+        yield* directory.upsert({
+          provider: ProviderDriverKind.make("omp"),
+          providerInstanceId: ProviderInstanceId.make("omp"),
+          threadId,
+          canonicalSourceCursor: resetCursor,
+        });
+        const resetBinding = Option.getOrThrow(yield* directory.getBinding(threadId));
+        assert.deepEqual(resetBinding.canonicalSourceCursor, resetCursor);
+      }).pipe(Effect.provide(makeDirectoryLayer(persistenceLayer)));
+
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }).pipe(Effect.provide(NodeServices.layer)));
 });

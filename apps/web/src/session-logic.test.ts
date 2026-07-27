@@ -18,10 +18,25 @@ import {
   findSidebarProposedPlan,
   hasActionableProposedPlan,
   isLatestTurnSettled,
+  providerOptionsForRuntimeProfile,
   workEntryIndicatesToolFailure,
   workEntryIndicatesToolNeutralStatus,
   workEntryIndicatesToolSuccess,
 } from "./session-logic";
+
+describe("provider picker catalog", () => {
+  it("exposes OMP plus optional native harnesses in the local product", () => {
+    expect(providerOptionsForRuntimeProfile("local").map(({ value }) => value)).toEqual([
+      "omp",
+      "codex",
+      "claudeAgent",
+    ]);
+  });
+
+  it("exposes only OMP in the Scaffold product profile", () => {
+    expect(providerOptionsForRuntimeProfile("scaffold").map(({ value }) => value)).toEqual(["omp"]);
+  });
+});
 
 let nextActivityId = 0;
 
@@ -814,8 +829,6 @@ describe("deriveWorkLogEntries", () => {
           taskId: "agent-1",
           taskType: "subagent",
           detail: "Review the authentication changes",
-          model: "gpt-5.6-terra",
-          effort: "high",
         },
       }),
       makeActivity({
@@ -823,7 +836,12 @@ describe("deriveWorkLogEntries", () => {
         createdAt: "2026-02-23T00:00:02.000Z",
         kind: "task.progress",
         summary: "Reviewing",
-        payload: { taskId: "agent-1", detail: "Checking OAuth boundaries" },
+        payload: {
+          taskId: "agent-1",
+          detail: "Checking OAuth boundaries",
+          model: "gpt-5.6-terra",
+          effort: "high",
+        },
       }),
       makeActivity({
         id: "subagent-completed",

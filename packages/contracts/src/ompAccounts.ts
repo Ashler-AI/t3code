@@ -174,6 +174,8 @@ export const OmpLoginChallenge = Schema.Struct({
   message: Schema.optionalKey(TrimmedNonEmptyString),
   prompt: Schema.optionalKey(TrimmedNonEmptyString),
   maskedAccount: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Epoch-millisecond deadline after which clients must dismiss/cancel this flow. */
+  expiresAt: Schema.optionalKey(Schema.Number),
   /** Terminal result. Present when `kind` is `complete`. */
   outcome: Schema.optionalKey(Schema.Literals(["success", "failure"])),
 });

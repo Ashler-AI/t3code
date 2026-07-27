@@ -100,6 +100,48 @@ describe("ProviderRuntimeEvent", () => {
     });
   });
 
+  it("preserves late subagent model and effort metadata", () => {
+    const progress = decodeRuntimeEvent({
+      type: "task.progress",
+      eventId: "omp:session-1:10",
+      provider: "omp",
+      providerInstanceId: "omp",
+      createdAt: "2026-07-24T00:00:03.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: {
+        taskId: "PackageNameScout",
+        description: "PackageNameScout",
+        model: "openai-codex/gpt-5.4-mini",
+        effort: "low",
+      },
+    });
+    const completed = decodeRuntimeEvent({
+      type: "task.completed",
+      eventId: "omp:session-1:11",
+      provider: "omp",
+      providerInstanceId: "omp",
+      createdAt: "2026-07-24T00:00:04.000Z",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: {
+        taskId: "PackageNameScout",
+        status: "completed",
+        model: "openai-codex/gpt-5.4-mini",
+        effort: "low",
+      },
+    });
+
+    expect(progress.payload).toMatchObject({
+      model: "openai-codex/gpt-5.4-mini",
+      effort: "low",
+    });
+    expect(completed.payload).toMatchObject({
+      model: "openai-codex/gpt-5.4-mini",
+      effort: "low",
+    });
+  });
+
   it("decodes turn.plan.updated for plan rendering", () => {
     const parsed = decodeRuntimeEvent({
       type: "turn.plan.updated",

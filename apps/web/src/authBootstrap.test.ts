@@ -132,6 +132,7 @@ describe("resolveInitialServerAuthGateState", () => {
     __resetServerAuthBootstrapForTests();
     __setPrimaryHttpRunnerForTests();
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -236,6 +237,35 @@ describe("resolveInitialServerAuthGateState", () => {
       status: "requires-auth",
       auth: LOOPBACK_AUTH,
     });
+  });
+
+  it("bootstraps combined loopback dev through the same-origin Vite endpoint", async () => {
+    const nextSession = sequence(
+      unauthenticatedSession(LOOPBACK_AUTH),
+      authenticatedSession(LOOPBACK_AUTH),
+    );
+    const testApi = await installAuthApi({ session: nextSession });
+    vi.stubEnv("VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED", "true");
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(input).toBe("/__t3/local-dev/browser-session");
+      expect(init).toMatchObject({
+        method: "POST",
+        credentials: "include",
+        headers: { "x-t3-local-dev-bootstrap": "1" },
+      });
+      expect(init?.body).toBeUndefined();
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { resolveInitialServerAuthGateState } = await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(testApi.calls.browserSession).toEqual([]);
+    expect(testApi.calls.session).toBe(2);
   });
 
   it("retries transient auth session bootstrap failures after restart", async () => {

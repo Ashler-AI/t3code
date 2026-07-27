@@ -8,6 +8,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as LogLevel from "effect/LogLevel";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as SchemaTransformation from "effect/SchemaTransformation";
@@ -94,6 +95,10 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  otlpAuthorization: Config.redacted("T3CODE_OTLP_AUTHORIZATION").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   otlpExportIntervalMs: Config.int("T3CODE_OTLP_EXPORT_INTERVAL_MS").pipe(
     Config.withDefault(10_000),
   ),
@@ -123,6 +128,11 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  localDevAutoAuth: Config.boolean("T3CODE_LOCAL_DEV_AUTO_AUTH").pipe(Config.withDefault(false)),
+  localDevBootstrapToken: Config.redacted("T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   trustedPublicBaseUrl: Config.url("T3CODE_TRUSTED_PUBLIC_BASE_URL").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -144,6 +154,41 @@ const EnvServerConfig = Config.all({
     Config.map(Option.getOrUndefined),
   ),
 });
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname
+    .trim()
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, "$1");
+  const octets = normalized.split(".");
+  const isIpv4Loopback =
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255);
+  return normalized === "localhost" || normalized === "::1" || isIpv4Loopback;
+}
+
+export function resolveCombinedLoopbackDevBootstrapToken(input: {
+  readonly enabled: boolean;
+  readonly token: string | undefined;
+  readonly mode: ServerConfig.RuntimeMode;
+  readonly host: string | undefined;
+  readonly devUrl: URL | undefined;
+}): string | undefined {
+  const token = input.token?.trim();
+  if (
+    !input.enabled ||
+    !token ||
+    input.mode !== "web" ||
+    !input.devUrl ||
+    input.devUrl.protocol !== "http:" ||
+    !isLoopbackHostname(input.devUrl.hostname) ||
+    (input.host !== undefined && !isLoopbackHostname(input.host))
+  ) {
+    return undefined;
+  }
+  return token;
+}
 
 export interface CliServerFlags {
   readonly mode: Option.Option<ServerConfig.RuntimeMode>;
@@ -323,7 +368,24 @@ export const resolveServerConfig = (
       ),
       () => mode === "desktop",
     );
-    const desktopBootstrapToken = bootstrap?.desktopBootstrapToken;
+    const desktopBootstrapToken =
+      bootstrap?.desktopBootstrapToken ??
+      resolveCombinedLoopbackDevBootstrapToken({
+        enabled: env.localDevAutoAuth,
+        token:
+          env.localDevBootstrapToken === undefined
+            ? undefined
+            : Redacted.value(env.localDevBootstrapToken),
+        mode,
+        host: Option.getOrUndefined(
+          resolveOptionPrecedence(
+            normalizedFlags.host,
+            Option.fromUndefinedOr(env.host),
+            Option.fromUndefinedOr(bootstrap?.host),
+          ),
+        ),
+        devUrl,
+      });
     const desktopTelemetryFd = bootstrap?.desktopTelemetryFd;
     const desktopTelemetryControlFd = bootstrap?.desktopTelemetryControlFd;
     const resourceMonitorPath = bootstrap?.resourceMonitorPath;
@@ -385,6 +447,7 @@ export const resolveServerConfig = (
         env.otlpMetricsUrl ??
         bootstrap?.otlpMetricsUrl ??
         persistedObservabilitySettings.otlpMetricsUrl,
+      ...(env.otlpAuthorization === undefined ? {} : { otlpAuthorization: env.otlpAuthorization }),
       otlpExportIntervalMs: env.otlpExportIntervalMs,
       otlpServiceName: env.otlpServiceName,
       mode,

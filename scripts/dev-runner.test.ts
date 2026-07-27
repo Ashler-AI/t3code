@@ -518,6 +518,92 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
         assert.equal(env.VITE_WS_URL, "ws://127.0.0.1:13773");
       }),
     );
+
+    it.effect("enables server-side browser bootstrap only for combined loopback dev", () =>
+      Effect.gen(function* () {
+        const env = yield* createDevRunnerEnv({
+          mode: "dev",
+          baseEnv: {
+            T3CODE_LOCAL_DEV_AUTO_AUTH: "stale",
+            T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN: "stale-token",
+          },
+          serverOffset: 0,
+          webOffset: 0,
+          t3Home: undefined,
+          browser: undefined,
+          autoBootstrapProjectFromCwd: undefined,
+          logWebSocketEvents: undefined,
+          host: "127.0.0.1",
+          port: undefined,
+          devUrl: undefined,
+          localDevBootstrapToken: "runner-generated-token",
+        });
+
+        assert.equal(env.T3CODE_LOCAL_DEV_AUTO_AUTH, "1");
+        assert.equal(env.T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN, "runner-generated-token");
+        assert.equal(env.T3CODE_SESSION_FABRIC_AUTH_MODE, "disabled");
+        assert.equal(env.VITE_T3CODE_SESSION_FABRIC_AUTH_MODE, "disabled");
+      }),
+    );
+
+    it.effect("preserves explicit required session fabric auth in combined loopback dev", () =>
+      Effect.gen(function* () {
+        const env = yield* createDevRunnerEnv({
+          mode: "dev",
+          baseEnv: {
+            T3CODE_SESSION_FABRIC_AUTH_MODE: "required",
+          },
+          serverOffset: 0,
+          webOffset: 0,
+          t3Home: undefined,
+          browser: undefined,
+          autoBootstrapProjectFromCwd: undefined,
+          logWebSocketEvents: undefined,
+          host: "127.0.0.1",
+          port: undefined,
+          devUrl: undefined,
+        });
+
+        assert.equal(env.T3CODE_SESSION_FABRIC_AUTH_MODE, "required");
+        assert.equal(env.VITE_T3CODE_SESSION_FABRIC_AUTH_MODE, "required");
+      }),
+    );
+
+    it.effect("keeps split and remote dev outside automatic localhost authorization", () =>
+      Effect.gen(function* () {
+        for (const input of [
+          { mode: "dev:web" as const, host: undefined },
+          { mode: "dev:server" as const, host: undefined },
+          { mode: "dev" as const, host: "0.0.0.0" },
+          { mode: "dev" as const, host: "127.attacker.example" },
+        ]) {
+          const env = yield* createDevRunnerEnv({
+            mode: input.mode,
+            baseEnv: {
+              T3CODE_LOCAL_DEV_AUTO_AUTH: "1",
+              T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN: "ambient-secret",
+              T3CODE_SESSION_FABRIC_AUTH_MODE: "disabled",
+              VITE_T3CODE_SESSION_FABRIC_AUTH_MODE: "disabled",
+            },
+            serverOffset: 0,
+            webOffset: 0,
+            t3Home: undefined,
+            browser: undefined,
+            autoBootstrapProjectFromCwd: undefined,
+            logWebSocketEvents: undefined,
+            host: input.host,
+            port: undefined,
+            devUrl: undefined,
+            localDevBootstrapToken: "runner-generated-token",
+          });
+
+          assert.equal(env.T3CODE_LOCAL_DEV_AUTO_AUTH, undefined);
+          assert.equal(env.T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN, undefined);
+          assert.equal(env.T3CODE_SESSION_FABRIC_AUTH_MODE, undefined);
+          assert.equal(env.VITE_T3CODE_SESSION_FABRIC_AUTH_MODE, undefined);
+        }
+      }),
+    );
   });
 
   describe("findFirstAvailableOffset", () => {

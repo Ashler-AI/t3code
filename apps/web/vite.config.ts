@@ -11,6 +11,10 @@ import productManifest from "../../ashler/product.json" with { type: "json" };
 import { DEV_PROXIED_PATH_PREFIXES } from "@t3tools/shared/devProxy";
 
 import { loadRepoEnv } from "../../scripts/lib/public-config";
+import {
+  createLocalDevAutoAuthMiddleware,
+  resolveLocalDevAutoAuthConfig,
+} from "./src/devLocalAutoAuthProxy";
 
 const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
@@ -39,6 +43,7 @@ const configuredRelayTracingDataset = repoEnv.VITE_RELAY_OTLP_TRACES_DATASET?.tr
 const configuredRelayTracingToken = repoEnv.VITE_RELAY_OTLP_TRACES_TOKEN?.trim() || "";
 const configuredHostedAppChannel = process.env.VITE_HOSTED_APP_CHANNEL?.trim() || "";
 const configuredAppVersion = process.env.APP_VERSION?.trim() || pkg.version;
+const localDevAutoAuthConfig = resolveLocalDevAutoAuthConfig(process.env);
 const configuredHostedAppUrl = (() => {
   const explicitHostedAppUrl = process.env.VITE_HOSTED_APP_URL?.trim();
   if (explicitHostedAppUrl) {
@@ -138,6 +143,22 @@ export default defineConfig(() => {
         transformIndexHtml: (html) =>
           html.replaceAll("__ASHLER_PRODUCT_NAME__", productManifest.productName),
       },
+      ...(localDevAutoAuthConfig
+        ? [
+            {
+              name: "t3-local-dev-auto-auth",
+              configureServer: (server: {
+                readonly middlewares: {
+                  use: (middleware: ReturnType<typeof createLocalDevAutoAuthMiddleware>) => void;
+                };
+              }) => {
+                server.middlewares.use(
+                  createLocalDevAutoAuthMiddleware({ config: localDevAutoAuthConfig }),
+                );
+              },
+            },
+          ]
+        : []),
       tanstackRouter(),
       react(),
       babel({
@@ -187,6 +208,9 @@ export default defineConfig(() => {
       "import.meta.env.VITE_HOSTED_APP_URL": JSON.stringify(configuredHostedAppUrl ?? ""),
       "import.meta.env.VITE_HOSTED_APP_CHANNEL": JSON.stringify(configuredHostedAppChannel),
       "import.meta.env.APP_VERSION": JSON.stringify(configuredAppVersion),
+      "import.meta.env.VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED": JSON.stringify(
+        localDevAutoAuthConfig !== null ? "true" : "false",
+      ),
     },
     resolve: {
       tsconfigPaths: true,

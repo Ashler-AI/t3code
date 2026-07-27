@@ -719,6 +719,9 @@ importers:
       '@t3tools/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@t3tools/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       alchemy:
         specifier: https://pkg.ing/alchemy/078ff00
         version: https://pkg.ing/alchemy/078ff00(00e545345bd9d0eeda40c05856e44853)

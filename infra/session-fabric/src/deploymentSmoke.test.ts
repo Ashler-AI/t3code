@@ -11,6 +11,28 @@ import {
 } from "./deploymentSmoke.ts";
 
 const NOW = "2026-07-25T20:00:00.000Z";
+const SCAFFOLD_ORIGIN = "https://proof.scaffold.example";
+const VIEWER_CAPABILITY = "viewer.header.signature";
+const RUNNER_CAPABILITY = "runner.header.signature";
+
+const authenticatedSmokeInput = {
+  scaffoldOrigin: SCAFFOLD_ORIGIN,
+  viewerCapability: VIEWER_CAPABILITY,
+  runnerCapability: RUNNER_CAPABILITY,
+} as const;
+
+function requiredAuthGate(input: RequestInfo | URL, init?: RequestInit): Response | null {
+  const url = new URL(input instanceof Request ? input.url : input);
+  const headers = new Headers(init?.headers);
+  if (init?.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: { "access-control-allow-origin": headers.get("origin") ?? "" },
+    });
+  }
+  if (headers.get("authorization") === null) return new Response(null, { status: 401 });
+  return url.pathname === "/v1/session-fabric/sessions" ? Response.json({ sessions: [] }) : null;
+}
 
 class TestSocket implements DeploymentSmokeSocket {
   readyState = 0;
@@ -76,7 +98,7 @@ describe("session fabric deployment smoke", () => {
         sessionId: DEPLOYMENT_SMOKE_SESSION_ID,
         runnerId: "deployment-smoke-runner-v1",
         snapshot: {
-          session: { initialPrompt: "run-42", publication: "local_only" },
+          session: { initialPrompt: "run-42", publication: "public" },
           thread: { thread: { id: "deployment-smoke-thread-v1" } },
         },
       },
@@ -94,6 +116,8 @@ describe("session fabric deployment smoke", () => {
 
   it("waits for disconnect handling and the retained offline snapshot before succeeding", async () => {
     const urls: URL[] = [];
+    const authorizations: string[] = [];
+    let protocols: ReadonlyArray<string> | undefined;
     let socket: TestSocket | undefined;
     let proofPolls = 0;
     const [, stalePublication] = buildDeploymentSmokeFrames({ marker: "old-run", now: NOW });
@@ -104,9 +128,23 @@ describe("session fabric deployment smoke", () => {
       ...publication.published.snapshot,
       session: { ...publication.published.snapshot.session, runnerState: "offline" as const },
     };
-    const fetchClient: typeof fetch = async (input) => {
+    const requests: Array<{
+      readonly method: string;
+      readonly authorization: string;
+      readonly origin: string;
+    }> = [];
+    const fetchClient: typeof fetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input);
       urls.push(url);
+      const headers = new Headers(init?.headers);
+      authorizations.push(headers.get("authorization") ?? "");
+      requests.push({
+        method: init?.method ?? "GET",
+        authorization: headers.get("authorization") ?? "",
+        origin: headers.get("origin") ?? "",
+      });
+      const gated = requiredAuthGate(input, init);
+      if (gated !== null) return gated;
       if (url.pathname.includes(DEPLOYMENT_SMOKE_EMPTY_SESSION_ID)) {
         return new Response(null, { status: 404 });
       }
@@ -125,11 +163,15 @@ describe("session fabric deployment smoke", () => {
       timeoutMs: 1_000,
       pollIntervalMs: 1,
       fetch: fetchClient,
-      createWebSocket: (url) => (socket = new TestSocket(url, urls)),
+      ...authenticatedSmokeInput,
+      createWebSocket: (url, selectedProtocols) => {
+        protocols = selectedProtocols;
+        return (socket = new TestSocket(url, urls));
+      },
     });
 
     expect(result).toMatchObject({ marker: "run-84", sessionId: DEPLOYMENT_SMOKE_SESSION_ID });
-    expect(urls[0]?.pathname).toContain(`${DEPLOYMENT_SMOKE_EMPTY_SESSION_ID}/snapshot`);
+    expect(urls[0]?.pathname).toBe("/base/v1/session-fabric/sessions");
     expect(urls.some((url) => url.protocol === "wss:")).toBe(true);
     expect(proofPolls).toBe(4);
     expect(socket?.sent.map((frame) => JSON.parse(frame).type)).toEqual([
@@ -138,6 +180,21 @@ describe("session fabric deployment smoke", () => {
     ]);
     expect(socket?.readyState).toBe(3);
     expect(socket?.closeCalls).toBe(1);
+    expect(
+      authorizations
+        .filter(Boolean)
+        .every((authorization) => authorization === `Bearer ${VIEWER_CAPABILITY}`),
+    ).toBe(true);
+    expect(requests.slice(0, 4)).toEqual([
+      { method: "GET", authorization: "", origin: "" },
+      { method: "GET", authorization: "", origin: "" },
+      { method: "OPTIONS", authorization: "", origin: SCAFFOLD_ORIGIN },
+      { method: "GET", authorization: `Bearer ${VIEWER_CAPABILITY}`, origin: "" },
+    ]);
+    expect(protocols).toEqual([
+      "t3.session-fabric.v1",
+      "t3.session-fabric.capability.runner.header.signature",
+    ]);
   });
 
   it("rejects post-disconnect snapshots with the wrong sequence or identity", async () => {
@@ -164,8 +221,10 @@ describe("session fabric deployment smoke", () => {
         location: { ...offlineSnapshot.session.location, environmentId: "wrong-environment" },
       },
     };
-    const fetchClient: typeof fetch = async (input) => {
+    const fetchClient: typeof fetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input);
+      const gated = requiredAuthGate(input, init);
+      if (gated !== null) return gated;
       if (url.pathname.includes(DEPLOYMENT_SMOKE_EMPTY_SESSION_ID)) {
         return new Response(null, { status: 404 });
       }
@@ -183,6 +242,7 @@ describe("session fabric deployment smoke", () => {
         timeoutMs: 1_000,
         pollIntervalMs: 1,
         fetch: fetchClient,
+        ...authenticatedSmokeInput,
         createWebSocket: (url) => (socket = new TestSocket(url, urls)),
       }),
     ).resolves.toMatchObject({ marker: "run-identity" });
@@ -196,8 +256,10 @@ describe("session fabric deployment smoke", () => {
     let socket: TestSocket | undefined;
     const [, publication] = buildDeploymentSmokeFrames({ marker: "run-close-timeout", now: NOW });
     if (publication.type !== "session.publish-snapshot") throw new Error("unexpected frame");
-    const fetchClient: typeof fetch = async (input) => {
+    const fetchClient: typeof fetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input);
+      const gated = requiredAuthGate(input, init);
+      if (gated !== null) return gated;
       return url.pathname.includes(DEPLOYMENT_SMOKE_EMPTY_SESSION_ID)
         ? new Response(null, { status: 404 })
         : Response.json(publication.published.snapshot);
@@ -210,6 +272,7 @@ describe("session fabric deployment smoke", () => {
         timeoutMs: 25,
         pollIntervalMs: 1,
         fetch: fetchClient,
+        ...authenticatedSmokeInput,
         createWebSocket: (url) => (socket = new TestSocket(url, urls, false)),
       }),
     ).rejects.toThrow("timed out waiting for WebSocket close");
@@ -218,7 +281,8 @@ describe("session fabric deployment smoke", () => {
   });
 
   it("fails closed when the stable empty coordinator already has state", async () => {
-    const fetchClient: typeof fetch = async () => Response.json({ unexpected: true });
+    const fetchClient: typeof fetch = async (input, init) =>
+      requiredAuthGate(input, init) ?? Response.json({ unexpected: true });
 
     await expect(
       runDeploymentSmoke({
@@ -226,6 +290,7 @@ describe("session fabric deployment smoke", () => {
         marker: "run-126",
         timeoutMs: 1_000,
         fetch: fetchClient,
+        ...authenticatedSmokeInput,
         createWebSocket: () => {
           throw new Error("WebSocket must not be created");
         },
@@ -242,6 +307,7 @@ describe("session fabric deployment smoke", () => {
         marker: "run-timeout",
         timeoutMs: 5,
         fetch: fetchClient,
+        ...authenticatedSmokeInput,
         createWebSocket: () => {
           throw new Error("WebSocket must not be created");
         },

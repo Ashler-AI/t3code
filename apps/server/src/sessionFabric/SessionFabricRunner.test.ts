@@ -11,10 +11,12 @@ import * as Option from "effect/Option";
 import {
   buildSessionFabricContextPublication,
   buildSessionFabricSnapshot,
+  makeSessionFabricWebSocketProtocols,
   makeSessionFabricWebSocketUrl,
   resolveSessionFabricRunnerConfig,
   resolveSessionFabricSessionId,
   sessionFabricCommandReceipt,
+  sessionFabricCapabilityRefreshDelayMs,
 } from "./SessionFabricRunner.ts";
 
 describe("SessionFabricRunner", () => {
@@ -51,9 +53,13 @@ describe("SessionFabricRunner", () => {
       overrideThreadId: Option.none(),
       scaffoldSessionId: Option.some("ses_scaffold"),
       scaffoldSessionUrl: Option.none(),
+      scaffoldLifecycleEpoch: Option.some(4),
+      runtimeApiToken: Option.some("runtime-secret"),
+      authMode: "required",
     });
     expect(config.environmentKind).toBe("scaffold");
     expect(config.runnerGeneration).toBe(0);
+    expect(config.scaffoldLifecycleEpoch).toBe(4);
     expect(
       makeSessionFabricWebSocketUrl(
         config.relayUrl!,
@@ -106,9 +112,10 @@ describe("SessionFabricRunner", () => {
     const snapshot = buildSessionFabricSnapshot({
       sessionId: SessionFabricSessionId.make("global-session-1"),
       environmentId: EnvironmentId.make("environment-1"),
-      environmentKind: "local",
-      scaffoldSessionId: null,
-      scaffoldSessionUrl: null,
+      environmentKind: "scaffold",
+      scaffoldSessionId: "ses_scaffold",
+      scaffoldSessionUrl: "https://scaffold.example.test/?q=ses_scaffold",
+      scaffoldLifecycleEpoch: 3,
       publication: "public",
       acknowledgedEventSequence: 5,
       shell,
@@ -120,6 +127,57 @@ describe("SessionFabricRunner", () => {
     expect(snapshot?.session.searchableText).toContain("The stream now reconnects.");
     expect(snapshot?.session.searchableText).toContain("Ran the focused test");
     expect(snapshot?.session.cursor).toEqual({ eventSequence: 5, snapshotSequence: 8 });
+    expect(snapshot?.session.location).toMatchObject({
+      environmentKind: "scaffold",
+      scaffoldSessionId: "ses_scaffold",
+      scaffoldLifecycleEpoch: 3,
+    });
+  });
+
+  it("authenticates the socket with an in-memory capability and refreshes before expiry", () => {
+    const grant = {
+      capability: "header.payload.signature",
+      tokenType: "Bearer",
+      role: "runner",
+      scopes: ["session:publish", "session:execute"],
+      expiresAt: "2026-07-24T20:15:00.000Z",
+      issuer: "scaffold",
+      audience: "session-fabric",
+      keyId: "proof-1",
+      bindings: { scaffoldSessionId: "ses_scaffold", scaffoldLifecycleEpoch: 4 },
+    } as const;
+    expect(makeSessionFabricWebSocketProtocols(grant)).toEqual([
+      "t3.session-fabric.v1",
+      "t3.session-fabric.capability.header.payload.signature",
+    ]);
+    expect(
+      sessionFabricCapabilityRefreshDelayMs(
+        grant.expiresAt,
+        Date.parse("2026-07-24T20:00:00.000Z"),
+      ),
+    ).toBe(870_000);
+    expect(JSON.stringify({ protocols: makeSessionFabricWebSocketProtocols(null) })).not.toContain(
+      grant.capability,
+    );
+    expect(makeSessionFabricWebSocketProtocols(null)).toEqual([]);
+  });
+
+  it("rejects an auth-disabled Scaffold runner", () => {
+    expect(() =>
+      resolveSessionFabricRunnerConfig({
+        relayUrl: Option.some(new URL("https://relay.example.test/")),
+        environmentKind: Option.some("scaffold"),
+        publication: "public",
+        runnerGeneration: 0,
+        overrideSessionId: Option.none(),
+        overrideThreadId: Option.none(),
+        scaffoldSessionId: Option.some("ses_scaffold"),
+        scaffoldSessionUrl: Option.some("https://scaffold.example.test/?q=ses_scaffold"),
+        scaffoldLifecycleEpoch: Option.some(4),
+        runtimeApiToken: Option.some("runtime-secret"),
+        authMode: "disabled",
+      }),
+    ).toThrow("only be disabled for a local runner");
   });
 
   it("returns the orchestration engine's original sequence on accepted duplicate dispatch", () => {
