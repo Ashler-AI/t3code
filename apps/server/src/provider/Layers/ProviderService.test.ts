@@ -53,6 +53,7 @@ import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   makeSqlitePersistenceLive,
   SqlitePersistenceMemory,
@@ -648,7 +649,7 @@ it.effect(
           resumeCursor: {
             schemaVersion: 3,
             sessionId: "provider-checkpoint",
-            eventSequence: 7,
+            eventSequence: 1,
             acpSequence: 5,
           },
           payload: {
@@ -661,13 +662,13 @@ it.effect(
         assert.equal(envelope.eventId, asEventId("evt-canonical-thread-segment"));
         assert.equal(envelope.environmentId, EnvironmentId.make("environment-canonical"));
         assert.equal(envelope.threadId, asThreadId("thread-canonical-thread-segment"));
-        assert.equal(envelope.sourceSequence, 7);
+        assert.equal(envelope.sourceSequence, 1);
         assert.equal(envelope.runtimeSessionId, RuntimeSessionId.make("provider-checkpoint"));
         assert.deepEqual(envelope.resumeCursor, {
           kind: "omp",
           schemaVersion: 3,
           sessionId: RuntimeSessionId.make("provider-checkpoint"),
-          eventSequence: 7,
+          eventSequence: 1,
           acpSequence: 5,
         });
         const beforeAcknowledgment = yield* directory.getBinding(
@@ -686,11 +687,11 @@ it.effect(
           assert.deepEqual(afterAcknowledgment.value.resumeCursor, {
             schemaVersion: 3,
             sessionId: "provider-checkpoint",
-            eventSequence: 7,
+            eventSequence: 1,
             acpSequence: 5,
           });
           assert.deepInclude(afterAcknowledgment.value.runtimePayload as Record<string, unknown>, {
-            canonicalSourceSequence: 7,
+            canonicalSourceSequence: 1,
             canonicalEventId: asEventId("evt-canonical-thread-segment"),
           });
         }
@@ -702,7 +703,164 @@ it.effect(
     }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.effect("ProviderServiceLive republishes rejected deliveries without advancing the cursor", () =>
+it.effect(
+  "ProviderServiceLive binds a replacement OMP runtime before releasing its first event",
+  () =>
+    Effect.gen(function* () {
+      const ompDriver = ProviderDriverKind.make("omp");
+      const omp = makeFakeCodexAdapter(ompDriver);
+      const threadId = asThreadId("thread-runtime-reset-handshake");
+      const oldRuntimeSessionId = RuntimeSessionId.make("omp-runtime-old");
+      const newRuntimeSessionId = RuntimeSessionId.make("omp-runtime-new");
+      const providerInstanceId = ProviderInstanceId.make("omp");
+      const registry = makeAdapterRegistryMock({ [ompDriver]: omp.adapter });
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerServiceLayer = makeProviderServiceLive({
+        environmentId: EnvironmentId.make("environment-runtime-reset-handshake"),
+      }).pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      const providerLayer = Layer.merge(providerServiceLayer, directoryLayer);
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+        yield* directory.upsert({
+          threadId,
+          provider: ompDriver,
+          providerInstanceId,
+          resumeCursor: {
+            schemaVersion: 3,
+            sessionId: oldRuntimeSessionId,
+            eventSequence: 1,
+            acpSequence: 1,
+          },
+          canonicalSourceCursor: {
+            environmentId: EnvironmentId.make("environment-runtime-reset-handshake"),
+            threadId,
+            providerInstanceId,
+            runtimeSessionId: oldRuntimeSessionId,
+            sourceSequence: 1,
+            eventId: asEventId("omp:omp-runtime-old:1"),
+          },
+        });
+
+        omp.startSession.mockImplementationOnce((input: ProviderSessionStartInput) =>
+          Effect.sync(() => {
+            omp.emit({
+              eventId: asEventId("omp:omp-runtime-new:1"),
+              provider: ompDriver,
+              threadId,
+              createdAt: "2026-01-01T00:00:01.000Z",
+              type: "runtime.warning",
+              resumeCursor: {
+                schemaVersion: 3,
+                sessionId: newRuntimeSessionId,
+                eventSequence: 1,
+                acpSequence: 1,
+              },
+              payload: { message: "new runtime ready" },
+            });
+            return {
+              provider: ompDriver,
+              providerInstanceId,
+              status: "ready",
+              runtimeMode: input.runtimeMode,
+              threadId,
+              resumeCursor: {
+                schemaVersion: 3,
+                sessionId: newRuntimeSessionId,
+                eventSequence: 0,
+                acpSequence: 0,
+              },
+              cwd: input.cwd ?? process.cwd(),
+              createdAt: "2026-01-01T00:00:01.000Z",
+              updatedAt: "2026-01-01T00:00:01.000Z",
+            } satisfies ProviderSession;
+          }),
+        );
+
+        const deliveryStream = provider.streamCanonicalDeliveries;
+        assert.isDefined(deliveryStream);
+        const deliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
+        yield* advanceTestClock(10);
+        const startFiber = yield* provider
+          .startSession(threadId, {
+            provider: ompDriver,
+            providerInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          })
+          .pipe(Effect.forkChild);
+        const delivery = Option.getOrThrow(
+          yield* Fiber.join(deliveryFiber).pipe(Effect.timeout("2 seconds")),
+        );
+
+        const bindingBeforeAcknowledgment = Option.getOrThrow(
+          yield* directory.getBinding(threadId),
+        );
+        assert.deepEqual(bindingBeforeAcknowledgment.resumeCursor, {
+          schemaVersion: 3,
+          sessionId: newRuntimeSessionId,
+          eventSequence: 0,
+          acpSequence: 0,
+        });
+        assert.equal(delivery.envelope.runtimeSessionId, newRuntimeSessionId);
+        assert.equal(delivery.envelope.sourceSequence, 1);
+        const firstMcpSession = {
+          environmentId: EnvironmentId.make("environment-runtime-reset-handshake"),
+          threadId,
+          providerSessionId: "provider-session-in-flight",
+          providerInstanceId,
+          endpoint: "http://127.0.0.1:1/mcp",
+          authorizationHeader: "Bearer in-flight",
+        };
+        McpProviderSession.setMcpProviderSession(firstMcpSession);
+
+        const overlappingFailure = yield* Effect.flip(
+          provider.startSession(threadId, {
+            provider: ompDriver,
+            providerInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          }),
+        );
+        assert.instanceOf(overlappingFailure, ProviderValidationError);
+        assert.include(overlappingFailure.issue, "another provider runtime binding is in progress");
+        assert.equal(omp.startSession.mock.calls.length, 1);
+        assert.strictEqual(McpProviderSession.readMcpProviderSession(threadId), firstMcpSession);
+        McpProviderSession.clearMcpProviderSession(threadId);
+
+        yield* delivery.acknowledge;
+        const started = yield* Fiber.join(startFiber).pipe(Effect.timeout("2 seconds"));
+        assert.deepEqual(started.resumeCursor, {
+          schemaVersion: 3,
+          sessionId: newRuntimeSessionId,
+          eventSequence: 0,
+          acpSequence: 0,
+        });
+        const checkpointed = Option.getOrThrow(yield* directory.getBinding(threadId));
+        assert.equal(checkpointed.canonicalSourceCursor?.runtimeSessionId, newRuntimeSessionId);
+        assert.notEqual(checkpointed.status, "error");
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive fences permanently rejected deliveries by thread", () =>
   Effect.gen(function* () {
     const ompDriver = ProviderDriverKind.make("omp");
     const omp = makeFakeCodexAdapter(ompDriver);
@@ -744,7 +902,7 @@ it.effect("ProviderServiceLive republishes rejected deliveries without advancing
         resumeCursor: {
           schemaVersion: 3,
           sessionId: "provider-retry",
-          eventSequence: 11,
+          eventSequence: 1,
           acpSequence: 9,
         },
         payload: { state: "completed" },
@@ -769,11 +927,241 @@ it.effect("ProviderServiceLive republishes rejected deliveries without advancing
       assert.isTrue(Option.isSome(afterAcknowledgment));
       if (Option.isSome(afterAcknowledgment)) {
         assert.deepInclude(afterAcknowledgment.value.runtimePayload as Record<string, unknown>, {
-          canonicalSourceSequence: 11,
+          canonicalSourceSequence: 1,
           canonicalEventId: asEventId("evt-retry-stable"),
         });
       }
+
+      const rejectedDeliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
+      yield* advanceTestClock(10);
+      omp.emit({
+        eventId: asEventId("evt-permanently-rejected"),
+        provider: ompDriver,
+        threadId: asThreadId("thread-permanently-rejected"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        type: "turn.completed",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "provider-permanently-rejected",
+          eventSequence: 1,
+          acpSequence: 1,
+        },
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+      const rejectedDelivery = Option.getOrThrow(yield* Fiber.join(rejectedDeliveryFiber));
+      yield* rejectedDelivery.reject(new Error("permanent cursor violation"));
+      yield* advanceTestClock(10);
+      assert.deepEqual(omp.stopSession.mock.calls, [[asThreadId("thread-permanently-rejected")]]);
+      const rejectedBinding = yield* directory.getBinding(
+        asThreadId("thread-permanently-rejected"),
+      );
+      assert.isTrue(Option.isSome(rejectedBinding));
+      if (Option.isSome(rejectedBinding)) {
+        assert.equal(rejectedBinding.value.status, "error");
+        assert.deepInclude(rejectedBinding.value.runtimePayload as Record<string, unknown>, {
+          activeTurnId: null,
+          lastError:
+            "Canonical provider delivery was permanently rejected: permanent cursor violation",
+          lastRuntimeEvent: "provider.runtime-delivery.rejected",
+        });
+        assert.isUndefined(rejectedBinding.value.canonicalSourceCursor);
+      }
+
+      const sameThreadFailure = yield* provider
+        .sendTurn({
+          threadId: asThreadId("thread-permanently-rejected"),
+          input: "continue",
+          attachments: [],
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(sameThreadFailure, ProviderValidationError);
+      assert.include(sameThreadFailure.issue, "permanent cursor violation");
+
+      const sameThreadStartFailure = yield* provider
+        .startSession(asThreadId("thread-permanently-rejected"), {
+          provider: ompDriver,
+          providerInstanceId: ProviderInstanceId.make("omp"),
+          threadId: asThreadId("thread-permanently-rejected"),
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(sameThreadStartFailure, ProviderValidationError);
+      assert.include(sameThreadStartFailure.issue, "permanent cursor violation");
+      assert.equal(omp.startSession.mock.calls.length, 0);
+
+      const laterDeliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
+      yield* advanceTestClock(10);
+      omp.emit({
+        eventId: asEventId("evt-same-thread-after-permanent-rejection"),
+        provider: ompDriver,
+        threadId: asThreadId("thread-permanently-rejected"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        type: "turn.completed",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "provider-permanently-rejected",
+          eventSequence: 2,
+          acpSequence: 2,
+        },
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+
+      omp.emit({
+        eventId: asEventId("evt-after-permanent-rejection"),
+        provider: ompDriver,
+        threadId: asThreadId("thread-after-permanent-rejection"),
+        createdAt: "2026-01-01T00:00:03.000Z",
+        type: "turn.completed",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "provider-after-permanent-rejection",
+          eventSequence: 1,
+          acpSequence: 1,
+        },
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+      const laterDelivery = Option.getOrThrow(
+        yield* Fiber.join(laterDeliveryFiber).pipe(Effect.timeout("2 seconds")),
+      );
+      assert.equal(laterDelivery.envelope.eventId, asEventId("evt-after-permanent-rejection"));
+      yield* laterDelivery.acknowledge;
     }).pipe(Effect.provide(providerLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("ProviderServiceLive restores permanent delivery fences after restart", () =>
+  Effect.gen(function* () {
+    const tempDir = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-provider-delivery-fence-restart-"),
+    );
+    const dbPath = NodePath.join(tempDir, "orchestration.sqlite");
+    const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+    const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(persistenceLayer),
+    );
+    const ompDriver = ProviderDriverKind.make("omp");
+    const makeRuntimeLayer = (adapter: ReturnType<typeof makeFakeCodexAdapter>) => {
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const registry = makeAdapterRegistryMock({ [ompDriver]: adapter.adapter });
+      const providerLayer = makeProviderServiceLive({
+        environmentId: EnvironmentId.make("environment-delivery-fence-restart"),
+      }).pipe(
+        Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+      return Layer.merge(providerLayer, directoryLayer);
+    };
+    const rejectedThreadId = asThreadId("thread-rejected-before-restart");
+
+    const firstAdapter = makeFakeCodexAdapter(ompDriver);
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const deliveryStream = provider.streamCanonicalDeliveries;
+      assert.isDefined(deliveryStream);
+      const deliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(Effect.forkChild);
+      yield* advanceTestClock(10);
+      firstAdapter.emit({
+        eventId: asEventId("evt-rejected-before-restart"),
+        provider: ompDriver,
+        threadId: rejectedThreadId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        type: "turn.completed",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "provider-rejected-before-restart",
+          eventSequence: 1,
+          acpSequence: 1,
+        },
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+      const delivery = Option.getOrThrow(yield* Fiber.join(deliveryFiber));
+      yield* delivery.reject(new Error("persisted permanent rejection"));
+      yield* advanceTestClock(10);
+    }).pipe(Effect.provide(makeRuntimeLayer(firstAdapter)));
+
+    const secondAdapter = makeFakeCodexAdapter(ompDriver);
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+
+      const startFailure = yield* provider
+        .startSession(rejectedThreadId, {
+          provider: ompDriver,
+          providerInstanceId: ProviderInstanceId.make("omp"),
+          threadId: rejectedThreadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(startFailure, ProviderValidationError);
+      assert.include(startFailure.issue, "persisted permanent rejection");
+      assert.equal(secondAdapter.startSession.mock.calls.length, 0);
+
+      const sendFailure = yield* provider
+        .sendTurn({ threadId: rejectedThreadId, input: "continue", attachments: [] })
+        .pipe(Effect.flip);
+      assert.instanceOf(sendFailure, ProviderValidationError);
+      assert.include(sendFailure.issue, "persisted permanent rejection");
+
+      const deliveryStream = provider.streamCanonicalDeliveries;
+      assert.isDefined(deliveryStream);
+      const differentThreadDeliveryFiber = yield* Stream.runHead(deliveryStream!).pipe(
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(10);
+      secondAdapter.emit({
+        eventId: asEventId("evt-rejected-thread-after-restart"),
+        provider: ompDriver,
+        threadId: rejectedThreadId,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        type: "turn.completed",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "provider-rejected-before-restart",
+          eventSequence: 2,
+          acpSequence: 2,
+        },
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+      secondAdapter.emit({
+        eventId: asEventId("evt-other-thread-after-restart"),
+        provider: ompDriver,
+        threadId: asThreadId("thread-other-after-restart"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        type: "turn.completed",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "provider-other-after-restart",
+          eventSequence: 1,
+          acpSequence: 1,
+        },
+        payload: { state: "completed" },
+      });
+      yield* advanceTestClock(20);
+      const differentThreadDelivery = Option.getOrThrow(
+        yield* Fiber.join(differentThreadDeliveryFiber).pipe(Effect.timeout("2 seconds")),
+      );
+      assert.equal(
+        differentThreadDelivery.envelope.eventId,
+        asEventId("evt-other-thread-after-restart"),
+      );
+      yield* differentThreadDelivery.acknowledge;
+    }).pipe(Effect.provide(makeRuntimeLayer(secondAdapter)));
+
+    NodeFS.rmSync(tempDir, { recursive: true, force: true });
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 

@@ -1,7 +1,10 @@
 import type {
+  EnvironmentId,
+  EventId,
   ProviderInstanceId,
   ProviderDriverKind,
   ProviderSessionRuntimeStatus,
+  RuntimeSessionId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
@@ -13,6 +16,15 @@ import type {
   ProviderSessionDirectoryPersistenceError,
   ProviderValidationError,
 } from "../Errors.ts";
+
+export interface ProviderCanonicalSourceCursor {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly runtimeSessionId: RuntimeSessionId;
+  readonly sourceSequence: number;
+  readonly eventId: EventId;
+}
 
 export interface ProviderRuntimeBinding {
   readonly threadId: ThreadId;
@@ -27,6 +39,7 @@ export interface ProviderRuntimeBinding {
   readonly status?: ProviderSessionRuntimeStatus;
   readonly resumeCursor?: unknown | null;
   readonly runtimePayload?: unknown | null;
+  readonly canonicalSourceCursor?: ProviderCanonicalSourceCursor;
   readonly runtimeMode?: RuntimeMode;
 }
 

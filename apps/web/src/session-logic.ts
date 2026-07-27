@@ -1,5 +1,6 @@
 import * as Option from "effect/Option";
 import * as Arr from "effect/Array";
+import productManifest from "../../../ashler/product.json";
 import {
   ApprovalRequestId,
   isToolLifecycleItemType,
@@ -24,13 +25,15 @@ import type {
 
 export type ProviderPickerKind = ProviderDriverKind;
 
-export const PROVIDER_OPTIONS: Array<{
+type ProviderOption = {
   value: ProviderPickerKind;
   label: string;
   available: boolean;
   /** Shown on the model picker sidebar when relevant */
   pickerSidebarBadge?: "new" | "soon";
-}> = [
+};
+
+const PROVIDER_OPTION_CATALOG: ReadonlyArray<ProviderOption> = [
   {
     value: ProviderDriverKind.make("omp"),
     label: "OMP",
@@ -58,6 +61,30 @@ export const PROVIDER_OPTIONS: Array<{
     pickerSidebarBadge: "new",
   },
 ];
+
+type ProductRuntimeProfile = keyof typeof productManifest.runtimeProfile.profiles;
+
+const DRIVER_KIND_BY_HARNESS = {
+  omp: ProviderDriverKind.make("omp"),
+  codex: ProviderDriverKind.make("codex"),
+  "claude-code": ProviderDriverKind.make("claudeAgent"),
+} as const;
+
+export function providerOptionsForRuntimeProfile(
+  profile: ProductRuntimeProfile,
+): ReadonlyArray<ProviderOption> {
+  const allowedDriverKinds = new Set<ProviderDriverKind>(
+    productManifest.runtimeProfile.profiles[profile].allowedHarnesses.flatMap((harness) => {
+      const driverKind = DRIVER_KIND_BY_HARNESS[harness as keyof typeof DRIVER_KIND_BY_HARNESS];
+      return driverKind ? [driverKind] : [];
+    }),
+  );
+  return PROVIDER_OPTION_CATALOG.filter((option) => allowedDriverKinds.has(option.value));
+}
+
+export const PROVIDER_OPTIONS = providerOptionsForRuntimeProfile(
+  productManifest.runtimeProfile.default as ProductRuntimeProfile,
+);
 
 export type WorkLogToolLifecycleStatus =
   | "inProgress"
@@ -650,15 +677,24 @@ export function deriveWorkLogEntries(
     { taskType?: string; task?: string; model?: string; effort?: string }
   >();
   for (const activity of ordered) {
-    if (activity.kind !== "task.started") continue;
+    if (
+      activity.kind !== "task.started" &&
+      activity.kind !== "task.progress" &&
+      activity.kind !== "task.completed"
+    ) {
+      continue;
+    }
     const payload = asRecord(activity.payload);
     const taskId = asTrimmedString(payload?.taskId);
     if (!taskId) continue;
+    const previous = taskMetadataById.get(taskId);
+    const task = activity.kind === "task.started" ? asTrimmedString(payload?.detail) : undefined;
     taskMetadataById.set(taskId, {
+      ...previous,
       ...(asTrimmedString(payload?.taskType)
         ? { taskType: asTrimmedString(payload?.taskType)! }
         : {}),
-      ...(asTrimmedString(payload?.detail) ? { task: asTrimmedString(payload?.detail)! } : {}),
+      ...(task ? { task } : {}),
       ...(asTrimmedString(payload?.model) ? { model: asTrimmedString(payload?.model)! } : {}),
       ...(asTrimmedString(payload?.effort) ? { effort: asTrimmedString(payload?.effort)! } : {}),
     });

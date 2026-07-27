@@ -1,14 +1,18 @@
-import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
-import { describe, expect, it, vi } from "vite-plus/test";
+import { CommandId, EnvironmentId, MessageId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   createMemoryPendingTurnOutboxStorage,
+  discardPendingTurn,
   drainPendingTurnOutbox,
   enqueuePendingTurn,
+  isPendingTurnDispatchFailureRetryable,
   listPendingTurnsForThread,
   reconcilePendingTurnForExistingThread,
   recordPendingTurnFailure,
+  retargetPendingTurnsForDraft,
   type PendingTurnOutboxEntry,
+  type PendingTurnOutboxStorage,
 } from "./pendingTurnOutbox";
 
 const environmentId = EnvironmentId.make("local");
@@ -41,6 +45,8 @@ function pendingInput(): Parameters<typeof enqueuePendingTurn>[1] {
 }
 
 describe("pending turn outbox", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it("rehydrates and delivers a provisional first message exactly once across a restart", async () => {
     const storage = createMemoryPendingTurnOutboxStorage();
     await enqueuePendingTurn(storage, pendingInput());
@@ -110,6 +116,169 @@ describe("pending turn outbox", () => {
     });
   });
 
+  it("retargets a prepared Scaffold command to the hydrated sandbox project", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    const pending = pendingInput();
+    const sourceProjectId = ProjectId.make("source-project");
+    const targetProjectId = ProjectId.make("target-project");
+    const accepted = await enqueuePendingTurn(storage, {
+      ...pending,
+      input: {
+        ...pending.input,
+        modelSelection: {
+          instanceId: "omp" as never,
+          model: "openai/gpt-5.6-sol",
+          options: [{ id: "reasoning_effort", value: "high" }],
+        },
+        bootstrap: {
+          createThread: {
+            projectId: sourceProjectId,
+            title: "Build the feature",
+            modelSelection: {
+              instanceId: "omp" as never,
+              model: "openai/gpt-5.6-sol",
+              options: [{ id: "reasoning_effort", value: "high" }],
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: "feature/source",
+            worktreePath: null,
+            createdAt: pending.createdAt,
+          },
+          prepareWorktree: {
+            projectCwd: "/Users/example/source-repo",
+            baseBranch: "feature/source",
+            branch: "t3/thread-1",
+          },
+          runSetupScript: true,
+        },
+      },
+    });
+    const targetEnvironmentId = EnvironmentId.make("scaffold-session");
+
+    await retargetPendingTurnsForDraft(storage, "draft-1", targetEnvironmentId, targetProjectId);
+
+    const [retargeted] = await storage.list();
+    expect(retargeted?.environmentId).toBe(targetEnvironmentId);
+    expect(retargeted?.idempotencyKey).toBe(accepted.idempotencyKey);
+    expect(retargeted?.messageId).toBe(accepted.messageId);
+    expect(retargeted?.input).toMatchObject({
+      commandId,
+      threadId,
+      message: accepted.input.message,
+      modelSelection: accepted.input.modelSelection,
+      bootstrap: {
+        createThread: {
+          ...accepted.input.bootstrap?.createThread,
+          projectId: targetProjectId,
+        },
+      },
+    });
+    expect(retargeted?.input.bootstrap).not.toHaveProperty("prepareWorktree");
+    expect(retargeted?.input.bootstrap).not.toHaveProperty("runSetupScript");
+  });
+
+  it("atomically retargets every draft turn before one drain announcement", async () => {
+    const memoryStorage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(memoryStorage, pendingInput());
+    const laterCommandId = CommandId.make("command-2");
+    const laterMessageId = MessageId.make("message-2");
+    const later = pendingInput();
+    await enqueuePendingTurn(memoryStorage, {
+      ...later,
+      idempotencyKey: laterCommandId,
+      messageId: laterMessageId,
+      createdAt: "2026-07-24T12:01:00.000Z",
+      input: {
+        ...later.input,
+        commandId: laterCommandId,
+        message: { ...later.input.message, messageId: laterMessageId, text: "Follow up" },
+      },
+    });
+
+    const writeCompletionOrder: string[] = [];
+    let releaseFirstWrite!: () => void;
+    const firstWriteBlocked = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    const put = vi.fn(async (_entry: PendingTurnOutboxEntry) => {
+      throw new Error("Retargeting must not expose per-entry writes.");
+    });
+    const storage: PendingTurnOutboxStorage = {
+      list: memoryStorage.list,
+      put,
+      putMany: async (entries) => {
+        const prepared = await Promise.all(
+          entries.map(async (entry, index) => {
+            if (index === 0) await firstWriteBlocked;
+            else releaseFirstWrite();
+            writeCompletionOrder.push(entry.idempotencyKey);
+            return entry;
+          }),
+        );
+        await memoryStorage.putMany(prepared);
+      },
+      remove: memoryStorage.remove,
+    };
+    const dispatchEvent = vi.fn();
+    const postMessage = vi.fn();
+    const close = vi.fn();
+    vi.stubGlobal("window", { dispatchEvent });
+    vi.stubGlobal(
+      "BroadcastChannel",
+      class {
+        postMessage = postMessage;
+        close = close;
+      },
+    );
+
+    await retargetPendingTurnsForDraft(
+      storage,
+      "draft-1",
+      EnvironmentId.make("scaffold-session"),
+      ProjectId.make("target-project"),
+    );
+
+    expect(writeCompletionOrder).toEqual([laterCommandId, commandId]);
+    expect(put).not.toHaveBeenCalled();
+    expect(dispatchEvent).toHaveBeenCalledTimes(1);
+    expect(postMessage).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+
+    const dispatched: string[] = [];
+    await drainPendingTurnOutbox({
+      storage: memoryStorage,
+      dispatch: async (entry) => {
+        dispatched.push(entry.idempotencyKey);
+      },
+    });
+    expect(dispatched).toEqual([commandId, laterCommandId]);
+  });
+
+  it("durably queues later turns with their own immutable command and message ids", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(storage, pendingInput());
+    const laterCommandId = CommandId.make("command-2");
+    const laterMessageId = MessageId.make("message-2");
+    const later = pendingInput();
+    await enqueuePendingTurn(storage, {
+      ...later,
+      idempotencyKey: laterCommandId,
+      messageId: laterMessageId,
+      createdAt: "2026-07-24T12:01:00.000Z",
+      input: {
+        ...later.input,
+        commandId: laterCommandId,
+        message: { ...later.input.message, messageId: laterMessageId, text: "Follow up" },
+      },
+    });
+
+    expect(await storage.list()).toMatchObject([
+      { idempotencyKey: commandId, messageId },
+      { idempotencyKey: laterCommandId, messageId: laterMessageId },
+    ]);
+  });
+
   it("preserves generic file payloads for a provisional first turn retry", async () => {
     const storage = createMemoryPendingTurnOutboxStorage();
     const baseInput = pendingInput();
@@ -160,6 +329,25 @@ describe("pending turn outbox", () => {
     expect(await storage.list()).toEqual([]);
   });
 
+  it("uses the browser lock to coordinate drains across tabs", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(storage, pendingInput());
+    const request = vi.fn(async (_name: string, callback: () => Promise<ReadonlyArray<unknown>>) =>
+      callback(),
+    );
+    vi.stubGlobal("navigator", { locks: { request } });
+    const dispatch = vi.fn(async () => undefined);
+
+    await Promise.all([
+      drainPendingTurnOutbox({ storage, dispatch }),
+      drainPendingTurnOutbox({ storage, dispatch }),
+    ]);
+
+    expect(request).toHaveBeenCalledWith("t3code:pending-turn-outbox:drain", expect.any(Function));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(await storage.list()).toEqual([]);
+  });
+
   it("keeps failures visible and retries with the same command and message ids", async () => {
     const storage = createMemoryPendingTurnOutboxStorage();
     await enqueuePendingTurn(storage, pendingInput());
@@ -189,6 +377,89 @@ describe("pending turn outbox", () => {
     expect(seen[1]?.input.commandId).toBe(commandId);
     expect(seen[1]?.messageId).toBe(messageId);
     expect(await storage.list()).toEqual([]);
+  });
+
+  it("retries transient and ambiguous dispatch failures", () => {
+    expect(
+      isPendingTurnDispatchFailureRetryable({
+        _tag: "EnvironmentRpcUnavailableError",
+        message: "Local is not connected.",
+      }),
+    ).toBe(true);
+    expect(isPendingTurnDispatchFailureRetryable(new Error("SocketCloseError: reset"))).toBe(true);
+    expect(isPendingTurnDispatchFailureRetryable(new Error("unexpected client defect"))).toBe(true);
+  });
+
+  it("retries unknown tagged dispatch failures", () => {
+    expect(
+      isPendingTurnDispatchFailureRetryable({
+        _tag: "UnexpectedProviderFailure",
+        message: "The provider returned a new failure shape.",
+      }),
+    ).toBe(true);
+  });
+
+  it("makes intentional authentication and scope failures terminal", () => {
+    expect(
+      [
+        "EnvironmentAuthorizationError",
+        "EnvironmentAuthInvalidError",
+        "EnvironmentScopeRequiredError",
+        "EnvironmentOperationForbiddenError",
+      ].every((_tag) => !isPendingTurnDispatchFailureRetryable({ _tag, message: "denied" })),
+    ).toBe(true);
+  });
+
+  it("makes declared command failures terminal and never resends them", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(storage, pendingInput());
+    const dispatch = vi.fn(async () => {
+      throw {
+        _tag: "OrchestrationDispatchCommandError",
+        message: "Invalid model selection",
+      };
+    });
+
+    const first = await drainPendingTurnOutbox({ storage, dispatch });
+    const second = await drainPendingTurnOutbox({ storage, dispatch });
+
+    expect(first[0]).toMatchObject({ outcome: "terminal", error: "Invalid model selection" });
+    expect(second[0]).toMatchObject({ outcome: "terminal", error: "Invalid model selection" });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(await storage.list()).toMatchObject([
+      { status: "terminal", attemptCount: 1, lastError: "Invalid model selection" },
+    ]);
+
+    await discardPendingTurn(storage, commandId);
+    expect(await storage.list()).toEqual([]);
+  });
+
+  it("does not send a later turn ahead of a failed earlier turn", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(storage, pendingInput());
+    const later = pendingInput();
+    const laterCommandId = CommandId.make("command-2");
+    const laterMessageId = MessageId.make("message-2");
+    await enqueuePendingTurn(storage, {
+      ...later,
+      idempotencyKey: laterCommandId,
+      messageId: laterMessageId,
+      createdAt: "2026-07-24T12:01:00.000Z",
+      input: {
+        ...later.input,
+        commandId: laterCommandId,
+        message: { ...later.input.message, messageId: laterMessageId },
+      },
+    });
+    const dispatch = vi.fn(async (entry: PendingTurnOutboxEntry) => {
+      if (entry.idempotencyKey === commandId) throw new Error("offline");
+    });
+
+    const results = await drainPendingTurnOutbox({ storage, dispatch });
+
+    expect(results.map((result) => result.outcome)).toEqual(["failed", "deferred"]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ idempotencyKey: commandId }));
   });
 
   it("records an immediate dispatch failure without replacing the durable payload", async () => {

@@ -51,6 +51,14 @@ export function normalizeOmpLoginChallengeResponse(value: string): string | null
   return response.length > 0 ? response : null;
 }
 
+export function ompLoginChallengeExpiryDelay(
+  challenge: OmpLoginChallenge,
+  now = Date.now(),
+): number | null {
+  if (challenge.expiresAt === undefined) return null;
+  return Math.max(0, challenge.expiresAt - now);
+}
+
 export function describeOmpLoginFailure(error: unknown): string | undefined {
   if (error instanceof Error) {
     const message = error.message.trim();
@@ -224,8 +232,9 @@ export function formatOmpUsageAmount(limit: OmpUsageLimit): string {
 
 export function buildOmpUsageDisplayRows(
   reports: ReadonlyArray<OmpUsageReport>,
+  accounts: ReadonlyArray<OmpAccountOverview["accounts"]["accounts"][number]> = [],
 ): OmpUsageDisplayRow[] {
-  return reports.flatMap((report, reportIndex) =>
+  const reportRows = reports.flatMap((report, reportIndex) =>
     report.limits.filter(isVisibleOmpUsageLimit).map((limit) => {
       const stale = report.notes?.includes(OMP_RETAINED_USAGE_NOTE) ?? false;
       return {
@@ -242,4 +251,25 @@ export function buildOmpUsageDisplayRows(
       };
     }),
   );
+  const missingAccountRows = accounts
+    .filter((account) => account.state !== "unavailable")
+    .filter(
+      (account) =>
+        !reports.some(
+          (report) =>
+            (report.accountRef === account.accountRef ||
+              (report.provider === account.provider &&
+                report.maskedAccount !== undefined &&
+                (report.maskedAccount === account.maskedEmail ||
+                  report.maskedAccount === account.displayName))) &&
+            report.limits.some(isVisibleOmpUsageLimit),
+        ),
+    )
+    .map((account) => ({
+      key: `${account.accountRef}:unavailable`,
+      title: `${providerDisplayName(account.provider)} · ${account.maskedEmail ?? account.displayName}`,
+      description: "Usage unavailable",
+      stale: true,
+    }));
+  return [...reportRows, ...missingAccountRows];
 }

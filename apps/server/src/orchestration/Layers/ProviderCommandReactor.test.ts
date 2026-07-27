@@ -490,6 +490,55 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 
+  it("deduplicates an identical turn start before invoking the provider twice", async () => {
+    const harness = await createHarness();
+    const commandId = CommandId.make("cmd-turn-start-duplicate");
+    const messageId = asMessageId("user-message-duplicate");
+    const command = {
+      type: "thread.turn.start" as const,
+      commandId,
+      threadId: ThreadId.make("thread-1"),
+      message: {
+        messageId,
+        role: "user" as const,
+        text: "send this exact prompt once",
+        attachments: [],
+      },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required" as const,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    const firstReceipt = await harness.dispatch(command);
+    const duplicateReceipt = await harness.dispatch(command);
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    const turnStartEvents = await Effect.runPromise(
+      Stream.runCollect(harness.engine.readEvents(0)).pipe(
+        Effect.map((events) =>
+          [...events].filter(
+            (event) =>
+              event.type === "thread.turn-start-requested" && event.commandId === commandId,
+          ),
+        ),
+      ),
+    );
+
+    expect(duplicateReceipt).toEqual(firstReceipt);
+    expect(turnStartEvents).toHaveLength(1);
+    expect(turnStartEvents[0]).toMatchObject({
+      commandId,
+      sequence: firstReceipt.sequence,
+      payload: {
+        threadId: ThreadId.make("thread-1"),
+        messageId,
+      },
+    });
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+  });
+
   it("recovers one persisted pending turn start when the reactor starts", async () => {
     const harness = await createHarness({ startReactor: false });
     const now = "2026-01-01T00:00:00.000Z";

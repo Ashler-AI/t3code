@@ -9,6 +9,7 @@ import {
   resolveDraftEnvModeAfterBranchChange,
   resolveEffectiveEnvMode,
   resolveEnvModeLabel,
+  resolveInitialWorktreeBaseBranch,
   resolveBranchToolbarValue,
   resolveLockedWorkspaceLabel,
   resolveLocalCheckoutBranchMismatch,
@@ -168,6 +169,26 @@ describe("resolveBranchToolbarValue", () => {
         activeWorktreePath: null,
         activeThreadBranch: "feature/base",
         currentGitBranch: "main",
+      }),
+    ).toBe("main");
+  });
+});
+
+describe("resolveInitialWorktreeBaseBranch", () => {
+  it("uses the repository's checked-out HEAD when origin/HEAD points elsewhere", () => {
+    expect(
+      resolveInitialWorktreeBaseBranch({
+        currentGitBranch: "feature/current-head",
+        defaultBranchName: "main",
+      }),
+    ).toBe("feature/current-head");
+  });
+
+  it("falls back to the default branch when the current ref is unavailable", () => {
+    expect(
+      resolveInitialWorktreeBaseBranch({
+        currentGitBranch: null,
+        defaultBranchName: "main",
       }),
     ).toBe("main");
   });

@@ -13,8 +13,9 @@ const SESSION_COOKIE_NAME = "t3_session";
 export function resolveSessionCookieName(input: {
   readonly mode: "web" | "desktop";
   readonly port: number;
+  readonly devUrl?: URL;
 }): string {
-  if (input.mode !== "desktop") {
+  if (input.mode !== "desktop" && input.devUrl === undefined) {
     return SESSION_COOKIE_NAME;
   }
 

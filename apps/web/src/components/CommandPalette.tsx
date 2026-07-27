@@ -132,6 +132,7 @@ import {
   completeOmpLoginFlow,
   describeOmpLoginFailure,
   getOmpLoginActionPresentation,
+  ompLoginChallengeExpiryDelay,
   preserveOmpOverviewAfterRefreshFailure,
   providerDisplayName,
 } from "./OmpAccountPalette.logic";
@@ -162,9 +163,18 @@ import type { ChatComposerHandle } from "./chat/ChatComposer";
 import { getProjectOrderKey, selectProjectGroupingSettings } from "../logicalProject";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
 import {
-  buildSidebarProjectPickerEntries,
+  buildLocalSidebarProjectPickerEntries,
   buildSidebarProjectSnapshots,
 } from "../sidebarProjectGrouping";
+import {
+  canCopySessionToScaffold,
+  COPY_SESSION_SCAFFOLD_DEPLOYMENTS,
+  isSessionTransferLocalConnectionTarget,
+  runSessionTransferCommand,
+  sessionTransferCommandTitle,
+  sessionTransferKindForThread,
+  type StartSessionCopy,
+} from "../sessionTransferUi";
 
 const EMPTY_BROWSE_ENTRIES: FilesystemBrowseResult["entries"] = [];
 
@@ -409,7 +419,13 @@ function reduceCommandPaletteUiState(
   }
 }
 
-export function CommandPalette({ children }: { children: ReactNode }) {
+export function CommandPalette({
+  children,
+  startSessionCopy,
+}: {
+  children: ReactNode;
+  startSessionCopy?: StartSessionCopy;
+}) {
   const [state, dispatch] = useReducer(reduceCommandPaletteUiState, {
     open: false,
     openIntent: null,
@@ -424,6 +440,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   const [pendingOmpLoginInput, setPendingOmpLoginInput] = useState<{
     readonly challenge: OmpLoginChallenge;
     readonly resolve: (response: string | null) => void;
+    timeoutId?: ReturnType<typeof setTimeout>;
   } | null>(null);
   const [ompLoginAuthorizationUrl, setOmpLoginAuthorizationUrl] = useState<string | null>(null);
   const pendingOmpLoginInputRef = useRef(pendingOmpLoginInput);
@@ -431,16 +448,32 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   const requestOmpLoginInput = useCallback(
     (challenge: OmpLoginChallenge) =>
       new Promise<string | null>((resolve) => {
-        pendingOmpLoginInputRef.current?.resolve(null);
-        const pending = { challenge, resolve };
+        const previous = pendingOmpLoginInputRef.current;
+        if (previous?.timeoutId !== undefined) clearTimeout(previous.timeoutId);
+        previous?.resolve(null);
+        const pending: {
+          readonly challenge: OmpLoginChallenge;
+          readonly resolve: (response: string | null) => void;
+          timeoutId?: ReturnType<typeof setTimeout>;
+        } = { challenge, resolve };
         pendingOmpLoginInputRef.current = pending;
         setPendingOmpLoginInput(pending);
+        const expiryDelay = ompLoginChallengeExpiryDelay(challenge);
+        if (expiryDelay !== null) {
+          pending.timeoutId = setTimeout(() => {
+            if (pendingOmpLoginInputRef.current !== pending) return;
+            pendingOmpLoginInputRef.current = null;
+            setPendingOmpLoginInput(null);
+            pending.resolve(null);
+          }, expiryDelay);
+        }
       }),
     [],
   );
   const settleOmpLoginInput = useCallback((response: string | null) => {
     const pending = pendingOmpLoginInputRef.current;
     if (pending === null) return;
+    if (pending.timeoutId !== undefined) clearTimeout(pending.timeoutId);
     pendingOmpLoginInputRef.current = null;
     setPendingOmpLoginInput(null);
     pending.resolve(response);
@@ -448,7 +481,9 @@ export function CommandPalette({ children }: { children: ReactNode }) {
 
   useEffect(
     () => () => {
-      pendingOmpLoginInputRef.current?.resolve(null);
+      const pending = pendingOmpLoginInputRef.current;
+      if (pending?.timeoutId !== undefined) clearTimeout(pending.timeoutId);
+      pending?.resolve(null);
       pendingOmpLoginInputRef.current = null;
     },
     [],
@@ -509,6 +544,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
           clearOpenIntent={clearOpenIntent}
           requestOmpLoginInput={requestOmpLoginInput}
           setOmpLoginAuthorizationUrl={setOmpLoginAuthorizationUrl}
+          startSessionCopy={startSessionCopy}
         />
       </CommandDialog>
       <OmpLoginChallengePanel
@@ -529,6 +565,7 @@ function CommandPaletteDialog(props: {
   readonly clearOpenIntent: () => void;
   readonly requestOmpLoginInput: (challenge: OmpLoginChallenge) => Promise<string | null>;
   readonly setOmpLoginAuthorizationUrl: (url: string | null) => void;
+  readonly startSessionCopy: StartSessionCopy | undefined;
 }) {
   if (!props.open) {
     return null;
@@ -541,6 +578,7 @@ function CommandPaletteDialog(props: {
       clearOpenIntent={props.clearOpenIntent}
       requestOmpLoginInput={props.requestOmpLoginInput}
       setOmpLoginAuthorizationUrl={props.setOmpLoginAuthorizationUrl}
+      startSessionCopy={props.startSessionCopy}
     />
   );
 }
@@ -551,6 +589,7 @@ function OpenCommandPaletteDialog(props: {
   readonly clearOpenIntent: () => void;
   readonly requestOmpLoginInput: (challenge: OmpLoginChallenge) => Promise<string | null>;
   readonly setOmpLoginAuthorizationUrl: (url: string | null) => void;
+  readonly startSessionCopy: StartSessionCopy | undefined;
 }) {
   const navigate = useNavigate();
   const {
@@ -559,6 +598,7 @@ function OpenCommandPaletteDialog(props: {
     requestOmpLoginInput,
     setOmpLoginAuthorizationUrl,
     setOpen,
+    startSessionCopy,
   } = props;
   const composerHandleRef = useComposerHandleContext();
   const [query, setQuery] = useState("");
@@ -967,11 +1007,12 @@ function OpenCommandPaletteDialog(props: {
   );
   const projectPickerEntries = useMemo(
     () =>
-      buildSidebarProjectPickerEntries({
+      buildLocalSidebarProjectPickerEntries({
         groups: projectGroups,
         preferredProjectRef: contextualProjectRef,
+        primaryEnvironmentId,
       }),
-    [contextualProjectRef, projectGroups],
+    [contextualProjectRef, primaryEnvironmentId, projectGroups],
   );
   const pickerProjects = useMemo(
     () =>
@@ -1134,23 +1175,11 @@ function OpenCommandPaletteDialog(props: {
             />
           ),
           runProject: async (project) => {
-            const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
-            const contextualRefBelongsToGroup =
-              contextualProjectRef !== null &&
-              group?.memberProjectRefs.some(
-                (projectRef) =>
-                  projectRef.environmentId === contextualProjectRef.environmentId &&
-                  projectRef.projectId === contextualProjectRef.projectId,
-              );
-            await handleNewThread(
-              contextualRefBelongsToGroup
-                ? contextualProjectRef
-                : scopeProjectRef(project.environmentId, project.id),
-            );
+            await handleNewThread(scopeProjectRef(project.environmentId, project.id));
           },
         }),
       ),
-    [contextualProjectRef, handleNewThread, pickerProjects, projectGroupByTargetKey],
+    [handleNewThread, pickerProjects, projectGroupByTargetKey],
   );
 
   function pushPaletteView(view: CommandPaletteView): void {
@@ -1477,6 +1506,88 @@ function OpenCommandPaletteDialog(props: {
     ],
   };
 
+  const activeThreadEnvironment = activeThread
+    ? environments.find((environment) => environment.environmentId === activeThread.environmentId)
+    : undefined;
+  const activeThreadIsLocal = Boolean(
+    activeThread &&
+    activeThreadEnvironment &&
+    isSessionTransferLocalConnectionTarget(activeThreadEnvironment.entry.target),
+  );
+  const copySessionEligible = canCopySessionToScaffold({
+    isLocalEnvironment: activeThreadIsLocal,
+    startAvailable: startSessionCopy !== undefined,
+    thread: activeThread,
+  });
+  const sessionTransferKind = sessionTransferKindForThread(activeThread);
+  const copySessionItem: CommandPaletteSubmenuItem | undefined =
+    copySessionEligible && sessionTransferKind && activeThread && startSessionCopy
+      ? {
+          kind: "submenu",
+          value: "action:copy-to-scaffold",
+          searchTerms: ["copy", "scaffold", "staging", "cloud"],
+          title: sessionTransferCommandTitle(sessionTransferKind),
+          icon: <CloudIcon className={ITEM_ICON_CLASS} />,
+          addonIcon: <CloudIcon className={ADDON_ICON_CLASS} />,
+          groups: [
+            {
+              value: "copy-to-scaffold-deployment",
+              label: "Copy to",
+              items: COPY_SESSION_SCAFFOLD_DEPLOYMENTS.map((deployment) => ({
+                kind: "action" as const,
+                value: `action:copy-to-scaffold:${deployment}`,
+                searchTerms: [deployment, "scaffold", "cloud"],
+                title: `Scaffold ${deployment}`,
+                icon: <CloudIcon className={ITEM_ICON_CLASS} />,
+                keepOpen: true,
+                run: async () => {
+                  let progressToastId: ReturnType<typeof toastManager.add> | undefined;
+                  await runSessionTransferCommand({
+                    deployment,
+                    kind: sessionTransferKind,
+                    source: {
+                      environmentId: activeThread.environmentId,
+                      projectId: activeThread.projectId,
+                      threadId: activeThread.id,
+                    },
+                    start: startSessionCopy,
+                    closePalette: () => setOpen(false),
+                    onProgress: (title) => {
+                      progressToastId = toastManager.add(
+                        stackedThreadToast({ type: "loading", title, timeout: 0 }),
+                      );
+                    },
+                    onCompleted: (title, destination) => {
+                      void navigate({
+                        to: "/$environmentId/$threadId",
+                        params: buildThreadRouteParams(
+                          scopeThreadRef(destination.environmentId, destination.threadId),
+                        ),
+                      });
+                      const toast = stackedThreadToast({
+                        type: "success",
+                        title,
+                      });
+                      if (progressToastId === undefined) toastManager.add(toast);
+                      else toastManager.update(progressToastId, toast);
+                    },
+                    onFailed: (title, error) => {
+                      const toast = stackedThreadToast({
+                        type: "error",
+                        title,
+                        description: error instanceof Error ? error.message : undefined,
+                      });
+                      if (progressToastId === undefined) toastManager.add(toast);
+                      else toastManager.update(progressToastId, toast);
+                    },
+                  });
+                },
+              })),
+            },
+          ],
+        }
+      : undefined;
+
   const visibleOmpOverview = ompOverview ?? ompSnapshotQuery.data;
   const hasActiveTurn = activeThread?.session?.activeTurnId != null;
   const ompLoginActionPresentation = getOmpLoginActionPresentation({ hasActiveTurn });
@@ -1555,7 +1666,10 @@ function OpenCommandPaletteDialog(props: {
   const ompUsageItems: CommandPaletteActionItem[] =
     visibleOmpOverview === null
       ? []
-      : buildOmpUsageDisplayRows(visibleOmpOverview.usage.reports).map((row) => ({
+      : buildOmpUsageDisplayRows(
+          visibleOmpOverview.usage.reports,
+          visibleOmpOverview.accounts.accounts,
+        ).map((row) => ({
           kind: "action" as const,
           value: `omp-usage:${row.key}`,
           searchTerms: ["usage", "plan", "quota", row.title, row.description],
@@ -1601,6 +1715,7 @@ function OpenCommandPaletteDialog(props: {
   }
   const rootGroups = buildAshlerRootGroups({
     newSessionItem,
+    ...(copySessionItem ? { copySessionItem } : {}),
     accountItems: ompAccountItems,
     planUsageItems: [refreshOmpUsageItem, ...ompUsageStatusItems, ...ompUsageItems],
   });

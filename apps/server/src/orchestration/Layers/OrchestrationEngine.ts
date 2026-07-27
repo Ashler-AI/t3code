@@ -45,6 +45,10 @@ import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
+import {
+  isSourceMutationCommand,
+  rejectSourceMutationWhileTransferIsActive,
+} from "../../sessionTransfer/ThreadTransferFence.ts";
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
@@ -177,6 +181,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
+              if (isSourceMutationCommand(envelope.command)) {
+                yield* rejectSourceMutationWhileTransferIsActive(sql, envelope.command);
+              }
               const committedEvents: OrchestrationEvent[] = [];
               let nextCommandReadModel = commandReadModel;
 

@@ -7,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
 import {
@@ -16,7 +17,11 @@ import {
 import * as NetService from "@t3tools/shared/Net";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { deriveServerPaths } from "../config.ts";
-import { resolveServerConfig, validateTrustedPublicBaseUrl } from "./config.ts";
+import {
+  resolveCombinedLoopbackDevBootstrapToken,
+  resolveServerConfig,
+  validateTrustedPublicBaseUrl,
+} from "./config.ts";
 
 const deriveExplicitServerPaths = (baseDir: string, devUrl: URL | undefined) =>
   deriveServerPaths(baseDir, devUrl, { baseDirIsExplicit: true });
@@ -52,6 +57,48 @@ it("validates the optional trusted external DPoP base URL", () => {
     expect(() => validateTrustedPublicBaseUrl(new URL(value))).toThrow(
       "T3CODE_TRUSTED_PUBLIC_BASE_URL",
     );
+  }
+});
+
+it("accepts local dev bootstrap only for the combined loopback web boundary", () => {
+  expect(
+    resolveCombinedLoopbackDevBootstrapToken({
+      enabled: true,
+      token: " internal-token ",
+      mode: "web",
+      host: "127.0.0.1",
+      devUrl: new URL("http://localhost:5733"),
+    }),
+  ).toBe("internal-token");
+
+  for (const input of [
+    { enabled: false, mode: "web" as const, host: undefined, url: "http://localhost:5733" },
+    { enabled: true, mode: "desktop" as const, host: undefined, url: "http://localhost:5733" },
+    { enabled: true, mode: "web" as const, host: "0.0.0.0", url: "http://localhost:5733" },
+    {
+      enabled: true,
+      mode: "web" as const,
+      host: "127.attacker.example",
+      url: "http://localhost:5733",
+    },
+    { enabled: true, mode: "web" as const, host: undefined, url: "https://localhost:5733" },
+    {
+      enabled: true,
+      mode: "web" as const,
+      host: undefined,
+      url: "http://127.attacker.example:5733",
+    },
+    { enabled: true, mode: "web" as const, host: undefined, url: "http://dev.example.com" },
+  ]) {
+    expect(
+      resolveCombinedLoopbackDevBootstrapToken({
+        enabled: input.enabled,
+        token: "internal-token",
+        mode: input.mode,
+        host: input.host,
+        devUrl: new URL(input.url),
+      }),
+    ).toBeUndefined();
   }
 });
 
@@ -217,6 +264,50 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     }),
   );
 
+  it.effect("seeds the browser bootstrap grant from the hidden combined-dev token", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-local-dev-auth");
+      const resolved = yield* resolveServerConfig(
+        {
+          mode: Option.none(),
+          port: Option.none(),
+          host: Option.none(),
+          baseDir: Option.none(),
+          cwd: Option.none(),
+          devUrl: Option.none(),
+          noBrowser: Option.none(),
+          bootstrapFd: Option.none(),
+          autoBootstrapProjectFromCwd: Option.none(),
+          logWebSocketEvents: Option.none(),
+          tailscaleServeEnabled: Option.none(),
+          tailscaleServePort: Option.none(),
+        },
+        Option.none(),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({
+                env: {
+                  T3CODE_MODE: "web",
+                  T3CODE_PORT: "13773",
+                  T3CODE_HOME: baseDir,
+                  VITE_DEV_SERVER_URL: "http://localhost:5733",
+                  T3CODE_LOCAL_DEV_AUTO_AUTH: "true",
+                  T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN: "internal-token",
+                },
+              }),
+            ),
+            NetService.layer,
+          ),
+        ),
+      );
+
+      expect(resolved.desktopBootstrapToken).toBe("internal-token");
+    }),
+  );
+
   it.effect("preserves explicit false CLI boolean flags over env and bootstrap values", () =>
     Effect.gen(function* () {
       const { join } = yield* Path.Path;
@@ -259,6 +350,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
                   T3CODE_NO_BROWSER: "true",
                   T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: "true",
                   T3CODE_LOG_WS_EVENTS: "true",
+                  T3CODE_OTLP_AUTHORIZATION: "Bearer env-only-token",
                 },
               }),
             ),
@@ -270,6 +362,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
       expect(resolved).toEqual({
         logLevel: "Info",
         ...defaultObservabilityConfig,
+        otlpAuthorization: resolved.otlpAuthorization,
         mode: "web",
         port: 8788,
         cwd: process.cwd(),
@@ -286,6 +379,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         tailscaleServeEnabled: false,
         tailscaleServePort: 443,
       });
+      expect(Redacted.value(resolved.otlpAuthorization!)).toBe("Bearer env-only-token");
     }),
   );
 

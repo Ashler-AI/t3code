@@ -189,6 +189,50 @@ function readPersistedCanonicalSourceSequence(
   return typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : undefined;
 }
 
+function deliveryRejectionDetail(cause: unknown): string {
+  if (cause instanceof Error && cause.message.trim().length > 0) {
+    return cause.message;
+  }
+  if (typeof cause === "string" && cause.trim().length > 0) {
+    return cause;
+  }
+  return "Unknown permanent delivery rejection";
+}
+
+type TerminalDeliveryFailure = {
+  readonly eventId: string;
+  readonly sourceSequence: number;
+  readonly detail: string;
+};
+
+function readPersistedTerminalDeliveryFailure(
+  runtimePayload: ProviderSessionDirectory.ProviderRuntimeBinding["runtimePayload"],
+): TerminalDeliveryFailure | undefined {
+  if (!runtimePayload || typeof runtimePayload !== "object" || Array.isArray(runtimePayload)) {
+    return undefined;
+  }
+  const raw =
+    "canonicalDeliveryFailure" in runtimePayload
+      ? runtimePayload.canonicalDeliveryFailure
+      : undefined;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const candidate = raw as Record<string, unknown>;
+  return typeof candidate.eventId === "string" &&
+    typeof candidate.sourceSequence === "number" &&
+    Number.isSafeInteger(candidate.sourceSequence) &&
+    candidate.sourceSequence >= 0 &&
+    typeof candidate.detail === "string" &&
+    candidate.detail.trim().length > 0
+    ? {
+        eventId: candidate.eventId,
+        sourceSequence: candidate.sourceSequence,
+        detail: candidate.detail,
+      }
+    : undefined;
+}
+
 const dieOnMissingBindingInstanceId = (
   operation: string,
   payload: {
@@ -275,6 +319,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   yield* Effect.addFinalizer(() => Queue.shutdown(canonicalRuntimeDeliveryQueue));
   const environmentId = options?.environmentId ?? EnvironmentId.make("local");
   const sourceSequences = new Map<ThreadId, number>();
+  const terminalDeliveryFailures = new Map<ThreadId, TerminalDeliveryFailure>();
+  const pendingRuntimeBindings = new Map<
+    ThreadId,
+    {
+      readonly expectedInstanceId: ProviderInstanceId;
+      readonly events: Array<{
+        readonly source: {
+          readonly instanceId: ProviderInstanceId;
+          readonly provider: ProviderDriverKind;
+        };
+        readonly event: ProviderRuntimeEvent;
+      }>;
+    }
+  >();
   let durableDeliveryConsumerEnabled = false;
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
@@ -289,6 +347,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     McpSessionRegistry.revokeActiveMcpThread(threadId).pipe(
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
     );
+
+  const getTerminalDeliveryFailure = Effect.fn("ProviderService.getTerminalDeliveryFailure")(
+    function* (threadId: ThreadId) {
+      const localFailure = terminalDeliveryFailures.get(threadId);
+      if (localFailure !== undefined) {
+        return localFailure;
+      }
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      const persistedFailure = readPersistedTerminalDeliveryFailure(binding?.runtimePayload);
+      if (persistedFailure !== undefined) {
+        terminalDeliveryFailures.set(threadId, persistedFailure);
+      }
+      return persistedFailure;
+    },
+  );
 
   const resolveSourceSequence = Effect.fn("ProviderService.resolveSourceSequence")(function* (
     event: ProviderRuntimeEvent,
@@ -330,6 +403,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         lastRuntimeEventAt: envelope.event.createdAt,
         ...(envelope.event.turnId !== undefined ? { activeTurnId: envelope.event.turnId } : {}),
       },
+      ...(envelope.resumeCursor?.kind === "omp"
+        ? {
+            canonicalSourceCursor: {
+              environmentId: envelope.environmentId,
+              threadId: envelope.threadId,
+              providerInstanceId: envelope.providerInstanceId,
+              runtimeSessionId: envelope.resumeCursor.sessionId,
+              sourceSequence: envelope.sourceSequence,
+              eventId: envelope.eventId,
+            },
+          }
+        : {}),
     });
 
   const awaitDurableIngestion = Effect.fn("ProviderService.awaitDurableIngestion")(function* (
@@ -338,7 +423,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   ) {
     while (true) {
       const receipt = yield* Deferred.make<
-        { readonly _tag: "Acknowledged" } | { readonly _tag: "Retry"; readonly cause?: unknown }
+        | { readonly _tag: "Acknowledged" }
+        | { readonly _tag: "Retry"; readonly cause?: unknown }
+        | { readonly _tag: "Rejected"; readonly cause: unknown }
       >();
       const receiptSemaphore = yield* Semaphore.make(1);
       const acknowledge = receiptSemaphore.withPermits(1)(
@@ -361,13 +448,94 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ),
           ),
         );
+      const reject = (cause: unknown) =>
+        receiptSemaphore.withPermits(1)(
+          Deferred.isDone(receipt).pipe(
+            Effect.flatMap((done) =>
+              done
+                ? Effect.void
+                : Effect.sync(() => {
+                    terminalDeliveryFailures.set(envelope.threadId, {
+                      eventId: envelope.eventId,
+                      sourceSequence: envelope.sourceSequence,
+                      detail: deliveryRejectionDetail(cause),
+                    });
+                  }).pipe(
+                    Effect.andThen(
+                      Deferred.succeed(receipt, {
+                        _tag: "Rejected" as const,
+                        cause,
+                      }),
+                    ),
+                    Effect.asVoid,
+                  ),
+            ),
+          ),
+        );
       yield* Queue.offer(canonicalRuntimeDeliveryQueue, {
         envelope,
         acknowledge,
         retry,
+        reject,
       });
       const resolution = yield* Deferred.await(receipt);
       if (resolution._tag === "Acknowledged") return;
+      if (resolution._tag === "Rejected") {
+        const detail = deliveryRejectionDetail(resolution.cause);
+        yield* directory
+          .upsert({
+            threadId: envelope.threadId,
+            provider: envelope.event.provider,
+            providerInstanceId: source.instanceId,
+            status: "error",
+            runtimePayload: {
+              activeTurnId: null,
+              lastError: `Canonical provider delivery was permanently rejected: ${detail}`,
+              lastRuntimeEvent: "provider.runtime-delivery.rejected",
+              lastRuntimeEventAt: envelope.event.createdAt,
+              canonicalDeliveryFailure: {
+                eventId: envelope.eventId,
+                sourceSequence: envelope.sourceSequence,
+                detail,
+              },
+            },
+          })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("failed to persist provider runtime delivery rejection", {
+                threadId: envelope.threadId,
+                eventId: envelope.eventId,
+                cause,
+              }),
+            ),
+          );
+        yield* registry.getByInstance(source.instanceId).pipe(
+          Effect.flatMap((adapter) => adapter.stopSession(envelope.threadId)),
+          Effect.catchCause((cause) =>
+            Effect.logError("failed to stop permanently rejected provider session", {
+              threadId: envelope.threadId,
+              eventId: envelope.eventId,
+              cause,
+            }),
+          ),
+        );
+        yield* clearMcpSession(envelope.threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("failed to clear permanently rejected provider MCP session", {
+              threadId: envelope.threadId,
+              eventId: envelope.eventId,
+              cause,
+            }),
+          ),
+        );
+        yield* Effect.logError("provider runtime delivery permanently rejected", {
+          threadId: envelope.threadId,
+          eventId: envelope.eventId,
+          sourceSequence: envelope.sourceSequence,
+          cause: resolution.cause,
+        });
+        return;
+      }
       yield* Effect.logWarning("provider runtime delivery requested retry", {
         threadId: envelope.threadId,
         eventId: envelope.eventId,
@@ -382,6 +550,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     event: ProviderRuntimeEvent,
     source: { readonly instanceId: ProviderInstanceId },
   ) {
+    const terminalFailure = yield* getTerminalDeliveryFailure(event.threadId);
+    if (terminalFailure !== undefined) {
+      yield* Effect.logError("provider runtime event blocked by permanent delivery rejection", {
+        threadId: event.threadId,
+        eventId: event.eventId,
+        rejectedEventId: terminalFailure.eventId,
+        rejectedSourceSequence: terminalFailure.sourceSequence,
+        cause: terminalFailure.detail,
+      });
+      return;
+    }
     const resumeCursor = canonicalResumeCursor(event);
     const sourceSequence = yield* resolveSourceSequence(event);
     const envelope: ProviderRuntimeEventEnvelope = {
@@ -451,7 +630,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
     });
 
-  const processRuntimeEvent = (
+  const processBoundRuntimeEvent = (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
@@ -466,6 +645,89 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }).pipe(Effect.andThen(publishRuntimeEvent(canonicalEvent, source))),
       ),
     );
+
+  const processRuntimeEvent = (
+    source: {
+      readonly instanceId: ProviderInstanceId;
+      readonly provider: ProviderDriverKind;
+    },
+    event: ProviderRuntimeEvent,
+  ): Effect.Effect<void, ProviderServiceError> =>
+    Effect.suspend(() => {
+      const pending = pendingRuntimeBindings.get(event.threadId);
+      if (pending?.expectedInstanceId === source.instanceId) {
+        pending.events.push({ source, event });
+        return Effect.void;
+      }
+      return processBoundRuntimeEvent(source, event);
+    });
+
+  const beginRuntimeBinding = (
+    operation: string,
+    threadId: ThreadId,
+    expectedInstanceId: ProviderInstanceId,
+  ) =>
+    Effect.suspend(() => {
+      if (pendingRuntimeBindings.has(threadId)) {
+        return Effect.fail(
+          toValidationError(
+            operation,
+            `Cannot start thread '${threadId}' while another provider runtime binding is in progress.`,
+          ),
+        );
+      }
+      pendingRuntimeBindings.set(threadId, { expectedInstanceId, events: [] });
+      return Effect.void;
+    });
+
+  const discardPendingRuntimeEvents = (threadId: ThreadId) =>
+    Effect.sync(() => {
+      pendingRuntimeBindings.delete(threadId);
+    });
+
+  const compensateFailedRuntimeBinding = Effect.fn(
+    "ProviderService.compensateFailedRuntimeBinding",
+  )(function* (threadId: ThreadId, adapter: ProviderAdapterShape<ProviderAdapterError>) {
+    yield* adapter.stopSession(threadId).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider.session.stop-unbound-failed", {
+          threadId,
+          provider: adapter.provider,
+          cause,
+        }),
+      ),
+    );
+    // OMP stop emits session.exited synchronously. Keep the binding gate in
+    // place through stop so the failed runtime cannot escape as an unbound
+    // canonical event, then discard that runtime's entire buffered segment.
+    yield* discardPendingRuntimeEvents(threadId);
+    yield* clearMcpSession(threadId).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider.session.clear-unbound-mcp-failed", {
+          threadId,
+          provider: adapter.provider,
+          cause,
+        }),
+      ),
+    );
+  });
+
+  const releaseRuntimeBinding = Effect.fn("ProviderService.releaseRuntimeBinding")(function* (
+    threadId: ThreadId,
+  ) {
+    while (true) {
+      const pending = pendingRuntimeBindings.get(threadId);
+      if (pending === undefined) return;
+      const batch = pending.events.splice(0, pending.events.length);
+      if (batch.length === 0) {
+        pendingRuntimeBindings.delete(threadId);
+        return;
+      }
+      yield* Effect.forEach(batch, ({ source, event }) => processBoundRuntimeEvent(source, event), {
+        discard: true,
+      });
+    }
+  });
 
   // `subscribedAdapters` is our source-of-truth for "which instance adapters
   // are currently wired into the runtime event bus". It both tracks the set
@@ -567,7 +829,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
-      yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+      yield* beginRuntimeBinding(input.operation, input.binding.threadId, bindingInstanceId);
+      yield* prepareMcpSession(input.binding.threadId, bindingInstanceId).pipe(
+        Effect.onError(() => discardPendingRuntimeEvents(input.binding.threadId)),
+      );
       const resumed = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
@@ -578,18 +843,29 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
         })
-        .pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+        .pipe(
+          Effect.onError(() =>
+            discardPendingRuntimeEvents(input.binding.threadId).pipe(
+              Effect.andThen(clearMcpSession(input.binding.threadId)),
+            ),
+          ),
+        );
       if (resumed.provider !== adapter.provider) {
-        yield* clearMcpSession(input.binding.threadId);
+        yield* compensateFailedRuntimeBinding(input.binding.threadId, adapter);
         return yield* toValidationError(
           input.operation,
           `Adapter/provider mismatch while recovering thread '${input.binding.threadId}'. Expected '${adapter.provider}', received '${resumed.provider}'.`,
         );
       }
 
-      yield* upsertSessionBinding(
-        { ...resumed, providerInstanceId: bindingInstanceId },
-        input.binding.threadId,
+      yield* Effect.gen(function* () {
+        yield* upsertSessionBinding(
+          { ...resumed, providerInstanceId: bindingInstanceId },
+          input.binding.threadId,
+        );
+        yield* releaseRuntimeBinding(input.binding.threadId);
+      }).pipe(
+        Effect.onError(() => compensateFailedRuntimeBinding(input.binding.threadId, adapter)),
       );
       yield* analytics.record("provider.session.recovered", {
         provider: resumed.provider,
@@ -612,6 +888,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     readonly operation: string;
     readonly allowRecovery: boolean;
   }) {
+    const terminalFailure = yield* getTerminalDeliveryFailure(input.threadId);
+    if (terminalFailure !== undefined) {
+      return yield* toValidationError(
+        input.operation,
+        `Cannot continue thread '${input.threadId}' because canonical provider delivery '${terminalFailure.eventId}' was permanently rejected: ${terminalFailure.detail}`,
+      );
+    }
     const bindingOption = yield* directory.getBinding(input.threadId);
     const binding = Option.getOrUndefined(bindingOption);
     if (!binding) {
@@ -701,6 +984,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "ProviderService.startSession",
         parsed,
       );
+      const terminalFailure = yield* getTerminalDeliveryFailure(threadId);
+      if (terminalFailure !== undefined) {
+        return yield* toValidationError(
+          "ProviderService.startSession",
+          `Cannot continue thread '${threadId}' because canonical provider delivery '${terminalFailure.eventId}' was permanently rejected: ${terminalFailure.detail}`,
+        );
+      }
       let metricProvider = parsed.provider ?? String(resolvedInstanceId);
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "start-session",
@@ -760,7 +1050,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.cwd.effective": effectiveCwd ?? "",
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
-        yield* prepareMcpSession(threadId, resolvedInstanceId);
+        yield* beginRuntimeBinding("ProviderService.startSession", threadId, resolvedInstanceId);
+        yield* prepareMcpSession(threadId, resolvedInstanceId).pipe(
+          Effect.onError(() => discardPendingRuntimeEvents(threadId)),
+        );
         const session = yield* adapter
           .startSession({
             ...input,
@@ -768,10 +1061,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
           })
-          .pipe(Effect.onError(() => clearMcpSession(threadId)));
+          .pipe(
+            Effect.onError(() =>
+              discardPendingRuntimeEvents(threadId).pipe(Effect.andThen(clearMcpSession(threadId))),
+            ),
+          );
 
         if (session.provider !== adapter.provider) {
-          yield* clearMcpSession(threadId);
+          yield* compensateFailedRuntimeBinding(threadId, adapter);
           return yield* toValidationError(
             "ProviderService.startSession",
             `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
@@ -782,13 +1079,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           providerInstanceId: resolvedInstanceId,
         };
 
-        yield* stopStaleSessionsForThread({
-          threadId,
-          currentInstanceId: resolvedInstanceId,
-        });
-        yield* upsertSessionBinding(sessionWithInstance, threadId, {
-          modelSelection: input.modelSelection,
-        });
+        yield* Effect.gen(function* () {
+          yield* stopStaleSessionsForThread({
+            threadId,
+            currentInstanceId: resolvedInstanceId,
+          });
+          yield* upsertSessionBinding(sessionWithInstance, threadId, {
+            modelSelection: input.modelSelection,
+          });
+          yield* releaseRuntimeBinding(threadId);
+        }).pipe(Effect.onError(() => compensateFailedRuntimeBinding(threadId, adapter)));
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
           runtimeMode: input.runtimeMode,

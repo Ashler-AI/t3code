@@ -1,11 +1,13 @@
 import type { StartThreadTurnInput } from "@t3tools/client-runtime/operations";
-import type { EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
+import type { EnvironmentId, MessageId, ProjectId, ThreadId } from "@t3tools/contracts";
 
 const DATABASE_NAME = "t3code:pending-turn-outbox";
 const DATABASE_VERSION = 1;
 const STORE_NAME = "pending-turns";
+const DRAIN_EVENT = "t3code:pending-turn-outbox:drain";
+const DRAIN_CHANNEL = "t3code:pending-turn-outbox";
 
-export type PendingTurnStatus = "pending" | "sending" | "failed";
+export type PendingTurnStatus = "pending" | "sending" | "failed" | "terminal";
 
 export interface PendingTurnOutboxEntry {
   readonly schemaVersion: 1;
@@ -25,19 +27,56 @@ export interface PendingTurnOutboxEntry {
 export interface PendingTurnOutboxStorage {
   readonly list: () => Promise<ReadonlyArray<PendingTurnOutboxEntry>>;
   readonly put: (entry: PendingTurnOutboxEntry) => Promise<void>;
+  readonly putMany: (entries: ReadonlyArray<PendingTurnOutboxEntry>) => Promise<void>;
   readonly remove: (idempotencyKey: string) => Promise<void>;
+}
+
+function announcePendingTurnDrain(): void {
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(DRAIN_EVENT));
+  if (typeof BroadcastChannel !== "undefined") {
+    const channel = new BroadcastChannel(DRAIN_CHANNEL);
+    // eslint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel.postMessage has no targetOrigin parameter.
+    channel.postMessage("drain");
+    channel.close();
+  }
 }
 
 export interface PendingTurnDrainResult {
   readonly entry: PendingTurnOutboxEntry;
-  readonly outcome: "acknowledged" | "sent" | "failed";
+  readonly outcome: "acknowledged" | "sent" | "failed" | "terminal" | "deferred";
   readonly error: string | null;
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error && error.message.trim().length > 0
-    ? error.message
-    : "The pending message could not be sent.";
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    error.message.trim().length > 0
+  ) {
+    return error.message;
+  }
+  return "The pending message could not be sent.";
+}
+
+function errorTag(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("_tag" in error)) return null;
+  return typeof error._tag === "string" ? error._tag : null;
+}
+
+const PERMANENT_PENDING_TURN_FAILURE_TAGS = new Set([
+  "OrchestrationDispatchCommandError",
+  "EnvironmentAuthorizationError",
+  "EnvironmentAuthInvalidError",
+  "EnvironmentScopeRequiredError",
+  "EnvironmentOperationForbiddenError",
+]);
+
+/** Only declared command rejections and intentional auth failures are terminal. */
+export function isPendingTurnDispatchFailureRetryable(error: unknown): boolean {
+  const tag = errorTag(error);
+  return tag === null || !PERMANENT_PENDING_TURN_FAILURE_TAGS.has(tag);
 }
 
 function isPendingTurnOutboxEntry(value: unknown): value is PendingTurnOutboxEntry {
@@ -59,7 +98,10 @@ function isPendingTurnOutboxEntry(value: unknown): value is PendingTurnOutboxEnt
     typeof message === "object" &&
     message !== null &&
     message.messageId === entry.messageId &&
-    (entry.status === "pending" || entry.status === "sending" || entry.status === "failed") &&
+    (entry.status === "pending" ||
+      entry.status === "sending" ||
+      entry.status === "failed" ||
+      entry.status === "terminal") &&
     typeof entry.attemptCount === "number" &&
     typeof entry.createdAt === "string" &&
     typeof entry.updatedAt === "string" &&
@@ -127,6 +169,20 @@ export function createIndexedDbPendingTurnOutboxStorage(): PendingTurnOutboxStor
         const done = transactionDone(transaction);
         transaction.objectStore(STORE_NAME).put(entry);
         await done;
+        announcePendingTurnDrain();
+      } finally {
+        database.close();
+      }
+    },
+    async putMany(entries) {
+      if (entries.length === 0) return;
+      const database = await openDatabase();
+      try {
+        const transaction = database.transaction(STORE_NAME, "readwrite");
+        const done = transactionDone(transaction);
+        const store = transaction.objectStore(STORE_NAME);
+        for (const entry of entries) store.put(entry);
+        await done;
       } finally {
         database.close();
       }
@@ -157,6 +213,9 @@ export function createMemoryPendingTurnOutboxStorage(
     },
     async put(entry) {
       entries.set(entry.idempotencyKey, entry);
+    },
+    async putMany(nextEntries) {
+      for (const entry of nextEntries) entries.set(entry.idempotencyKey, entry);
     },
     async remove(idempotencyKey) {
       entries.delete(idempotencyKey);
@@ -197,6 +256,65 @@ export async function enqueuePendingTurn(
   return entry;
 }
 
+function retargetTurnInputForScaffold(
+  input: StartThreadTurnInput,
+  projectId: ProjectId,
+): StartThreadTurnInput {
+  const { bootstrap: _bootstrap, ...turnInput } = input;
+  const createThread = input.bootstrap?.createThread;
+  if (createThread === undefined) return turnInput;
+
+  return {
+    ...turnInput,
+    bootstrap: {
+      createThread: {
+        ...createThread,
+        projectId,
+      },
+    },
+  };
+}
+
+/**
+ * A Scaffold draft accepts the user's turn before the target project exists in
+ * the browser projection. Once that project hydrates, preserve the accepted
+ * command/message identities and user payload while replacing only
+ * destination-bound routing. Local worktree preparation must never run inside
+ * a sandbox that already owns its workspace.
+ */
+export async function retargetPendingTurnsForDraft(
+  storage: PendingTurnOutboxStorage,
+  draftId: string,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+): Promise<void> {
+  const entries = (await storage.list()).filter((entry) => entry.draftId === draftId);
+  if (entries.length === 0) return;
+  await storage.putMany(
+    entries.map((entry) => ({
+      ...entry,
+      environmentId,
+      input: retargetTurnInputForScaffold(entry.input, projectId),
+    })),
+  );
+  announcePendingTurnDrain();
+}
+
+export function subscribePendingTurnDrain(listener: () => void): () => void {
+  if (typeof window === "undefined") return () => undefined;
+  window.addEventListener(DRAIN_EVENT, listener);
+  window.addEventListener("online", listener);
+  const channel =
+    typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(DRAIN_CHANNEL);
+  channel?.addEventListener("message", listener);
+  return () => {
+    window.removeEventListener(DRAIN_EVENT, listener);
+    window.removeEventListener("online", listener);
+    channel?.removeEventListener("message", listener);
+    channel?.close();
+  };
+}
+
 export async function listPendingTurnsForThread(
   storage: PendingTurnOutboxStorage,
   environmentId: EnvironmentId,
@@ -231,6 +349,14 @@ export async function acknowledgePendingTurn(
   await storage.remove(idempotencyKey);
 }
 
+export async function discardPendingTurn(
+  storage: PendingTurnOutboxStorage,
+  idempotencyKey: string,
+): Promise<void> {
+  await storage.remove(idempotencyKey);
+  announcePendingTurnDrain();
+}
+
 export async function recordPendingTurnFailure(
   storage: PendingTurnOutboxStorage,
   idempotencyKey: string,
@@ -240,9 +366,10 @@ export async function recordPendingTurnFailure(
     (candidate) => candidate.idempotencyKey === idempotencyKey,
   );
   if (!entry) return;
+  const retryable = isPendingTurnDispatchFailureRetryable(error);
   await storage.put({
     ...entry,
-    status: "failed",
+    status: retryable ? "failed" : "terminal",
     attemptCount: entry.attemptCount + 1,
     updatedAt: new Date().toISOString(),
     lastError: errorMessage(error),
@@ -274,7 +401,8 @@ export async function drainPendingTurnOutbox(input: {
 
   try {
     const drain = async (): Promise<ReadonlyArray<PendingTurnDrainResult>> => {
-      const entries = (await input.storage.list()).filter(
+      const allEntries = [...(await input.storage.list())];
+      const entries = allEntries.filter(
         (entry) =>
           (input.environmentId === undefined || entry.environmentId === input.environmentId) &&
           (input.threadId === undefined || entry.threadId === input.threadId) &&
@@ -282,8 +410,27 @@ export async function drainPendingTurnOutbox(input: {
       );
       const results: PendingTurnDrainResult[] = [];
       for (const entry of entries) {
+        if (entry.status === "terminal") {
+          results.push({ entry, outcome: "terminal", error: entry.lastError });
+          continue;
+        }
+
+        const entryIndex = allEntries.indexOf(entry);
+        const hasEarlierTurnInThread = allEntries.some(
+          (candidate, candidateIndex) =>
+            candidateIndex < entryIndex &&
+            candidate.environmentId === entry.environmentId &&
+            candidate.threadId === entry.threadId &&
+            candidate.idempotencyKey !== entry.idempotencyKey,
+        );
+        if (hasEarlierTurnInThread) {
+          results.push({ entry, outcome: "deferred", error: null });
+          continue;
+        }
+
         if ((await input.isAcknowledged?.(entry)) === true) {
           await input.storage.remove(entry.idempotencyKey);
+          allEntries.splice(allEntries.indexOf(entry), 1);
           results.push({ entry, outcome: "acknowledged", error: null });
           continue;
         }
@@ -299,16 +446,22 @@ export async function drainPendingTurnOutbox(input: {
         try {
           await input.dispatch(sending);
           await input.storage.remove(sending.idempotencyKey);
+          allEntries.splice(allEntries.indexOf(entry), 1);
           results.push({ entry: sending, outcome: "sent", error: null });
         } catch (error) {
           const message = errorMessage(error);
+          const retryable = isPendingTurnDispatchFailureRetryable(error);
           await input.storage.put({
             ...sending,
-            status: "failed",
+            status: retryable ? "failed" : "terminal",
             updatedAt: new Date().toISOString(),
             lastError: message,
           });
-          results.push({ entry: sending, outcome: "failed", error: message });
+          results.push({
+            entry: sending,
+            outcome: retryable ? "failed" : "terminal",
+            error: message,
+          });
         }
       }
       return results;

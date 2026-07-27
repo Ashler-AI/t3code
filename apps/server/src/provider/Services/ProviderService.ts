@@ -137,6 +137,7 @@ export interface ProviderRuntimeEventDelivery {
   readonly envelope: ProviderRuntimeEventEnvelope;
   readonly acknowledge: Effect.Effect<void, ProviderServiceError>;
   readonly retry: (cause?: unknown) => Effect.Effect<void>;
+  readonly reject: (cause: unknown) => Effect.Effect<void>;
 }
 
 /**

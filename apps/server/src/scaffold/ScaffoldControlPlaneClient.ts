@@ -1,10 +1,13 @@
 import {
   EnvironmentId,
+  SessionFabricCapabilityGrant,
+  type SessionFabricSessionId,
   type ScaffoldDeployment,
   ScaffoldLifecycleError,
   ScaffoldSessionObservation,
   ScaffoldSessionStatus,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 import type { ScaffoldTargetConfig } from "./ScaffoldConfig.ts";
 
@@ -23,6 +26,30 @@ export interface ScaffoldEphemeralTransport {
   readonly attachCredential: string;
   readonly expiresAt: string;
 }
+
+export type ScaffoldSessionFabricCapabilityInput =
+  | {
+      readonly role: "viewer";
+    }
+  | {
+      readonly role: "controller";
+      readonly fabricSessionId: SessionFabricSessionId;
+      readonly scaffoldSessionId: string;
+      readonly scaffoldLifecycleEpoch: number;
+    };
+
+export interface ScaffoldRunnerCapabilityInput {
+  readonly baseUrl: string;
+  readonly runtimeApiToken: string;
+  readonly scaffoldSessionId: string;
+  readonly lifecycleEpoch: number;
+  readonly fetch?: ScaffoldFetch;
+  readonly now?: () => number;
+  readonly timeoutMs?: number;
+}
+
+const decodeSessionFabricCapabilityGrant = Schema.decodeUnknownSync(SessionFabricCapabilityGrant);
+const JWT_COMPACT_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -100,6 +127,133 @@ function retryAfterMs(response: Response): number | undefined {
   if (!raw) return undefined;
   const seconds = Number(raw);
   return Number.isFinite(seconds) && seconds >= 0 ? Math.floor(seconds * 1_000) : undefined;
+}
+
+function invalidCapability(): ScaffoldLifecycleError {
+  return new ScaffoldLifecycleError({
+    reason: "invalid_response",
+    message: "Scaffold returned an invalid session fabric capability.",
+    status: 502,
+    code: "scaffold_invalid_session_fabric_capability",
+  });
+}
+
+function hasExactScopes(actual: ReadonlyArray<string>, expected: ReadonlyArray<string>): boolean {
+  return actual.length === expected.length && expected.every((scope) => actual.includes(scope));
+}
+
+function validateCapabilityGrant(
+  value: unknown,
+  input:
+    | ScaffoldSessionFabricCapabilityInput
+    | {
+        readonly role: "runner";
+        readonly scaffoldSessionId: string;
+        readonly lifecycleEpoch: number;
+      },
+  now: number,
+): SessionFabricCapabilityGrant {
+  let grant: SessionFabricCapabilityGrant;
+  try {
+    grant = decodeSessionFabricCapabilityGrant(value);
+  } catch {
+    throw invalidCapability();
+  }
+  const expiresAt = Date.parse(grant.expiresAt);
+  if (
+    grant.role !== input.role ||
+    !JWT_COMPACT_PATTERN.test(grant.capability) ||
+    !Number.isFinite(expiresAt) ||
+    expiresAt <= now
+  ) {
+    throw invalidCapability();
+  }
+  if (input.role === "viewer") {
+    if (
+      !hasExactScopes(grant.scopes, ["directory:read", "session:read"]) ||
+      grant.bindings.fabricSessionId !== undefined ||
+      grant.bindings.scaffoldSessionId !== undefined ||
+      grant.bindings.scaffoldLifecycleEpoch !== undefined
+    ) {
+      throw invalidCapability();
+    }
+    return grant;
+  }
+  if (input.role === "controller") {
+    if (
+      !hasExactScopes(grant.scopes, ["session:read", "session:command"]) ||
+      grant.bindings.fabricSessionId !== input.fabricSessionId ||
+      grant.bindings.scaffoldSessionId !== input.scaffoldSessionId ||
+      grant.bindings.scaffoldLifecycleEpoch !== input.scaffoldLifecycleEpoch
+    ) {
+      throw invalidCapability();
+    }
+    return grant;
+  }
+  if (
+    !hasExactScopes(grant.scopes, ["session:publish", "session:execute"]) ||
+    grant.bindings.fabricSessionId !== undefined ||
+    grant.bindings.scaffoldSessionId !== input.scaffoldSessionId ||
+    grant.bindings.scaffoldLifecycleEpoch !== input.lifecycleEpoch
+  ) {
+    throw invalidCapability();
+  }
+  return grant;
+}
+
+export async function requestScaffoldRunnerCapability(
+  input: ScaffoldRunnerCapabilityInput,
+): Promise<SessionFabricCapabilityGrant> {
+  const fetchImpl = input.fetch ?? globalThis.fetch.bind(globalThis);
+  let response: Response;
+  try {
+    response = await fetchImpl(
+      new URL(
+        `/api/sessions/${encodeURIComponent(input.scaffoldSessionId)}/session-fabric/runner-capability`,
+        input.baseUrl,
+      ),
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "x-scaffold-runtime-api-token": input.runtimeApiToken,
+        },
+        body: JSON.stringify({ lifecycleEpoch: input.lifecycleEpoch }),
+        signal: AbortSignal.timeout(input.timeoutMs ?? 5_000),
+      },
+    );
+  } catch {
+    throw new ScaffoldLifecycleError({
+      reason: "network",
+      message: "Scaffold could not issue a session fabric capability.",
+      status: 0,
+      code: "scaffold_session_fabric_capability_network_error",
+    });
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    body = undefined;
+  }
+  if (!response.ok) {
+    throw new ScaffoldLifecycleError({
+      reason: errorReason(response.status),
+      message: "Scaffold could not issue a session fabric capability.",
+      status: response.status,
+      code: `scaffold_session_fabric_capability_http_${response.status}`,
+    });
+  }
+  return validateCapabilityGrant(
+    body,
+    {
+      role: "runner",
+      scaffoldSessionId: input.scaffoldSessionId,
+      lifecycleEpoch: input.lifecycleEpoch,
+    },
+    (input.now ?? Date.now)(),
+  );
 }
 
 export function makeScaffoldControlPlaneClient(options: {
@@ -215,6 +369,17 @@ export function makeScaffoldControlPlaneClient(options: {
       mutate({ ...input, kind: "resume" }),
     pauseSession: (input: Omit<Parameters<typeof mutate>[0], "kind">) =>
       mutate({ ...input, kind: "pause" }),
+    issueSessionFabricCapability: async (
+      input: ScaffoldSessionFabricCapabilityInput,
+    ): Promise<SessionFabricCapabilityGrant> => {
+      const body = await request("/api/session-fabric/capabilities", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(5_000),
+      });
+      return validateCapabilityGrant(body, input, now());
+    },
     issueT3Transport: async (input: {
       readonly environmentId?: EnvironmentId;
       readonly sessionId: string;

@@ -1,11 +1,13 @@
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle";
+import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as Etag from "effect/unstable/http/Etag";
 import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
@@ -20,6 +22,14 @@ import {
   SessionFabricContextRequest,
   SessionFabricSearchRequest,
 } from "@t3tools/contracts/session-fabric";
+import {
+  authorizeSessionFabricCapability,
+  capabilityCanListDirectory,
+  capabilityCanReadSession,
+  isLoopbackSessionFabricRequestUrl,
+  makeSessionFabricCapabilityVerifierConfig,
+  websocketCapability,
+} from "@t3tools/shared/sessionFabricCapability";
 
 import {
   clientApi,
@@ -83,6 +93,14 @@ const httpPlatformNotSupportedLayer = Layer.succeed(HttpPlatform.HttpPlatform, {
   fileWebResponse: () => Effect.die("Relay API does not serve file responses"),
 });
 
+const decodeSessionPathSegment = (value: string): string | null => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+};
+
 const relayApiLayer = Layer.mergeAll(
   healthApi,
   metadataApi,
@@ -125,6 +143,33 @@ export default class Api extends Cloudflare.Worker<Api>()(
     const observability = yield* RelayObservability;
     const sessionStreams = yield* SessionStreamCoordinator;
     const sessionDirectory = yield* SessionDirectory;
+    const sessionFabricAuthMode = yield* Config.string("SESSION_FABRIC_AUTH_MODE").pipe(
+      Config.option,
+    );
+    const sessionFabricAuthIssuer = yield* Config.string("SESSION_FABRIC_CAPABILITY_ISSUER").pipe(
+      Config.option,
+    );
+    const sessionFabricAuthAudience = yield* Config.string(
+      "SESSION_FABRIC_CAPABILITY_AUDIENCE",
+    ).pipe(Config.option);
+    const sessionFabricAuthPublicKeys = yield* Config.string(
+      "SESSION_FABRIC_CAPABILITY_PUBLIC_KEYS_JSON",
+    ).pipe(Config.option);
+    const sessionFabricAllowedOrigins = new Set(
+      Option.getOrElse(
+        yield* Config.string("SESSION_FABRIC_ALLOWED_ORIGINS").pipe(Config.option),
+        () => "",
+      )
+        .split(",")
+        .map((origin) => origin.trim().replace(/\/+$/gu, ""))
+        .filter((origin) => origin.length > 0),
+    );
+    const sessionFabricVerifierConfig = makeSessionFabricCapabilityVerifierConfig({
+      mode: Option.getOrUndefined(sessionFabricAuthMode),
+      issuer: Option.getOrUndefined(sessionFabricAuthIssuer),
+      audience: Option.getOrUndefined(sessionFabricAuthAudience),
+      publicKeysJson: Option.getOrUndefined(sessionFabricAuthPublicKeys),
+    });
 
     //
     // 2. Create bindings
@@ -231,14 +276,53 @@ export default class Api extends Cloudflare.Worker<Api>()(
       Layer.provide(runtimeLayer),
     );
 
-    // Session IDs are opaque and sessions are public in the initial fabric
-    // rollout. Authentication can be added at this Worker boundary without
-    // changing the per-session Durable Object protocol.
+    const authorizeSessionFabricRequest = Effect.fn("relay.session_fabric.authorize")(function* (
+      request: HttpServerRequest.HttpServerRequest,
+    ) {
+      const websocketToken =
+        request.headers.upgrade?.toLowerCase() === "websocket"
+          ? websocketCapability(request.headers["sec-websocket-protocol"])
+          : null;
+      return yield* authorizeSessionFabricCapability({
+        config: sessionFabricVerifierConfig,
+        authorization:
+          websocketToken === null ? request.headers.authorization : `Bearer ${websocketToken}`,
+        requestUrl: request.url,
+        nowEpochSeconds: Math.floor((yield* Clock.currentTimeMillis) / 1_000),
+      });
+    });
+
+    const sessionFabricAuthorizationFailure = (reason: string) =>
+      HttpServerResponse.text("Session fabric authorization required", {
+        status: reason === "unavailable" ? 503 : 401,
+      });
+
+    const sessionFabricCorsOrigin = (
+      request: HttpServerRequest.HttpServerRequest,
+    ): string | null => {
+      const origin = request.headers.origin?.replace(/\/+$/gu, "");
+      if (origin === undefined) return null;
+      if (sessionFabricVerifierConfig?.mode === "disabled") {
+        if (!isLoopbackSessionFabricRequestUrl(request.url)) return null;
+        try {
+          const url = new URL(origin);
+          return url.hostname === "localhost" || url.hostname === "127.0.0.1" ? origin : null;
+        } catch {
+          return null;
+        }
+      }
+      return sessionFabricAllowedOrigins.has(origin) ? origin : null;
+    };
+
     const sessionFabricRoute = HttpRouter.add(
       "GET",
       "/v1/session-fabric/sessions/*",
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
+        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        if (authorized._tag === "Failure") {
+          return sessionFabricAuthorizationFailure(authorized.failure.reason);
+        }
         const url = new URL(request.url);
         const match = url.pathname.match(
           /^\/v1\/session-fabric\/sessions\/([^/]+)\/(?:connect|snapshot|events|context)$/,
@@ -247,13 +331,11 @@ export default class Api extends Cloudflare.Worker<Api>()(
         if (encodedSessionId === undefined) {
           return HttpServerResponse.empty({ status: 404 });
         }
-        let sessionId: string;
-        try {
-          sessionId = decodeURIComponent(encodedSessionId);
-        } catch {
+        const decodedSessionId = decodeSessionPathSegment(encodedSessionId);
+        if (decodedSessionId === null) {
           return HttpServerResponse.text("Invalid session id", { status: 400 });
         }
-        return yield* sessionStreams.getByName(sessionId).fetch(request);
+        return yield* sessionStreams.getByName(decodedSessionId).fetch(request);
       }),
     );
 
@@ -261,6 +343,17 @@ export default class Api extends Cloudflare.Worker<Api>()(
       "GET",
       "/v1/session-fabric/sessions",
       Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        if (authorized._tag === "Failure") {
+          return sessionFabricAuthorizationFailure(authorized.failure.reason);
+        }
+        if (
+          sessionFabricVerifierConfig?.mode !== "disabled" &&
+          (authorized.success === null || !capabilityCanListDirectory(authorized.success))
+        ) {
+          return HttpServerResponse.empty({ status: 403 });
+        }
         const sessions = yield* sessionDirectory.getByName("public-session-directory").list();
         return HttpServerResponse.jsonUnsafe(
           { sessions },
@@ -273,6 +366,17 @@ export default class Api extends Cloudflare.Worker<Api>()(
       "POST",
       "/v1/session-fabric/search",
       Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        if (authorized._tag === "Failure") {
+          return sessionFabricAuthorizationFailure(authorized.failure.reason);
+        }
+        if (
+          sessionFabricVerifierConfig?.mode !== "disabled" &&
+          (authorized.success === null || !capabilityCanListDirectory(authorized.success))
+        ) {
+          return HttpServerResponse.empty({ status: 403 });
+        }
         const decoded = yield* Effect.result(
           HttpServerRequest.schemaBodyJson(SessionFabricSearchRequest),
         );
@@ -292,6 +396,11 @@ export default class Api extends Cloudflare.Worker<Api>()(
       "POST",
       "/v1/session-fabric/context",
       Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        if (authorized._tag === "Failure") {
+          return sessionFabricAuthorizationFailure(authorized.failure.reason);
+        }
         const decoded = yield* Effect.result(
           HttpServerRequest.schemaBodyJson(SessionFabricContextRequest),
         );
@@ -299,18 +408,22 @@ export default class Api extends Cloudflare.Worker<Api>()(
           return HttpServerResponse.text("Invalid session context request", { status: 400 });
         }
         const input = decoded.success;
-        return yield* sessionStreams
+        const context = yield* sessionStreams
           .getByName(input.sessionId)
-          .getContext(input.includeCodeDiff, input.includeContinuation)
-          .pipe(
-            Effect.map((context) =>
-              context === null
-                ? HttpServerResponse.empty({ status: 404 })
-                : HttpServerResponse.jsonUnsafe(context, {
-                    headers: { "cache-control": "no-store" },
-                  }),
-            ),
-          );
+          .getContext(input.includeCodeDiff, input.includeContinuation);
+        if (
+          context !== null &&
+          sessionFabricVerifierConfig?.mode !== "disabled" &&
+          (authorized.success === null ||
+            !capabilityCanReadSession(authorized.success, context.snapshot))
+        ) {
+          return HttpServerResponse.empty({ status: 404 });
+        }
+        return context === null
+          ? HttpServerResponse.empty({ status: 404 })
+          : HttpServerResponse.jsonUnsafe(context, {
+              headers: { "cache-control": "no-store" },
+            });
       }),
     );
 
@@ -369,7 +482,28 @@ export default class Api extends Cloudflare.Worker<Api>()(
     ).pipe(
       HttpRouter.toHttpEffect,
       withoutCapturedParentSpan,
-      Effect.flatMap((httpEffect) => traceRelayHttpRequestWith(httpEffect, relayTraceLayer)),
+      Effect.flatMap((httpEffect) =>
+        traceRelayHttpRequestWith(
+          Effect.gen(function* () {
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            const response = yield* httpEffect;
+            const url = new URL(request.url);
+            if (!url.pathname.startsWith("/v1/session-fabric/")) return response;
+            const requestedOrigin = request.headers.origin;
+            if (requestedOrigin === undefined) return response;
+            const origin = sessionFabricCorsOrigin(request);
+            if (origin === null) return HttpServerResponse.empty({ status: 403 });
+            return HttpServerResponse.setHeaders(response, {
+              "access-control-allow-origin": origin,
+              "access-control-allow-methods": "GET,POST,OPTIONS",
+              "access-control-allow-headers": "authorization,content-type",
+              "access-control-expose-headers": "content-type",
+              vary: "origin",
+            });
+          }),
+          relayTraceLayer,
+        ),
+      ),
     );
 
     return { fetch };

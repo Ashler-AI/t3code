@@ -3,6 +3,7 @@ import { makeLocalFileTracer, makeTraceSink } from "@t3tools/shared/observabilit
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as References from "effect/References";
+import * as Redacted from "effect/Redacted";
 import * as Tracer from "effect/Tracer";
 import * as OtlpMetrics from "effect/unstable/observability/OtlpMetrics";
 import * as OtlpSerialization from "effect/unstable/observability/OtlpSerialization";
@@ -13,6 +14,11 @@ import { ServerLoggerLive } from "../../serverLogger.ts";
 import * as BrowserTraceCollector from "../BrowserTraceCollector.ts";
 
 const otlpSerializationLayer = OtlpSerialization.layerJson;
+
+export const otlpExportHeaders = (
+  authorization: Redacted.Redacted<string> | undefined,
+): Readonly<Record<string, string>> | undefined =>
+  authorization === undefined ? undefined : { authorization: Redacted.value(authorization) };
 
 export const ObservabilityLive = Layer.unwrap(
   Effect.gen(function* () {
@@ -37,6 +43,7 @@ export const ObservabilityLive = Layer.unwrap(
             ? undefined
             : yield* OtlpTracer.make({
                 url: config.otlpTracesUrl,
+                headers: otlpExportHeaders(config.otlpAuthorization),
                 exportInterval: `${config.otlpExportIntervalMs} millis`,
                 resource: {
                   serviceName: config.otlpServiceName,
@@ -68,6 +75,7 @@ export const ObservabilityLive = Layer.unwrap(
         ? Layer.empty
         : OtlpMetrics.layer({
             url: config.otlpMetricsUrl,
+            headers: otlpExportHeaders(config.otlpAuthorization),
             exportInterval: `${config.otlpExportIntervalMs} millis`,
             resource: {
               serviceName: config.otlpServiceName,

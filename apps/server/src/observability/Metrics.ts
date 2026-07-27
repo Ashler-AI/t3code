@@ -58,6 +58,48 @@ export const providerRuntimeEventsTotal = Metric.counter("t3_provider_runtime_ev
   description: "Total canonical provider runtime events processed.",
 });
 
+export const ompFirstOutputLatency = Metric.timer("t3_omp_first_output_latency", {
+  description: "Time from an OMP turn starting to its first reasoning or assistant text delta.",
+});
+
+export const ompReplayEventsTotal = Metric.counter("t3_omp_replay_events_total", {
+  description: "Total OMP replay notifications classified by replay disposition.",
+});
+
+export const ompToolUpdatesTotal = Metric.counter("t3_omp_tool_updates_total", {
+  description: "Total OMP tool lifecycle updates.",
+});
+
+export const ompSubagentEventsTotal = Metric.counter("t3_omp_subagent_events_total", {
+  description: "Total OMP subagent lifecycle events.",
+});
+
+export const ompInterruptsTotal = Metric.counter("t3_omp_interrupts_total", {
+  description: "Total OMP interrupt requests by disposition.",
+});
+
+export const sessionFabricRunnerStateTransitionsTotal = Metric.counter(
+  "t3_session_fabric_runner_state_transitions_total",
+  {
+    description: "Total session-fabric runner state transitions.",
+  },
+);
+
+export type SessionFabricRunnerMetricState =
+  | "disabled"
+  | "connecting"
+  | "connected"
+  | "connection_failed"
+  | "reconnect_wait";
+
+export const recordSessionFabricRunnerState = (
+  state: SessionFabricRunnerMetricState,
+  attributes: {
+    readonly authMode: "required" | "disabled";
+    readonly environmentKind: "local" | "scaffold";
+  },
+) => increment(sessionFabricRunnerStateTransitionsTotal, { state, ...attributes });
+
 export const gitCommandsTotal = Metric.counter("t3_git_commands_total", {
   description: "Total git commands executed by the server runtime.",
 });

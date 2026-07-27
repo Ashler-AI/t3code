@@ -41,11 +41,14 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import { ProviderSessionDirectoryLive } from "../../provider/Layers/ProviderSessionDirectory.ts";
 import {
   ProviderService,
   type ProviderRuntimeEventDelivery,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
@@ -101,7 +104,10 @@ function isLegacyTurnCompletedEvent(
   );
 }
 
-function createProviderServiceHarness(options?: { canonicalDeliveries?: boolean }) {
+function createProviderServiceHarness(options?: {
+  canonicalDeliveries?: boolean;
+  canonicalEvents?: boolean;
+}) {
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const canonicalRuntimeEventPubSub = Effect.runSync(
     PubSub.unbounded<ProviderRuntimeEventEnvelope>(),
@@ -139,9 +145,13 @@ function createProviderServiceHarness(options?: { canonicalDeliveries?: boolean 
     get streamEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
     },
-    get streamCanonicalEvents() {
-      return Stream.fromPubSub(canonicalRuntimeEventPubSub);
-    },
+    ...(options?.canonicalEvents === false
+      ? {}
+      : {
+          get streamCanonicalEvents() {
+            return Stream.fromPubSub(canonicalRuntimeEventPubSub);
+          },
+        }),
     ...(options?.canonicalDeliveries
       ? {
           get streamCanonicalDeliveries() {
@@ -197,6 +207,10 @@ function createProviderServiceHarness(options?: { canonicalDeliveries?: boolean 
     Effect.runSync(PubSub.publish(canonicalRuntimeEventPubSub, envelope));
   };
 
+  const emitLegacy = (event: ProviderRuntimeEvent): void => {
+    Effect.runSync(PubSub.publish(runtimeEventPubSub, event));
+  };
+
   const emitDelivery = (delivery: ProviderRuntimeEventDelivery): void => {
     Effect.runSync(PubSub.publish(canonicalRuntimeDeliveryPubSub, delivery));
   };
@@ -206,6 +220,7 @@ function createProviderServiceHarness(options?: { canonicalDeliveries?: boolean 
     emit,
     emitDelivery,
     emitEnvelope,
+    emitLegacy,
     setSession,
   };
 }
@@ -243,6 +258,7 @@ describe("ProviderRuntimeIngestion", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
     | OrchestrationCommandReceiptRepository
     | OrchestrationEngineService
+    | ProviderSessionDirectory
     | ProviderRuntimeIngestionService
     | ProjectionSnapshotQuery,
     unknown
@@ -273,16 +289,26 @@ describe("ProviderRuntimeIngestion", () => {
   async function createHarness(options?: {
     serverSettings?: Partial<ServerSettings>;
     canonicalDeliveries?: boolean;
+    canonicalEvents?: boolean;
   }) {
     const workspaceRoot = makeTempDir("t3-provider-project-");
     NodeFS.mkdirSync(NodePath.join(workspaceRoot, ".git"));
-    const provider = createProviderServiceHarness(
-      options?.canonicalDeliveries === undefined
-        ? undefined
-        : { canonicalDeliveries: options.canonicalDeliveries },
-    );
+    const provider = createProviderServiceHarness({
+      ...(options?.canonicalDeliveries === undefined
+        ? {}
+        : { canonicalDeliveries: options.canonicalDeliveries }),
+      ...(options?.canonicalEvents === undefined
+        ? {}
+        : { canonicalEvents: options.canonicalEvents }),
+    });
     const commandReceiptLayer = OrchestrationCommandReceiptRepositoryLive.pipe(
       Layer.provide(SqlitePersistenceMemory),
+    );
+    const providerRuntimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+      Layer.provide(SqlitePersistenceMemory),
+    );
+    const providerSessionDirectoryLayer = ProviderSessionDirectoryLive.pipe(
+      Layer.provide(providerRuntimeRepositoryLayer),
     );
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
@@ -301,6 +327,7 @@ describe("ProviderRuntimeIngestion", () => {
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(commandReceiptLayer),
+      Layer.provideMerge(providerSessionDirectoryLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, provider.service)),
       Layer.provideMerge(makeTestServerSettingsLayer(options?.serverSettings)),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
@@ -310,6 +337,9 @@ describe("ProviderRuntimeIngestion", () => {
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const ingestion = await runtime.runPromise(Effect.service(ProviderRuntimeIngestionService));
+    const providerSessionDirectory = await runtime.runPromise(
+      Effect.service(ProviderSessionDirectory),
+    );
     const ingestCanonical = ingestion.ingestCanonical as
       | ((envelope: ProviderRuntimeEventEnvelope) => Effect.Effect<void, Error>)
       | undefined;
@@ -389,11 +419,60 @@ describe("ProviderRuntimeIngestion", () => {
       emit: provider.emit,
       emitDelivery: provider.emitDelivery,
       emitEnvelope: provider.emitEnvelope,
+      emitLegacy: provider.emitLegacy,
       ingestEnvelope: (envelope: ProviderRuntimeEventEnvelope) =>
         runtime!.runPromise(ingestCanonical!(envelope)),
       setProviderSession: provider.setSession,
       readReceipt: (commandId: CommandId) =>
         runtime!.runPromise(commandReceipts.getByCommandId({ commandId })),
+      bindCanonicalRuntimeSession: (input: {
+        threadId: ThreadId;
+        runtimeSessionId: RuntimeSessionId;
+      }) =>
+        runtime!.runPromise(
+          providerSessionDirectory.upsert({
+            threadId: input.threadId,
+            provider: ProviderDriverKind.make("omp"),
+            providerInstanceId: ProviderInstanceId.make("omp"),
+            resumeCursor: {
+              schemaVersion: 3,
+              sessionId: input.runtimeSessionId,
+              eventSequence: 0,
+              acpSequence: 0,
+            },
+          }),
+        ),
+      checkpointCanonicalCursor: (input: {
+        environmentId: EnvironmentId;
+        threadId: ThreadId;
+        runtimeSessionId: RuntimeSessionId;
+        sourceSequence: number;
+        eventId: EventId;
+      }) =>
+        runtime!.runPromise(
+          Effect.gen(function* () {
+            for (
+              let sourceSequence = 1;
+              sourceSequence <= input.sourceSequence;
+              sourceSequence += 1
+            ) {
+              yield* providerSessionDirectory.upsert({
+                threadId: input.threadId,
+                provider: ProviderDriverKind.make("omp"),
+                providerInstanceId: ProviderInstanceId.make("omp"),
+                canonicalSourceCursor: {
+                  ...input,
+                  providerInstanceId: ProviderInstanceId.make("omp"),
+                  sourceSequence,
+                  eventId:
+                    sourceSequence === input.sourceSequence
+                      ? input.eventId
+                      : EventId.make(`checkpoint:${input.runtimeSessionId}:${sourceSequence}`),
+                },
+              });
+            }
+          }),
+        ),
       drain,
     };
   }
@@ -445,8 +524,30 @@ describe("ProviderRuntimeIngestion", () => {
     const threadId = asThreadId("thread-1");
     const turnId = asTurnId("turn-omp-selection");
     const providerInstanceId = ProviderInstanceId.make("omp");
+    const runtimeSessionId = RuntimeSessionId.make("session-omp-selection");
+    let sourceSequence = 0;
+    const ingestOmp = (event: ProviderRuntimeEvent) => {
+      sourceSequence += 1;
+      return harness.ingestEnvelope({
+        protocolVersion: 1,
+        eventId: event.eventId,
+        environmentId: EnvironmentId.make("environment-omp-selection"),
+        threadId,
+        sourceSequence,
+        resumeCursor: {
+          kind: "omp",
+          schemaVersion: 3,
+          sessionId: runtimeSessionId,
+          eventSequence: sourceSequence,
+          acpSequence: sourceSequence,
+        },
+        providerInstanceId,
+        runtimeSessionId,
+        event,
+      });
+    };
 
-    harness.emit({
+    await ingestOmp({
       type: "turn.started",
       eventId: asEventId("evt-omp-selection-started"),
       provider: ProviderDriverKind.make("omp"),
@@ -475,7 +576,7 @@ describe("ProviderRuntimeIngestion", () => {
       options: [{ id: "reasoningEffort", value: "low" }],
     });
 
-    harness.emit({
+    await ingestOmp({
       type: "model.rerouted",
       eventId: asEventId("evt-omp-selection-rerouted"),
       provider: ProviderDriverKind.make("omp"),
@@ -1257,22 +1358,22 @@ describe("ProviderRuntimeIngestion", () => {
 
   it("acknowledges a canonical delivery after its event, projection, and receipt are committed", async () => {
     const harness = await createHarness({ canonicalDeliveries: true });
-    const eventId = asEventId("omp:session-delivery-commit:7");
+    const eventId = asEventId("omp:session-delivery-commit:1");
     const commandId = CommandId.make(
-      "provider:environment-delivery-commit:thread-1:omp%3Asession-delivery-commit%3A7:thread-activity-append:0",
+      "provider:environment-delivery-commit:thread-1:omp%3Asession-delivery-commit%3A1:thread-activity-append:0",
     );
     const envelope: ProviderRuntimeEventEnvelope = {
       protocolVersion: 1,
       eventId,
       environmentId: EnvironmentId.make("environment-delivery-commit"),
       threadId: asThreadId("thread-1"),
-      sourceSequence: 7,
+      sourceSequence: 1,
       resumeCursor: {
         kind: "omp",
         schemaVersion: 3,
         sessionId: RuntimeSessionId.make("session-delivery-commit"),
-        eventSequence: 7,
-        acpSequence: 5,
+        eventSequence: 1,
+        acpSequence: 1,
       },
       providerInstanceId: ProviderInstanceId.make("omp"),
       runtimeSessionId: RuntimeSessionId.make("session-delivery-commit"),
@@ -1324,6 +1425,7 @@ describe("ProviderRuntimeIngestion", () => {
         resolveAcknowledgment();
       }),
       retry: () => Effect.die(new Error("successful delivery must not retry")),
+      reject: () => Effect.die(new Error("successful delivery must not be rejected")),
     });
 
     await acknowledgment;
@@ -1335,7 +1437,374 @@ describe("ProviderRuntimeIngestion", () => {
     );
   });
 
-  it("retries a failed canonical delivery without acknowledging or accepting side effects", async () => {
+  it("retries only acknowledgment after projection committed for the same envelope", async () => {
+    const harness = await createHarness({ canonicalDeliveries: true });
+    const environmentId = EnvironmentId.make("environment-ack-redelivery");
+    const threadId = asThreadId("thread-1");
+    const runtimeSessionId = RuntimeSessionId.make("session-ack-redelivery");
+    const providerInstanceId = ProviderInstanceId.make("omp");
+    const deltaEventId = asEventId("omp:session-ack-redelivery:1");
+    const deltaEnvelope: ProviderRuntimeEventEnvelope = {
+      protocolVersion: 1,
+      eventId: deltaEventId,
+      environmentId,
+      threadId,
+      sourceSequence: 1,
+      resumeCursor: {
+        kind: "omp",
+        schemaVersion: 3,
+        sessionId: runtimeSessionId,
+        eventSequence: 1,
+        acpSequence: 1,
+      },
+      providerInstanceId,
+      runtimeSessionId,
+      event: {
+        type: "turn.proposed.delta",
+        eventId: deltaEventId,
+        provider: ProviderDriverKind.make("omp"),
+        providerInstanceId,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-ack-redelivery"),
+        payload: { delta: "# One step" },
+      },
+    };
+
+    let retryCount = 0;
+    harness.emitDelivery({
+      envelope: deltaEnvelope,
+      acknowledge: Effect.die(new Error("cursor checkpoint temporarily unavailable")),
+      retry: () =>
+        Effect.sync(() => {
+          retryCount += 1;
+        }),
+      reject: () => Effect.die(new Error("transient checkpoint failure must not reject")),
+    });
+    await harness.drain();
+    expect(retryCount).toBe(1);
+
+    let acknowledgeCount = 0;
+    harness.emitDelivery({
+      envelope: deltaEnvelope,
+      acknowledge: Effect.sync(() => {
+        acknowledgeCount += 1;
+      }),
+      retry: () => Effect.die(new Error("redelivered committed envelope must not retry")),
+      reject: () => Effect.die(new Error("redelivered committed envelope must not reject")),
+    });
+    await harness.drain();
+    expect(acknowledgeCount).toBe(1);
+
+    const completedEventId = asEventId("omp:session-ack-redelivery:2");
+    await harness.ingestEnvelope({
+      protocolVersion: 1,
+      eventId: completedEventId,
+      environmentId,
+      threadId,
+      sourceSequence: 2,
+      resumeCursor: {
+        kind: "omp",
+        schemaVersion: 3,
+        sessionId: runtimeSessionId,
+        eventSequence: 2,
+        acpSequence: 2,
+      },
+      providerInstanceId,
+      runtimeSessionId,
+      event: {
+        type: "turn.proposed.completed",
+        eventId: completedEventId,
+        provider: ProviderDriverKind.make("omp"),
+        providerInstanceId,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        turnId: asTurnId("turn-ack-redelivery"),
+        payload: { planMarkdown: "# One step" },
+      },
+    });
+
+    const snapshot = await harness.readModel();
+    const proposedPlan = snapshot.threads
+      .find((thread) => thread.id === threadId)
+      ?.proposedPlans.find((plan) => plan.id === "plan:thread-1:turn:turn-ack-redelivery");
+    expect(proposedPlan?.planMarkdown).toBe("# One step");
+  });
+
+  it("permanently rejects a fresh OMP delivery that does not start at sequence one", async () => {
+    const harness = await createHarness({ canonicalDeliveries: true });
+    const eventId = asEventId("omp:fresh-session:2");
+    let rejectCount = 0;
+    let retryCount = 0;
+    harness.emitDelivery({
+      envelope: {
+        protocolVersion: 1,
+        eventId,
+        environmentId: EnvironmentId.make("environment-fresh-sequence"),
+        threadId: asThreadId("thread-1"),
+        sourceSequence: 2,
+        resumeCursor: {
+          kind: "omp",
+          schemaVersion: 3,
+          sessionId: RuntimeSessionId.make("fresh-session"),
+          eventSequence: 2,
+          acpSequence: 2,
+        },
+        providerInstanceId: ProviderInstanceId.make("omp"),
+        runtimeSessionId: RuntimeSessionId.make("fresh-session"),
+        event: {
+          type: "content.delta",
+          eventId,
+          provider: ProviderDriverKind.make("omp"),
+          providerInstanceId: ProviderInstanceId.make("omp"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId: asThreadId("thread-1"),
+          turnId: asTurnId("turn-fresh-sequence"),
+          itemId: asRuntimeItemId("reasoning-fresh-sequence"),
+          payload: { streamKind: "reasoning_text", delta: "must be rejected" },
+        },
+      },
+      acknowledge: Effect.die(new Error("invalid fresh sequence must not acknowledge")),
+      retry: () =>
+        Effect.sync(() => {
+          retryCount += 1;
+        }),
+      reject: () =>
+        Effect.sync(() => {
+          rejectCount += 1;
+        }),
+    });
+    await harness.drain();
+    expect(retryCount).toBe(0);
+    expect(rejectCount).toBe(1);
+  });
+
+  it("fails closed instead of ingesting OMP events from the non-durable canonical fallback", async () => {
+    const harness = await createHarness({ canonicalDeliveries: false });
+    const eventId = asEventId("omp:non-durable-session:1");
+    harness.emitEnvelope({
+      protocolVersion: 1,
+      eventId,
+      environmentId: EnvironmentId.make("environment-non-durable-omp"),
+      threadId: asThreadId("thread-1"),
+      sourceSequence: 1,
+      resumeCursor: {
+        kind: "omp",
+        schemaVersion: 3,
+        sessionId: RuntimeSessionId.make("non-durable-session"),
+        eventSequence: 1,
+        acpSequence: 1,
+      },
+      providerInstanceId: ProviderInstanceId.make("omp"),
+      runtimeSessionId: RuntimeSessionId.make("non-durable-session"),
+      event: {
+        type: "content.delta",
+        eventId,
+        provider: ProviderDriverKind.make("omp"),
+        providerInstanceId: ProviderInstanceId.make("omp"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("turn-non-durable-omp"),
+        itemId: asRuntimeItemId("reasoning-non-durable-omp"),
+        payload: { streamKind: "reasoning_text", delta: "must not project" },
+      },
+    });
+    await harness.drain();
+
+    const snapshot = await harness.readModel();
+    expect(
+      snapshot.threads
+        .find((thread) => thread.id === "thread-1")
+        ?.activities.some((activity) => activity.id === eventId),
+    ).toBe(false);
+  });
+
+  it("fails closed for OMP on the legacy fallback while continuing non-OMP ingestion", async () => {
+    const harness = await createHarness({ canonicalDeliveries: false, canonicalEvents: false });
+    const ompEventId = asEventId("omp:legacy-fallback:1");
+    harness.emitLegacy({
+      type: "runtime.warning",
+      eventId: ompEventId,
+      provider: ProviderDriverKind.make("omp"),
+      providerInstanceId: ProviderInstanceId.make("omp"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: asThreadId("thread-1"),
+      payload: { message: "must not project" },
+    });
+    const codexEventId = asEventId("codex:legacy-fallback:1");
+    harness.emitLegacy({
+      type: "runtime.warning",
+      eventId: codexEventId,
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId: asThreadId("thread-1"),
+      payload: { message: "continues normally" },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some((activity) => activity.id === codexEventId),
+    );
+    expect(thread.activities.some((activity) => activity.id === ompEventId)).toBe(false);
+  });
+
+  it("enforces the persisted OMP cursor for duplicates, collisions, gaps, and lower sequences", async () => {
+    const harness = await createHarness({ canonicalDeliveries: true });
+    const environmentId = EnvironmentId.make("environment-strict-cursor");
+    const threadId = asThreadId("thread-1");
+    const runtimeSessionId = RuntimeSessionId.make("session-strict-cursor");
+    const acknowledgedEventId = asEventId("omp:session-strict-cursor:7");
+    await harness.checkpointCanonicalCursor({
+      environmentId,
+      threadId,
+      runtimeSessionId,
+      sourceSequence: 7,
+      eventId: acknowledgedEventId,
+    });
+
+    const makeEnvelope = (
+      sourceSequence: number,
+      eventId: EventId,
+    ): ProviderRuntimeEventEnvelope => ({
+      protocolVersion: 1,
+      eventId,
+      environmentId,
+      threadId,
+      sourceSequence,
+      resumeCursor: {
+        kind: "omp",
+        schemaVersion: 3,
+        sessionId: runtimeSessionId,
+        eventSequence: sourceSequence,
+        acpSequence: sourceSequence,
+      },
+      providerInstanceId: ProviderInstanceId.make("omp"),
+      runtimeSessionId,
+      event: {
+        type: "content.delta",
+        eventId,
+        provider: ProviderDriverKind.make("omp"),
+        providerInstanceId: ProviderInstanceId.make("omp"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        threadId,
+        turnId: asTurnId("turn-strict-cursor"),
+        itemId: asRuntimeItemId(`reasoning-${sourceSequence}`),
+        payload: { streamKind: "reasoning_text", delta: `sequence ${sourceSequence}` },
+      },
+    });
+
+    let duplicateAcknowledgeCount = 0;
+    harness.emitDelivery({
+      envelope: makeEnvelope(7, acknowledgedEventId),
+      acknowledge: Effect.sync(() => {
+        duplicateAcknowledgeCount += 1;
+      }),
+      retry: () => Effect.die(new Error("an idempotent duplicate must not retry")),
+      reject: () => Effect.die(new Error("an idempotent duplicate must not be rejected")),
+    });
+    await harness.drain();
+    expect(duplicateAcknowledgeCount).toBe(1);
+
+    for (const [sourceSequence, eventId] of [
+      [7, asEventId("omp:session-strict-cursor:collision")],
+      [9, asEventId("omp:session-strict-cursor:9")],
+      [6, asEventId("omp:session-strict-cursor:6")],
+    ] as const) {
+      let acknowledgeCount = 0;
+      let retryCount = 0;
+      let rejectCount = 0;
+      harness.emitDelivery({
+        envelope: makeEnvelope(sourceSequence, eventId),
+        acknowledge: Effect.sync(() => {
+          acknowledgeCount += 1;
+        }),
+        retry: () =>
+          Effect.sync(() => {
+            retryCount += 1;
+          }),
+        reject: () =>
+          Effect.sync(() => {
+            rejectCount += 1;
+          }),
+      });
+      await harness.drain();
+      expect(acknowledgeCount).toBe(0);
+      expect(retryCount).toBe(0);
+      expect(rejectCount).toBe(1);
+    }
+
+    const resetSessionId = RuntimeSessionId.make("session-strict-cursor-reset");
+    const resetEventId = asEventId("omp:session-strict-cursor-reset:1");
+    const resetEnvelope: ProviderRuntimeEventEnvelope = {
+      ...makeEnvelope(1, resetEventId),
+      runtimeSessionId: resetSessionId,
+      resumeCursor: {
+        kind: "omp",
+        schemaVersion: 3,
+        sessionId: resetSessionId,
+        eventSequence: 1,
+        acpSequence: 1,
+      },
+    };
+    let unboundResetRejectCount = 0;
+    harness.emitDelivery({
+      envelope: resetEnvelope,
+      acknowledge: Effect.die(new Error("unbound session reset must not acknowledge")),
+      retry: () => Effect.die(new Error("unbound session reset must not retry")),
+      reject: () =>
+        Effect.sync(() => {
+          unboundResetRejectCount += 1;
+        }),
+    });
+    await harness.drain();
+    expect(unboundResetRejectCount).toBe(1);
+
+    await harness.bindCanonicalRuntimeSession({ threadId, runtimeSessionId: resetSessionId });
+    let resetAcknowledgeCount = 0;
+    harness.emitDelivery({
+      envelope: resetEnvelope,
+      acknowledge: Effect.sync(() => {
+        resetAcknowledgeCount += 1;
+      }),
+      retry: () => Effect.die(new Error("authorized session reset must not retry")),
+      reject: () => Effect.die(new Error("authorized session reset must not reject")),
+    });
+    await harness.drain();
+    expect(resetAcknowledgeCount).toBe(1);
+
+    const fencedInstanceId = ProviderInstanceId.make("omp-secondary");
+    let fencedResetRejectCount = 0;
+    harness.emitDelivery({
+      envelope: {
+        ...resetEnvelope,
+        providerInstanceId: fencedInstanceId,
+        event: { ...resetEnvelope.event, providerInstanceId: fencedInstanceId },
+      },
+      acknowledge: Effect.die(new Error("provider-instance reset must not acknowledge")),
+      retry: () => Effect.die(new Error("provider-instance reset must not retry")),
+      reject: () =>
+        Effect.sync(() => {
+          fencedResetRejectCount += 1;
+        }),
+    });
+    await harness.drain();
+    expect(fencedResetRejectCount).toBe(1);
+
+    const snapshot = await harness.readModel();
+    const activities = snapshot.threads.find((thread) => thread.id === threadId)?.activities ?? [];
+    expect(activities.some((activity) => activity.id === acknowledgedEventId)).toBe(false);
+    expect(
+      activities.some((activity) => activity.id === "omp:session-strict-cursor:collision"),
+    ).toBe(false);
+    expect(activities.some((activity) => activity.id === "omp:session-strict-cursor:9")).toBe(
+      false,
+    );
+    expect(activities.some((activity) => activity.id === "omp:session-strict-cursor:6")).toBe(
+      false,
+    );
+  });
+
+  it("permanently rejects an invalid canonical delivery without side effects or retry", async () => {
     const harness = await createHarness({ canonicalDeliveries: true });
     const envelopeEventId = asEventId("omp:session-delivery-failure:2");
     const innerEventId = asEventId("omp:session-delivery-failure:1");
@@ -1344,9 +1813,10 @@ describe("ProviderRuntimeIngestion", () => {
     );
     let acknowledgeCount = 0;
     let retryCount = 0;
-    let resolveRetry!: () => void;
-    const retried = new Promise<void>((resolve) => {
-      resolveRetry = resolve;
+    let rejectCount = 0;
+    let resolveRejection!: () => void;
+    const rejected = new Promise<void>((resolve) => {
+      resolveRejection = resolve;
     });
 
     harness.emitDelivery({
@@ -1386,13 +1856,18 @@ describe("ProviderRuntimeIngestion", () => {
       retry: () =>
         Effect.sync(() => {
           retryCount += 1;
-          resolveRetry();
+        }),
+      reject: () =>
+        Effect.sync(() => {
+          rejectCount += 1;
+          resolveRejection();
         }),
     });
 
-    await retried;
+    await rejected;
     expect(acknowledgeCount).toBe(0);
-    expect(retryCount).toBe(1);
+    expect(retryCount).toBe(0);
+    expect(rejectCount).toBe(1);
 
     const snapshot = await harness.readModel();
     expect(
@@ -1447,7 +1922,7 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   it("does not repeat buffered assistant cache mutations when a canonical envelope is replayed", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({ canonicalDeliveries: true });
     const now = "2026-01-01T00:00:00.000Z";
     const environmentId = EnvironmentId.make("environment-buffered-replay");
     const threadId = asThreadId("thread-1");
@@ -1483,8 +1958,30 @@ describe("ProviderRuntimeIngestion", () => {
       },
     };
 
-    await harness.ingestEnvelope(deltaEnvelope);
-    await harness.ingestEnvelope(deltaEnvelope);
+    let retryCount = 0;
+    harness.emitDelivery({
+      envelope: deltaEnvelope,
+      acknowledge: Effect.die(new Error("cursor checkpoint temporarily unavailable")),
+      retry: () =>
+        Effect.sync(() => {
+          retryCount += 1;
+        }),
+      reject: () => Effect.die(new Error("transient checkpoint failure must not reject")),
+    });
+    await harness.drain();
+    expect(retryCount).toBe(1);
+
+    let acknowledgeCount = 0;
+    harness.emitDelivery({
+      envelope: deltaEnvelope,
+      acknowledge: Effect.sync(() => {
+        acknowledgeCount += 1;
+      }),
+      retry: () => Effect.die(new Error("committed replay must not retry")),
+      reject: () => Effect.die(new Error("committed replay must not reject")),
+    });
+    await harness.drain();
+    expect(acknowledgeCount).toBe(1);
 
     const completedEventId = asEventId("omp:session-buffered-replay:2");
     await harness.ingestEnvelope({
@@ -3688,6 +4185,8 @@ describe("ProviderRuntimeIngestion", () => {
         taskId: "turn-task-1",
         description: "Comparing the desktop rollout chunks to the app-server stream.",
         summary: "Code reviewer is validating the desktop rollout chunks.",
+        model: "openai-codex/gpt-5.4-mini",
+        effort: "low",
       },
     });
 
@@ -3702,6 +4201,8 @@ describe("ProviderRuntimeIngestion", () => {
         taskId: "turn-task-1",
         status: "completed",
         summary: "<proposed_plan>\n# Plan title\n</proposed_plan>",
+        model: "openai-codex/gpt-5.4-mini",
+        effort: "low",
       },
     });
     harness.emit({
@@ -3754,8 +4255,12 @@ describe("ProviderRuntimeIngestion", () => {
     expect(progressPayload?.summary).toBe(
       "Code reviewer is validating the desktop rollout chunks.",
     );
+    expect(progressPayload?.model).toBe("openai-codex/gpt-5.4-mini");
+    expect(progressPayload?.effort).toBe("low");
     expect(completed?.kind).toBe("task.completed");
     expect(completedPayload?.detail).toBe("<proposed_plan>\n# Plan title\n</proposed_plan>");
+    expect(completedPayload?.model).toBe("openai-codex/gpt-5.4-mini");
+    expect(completedPayload?.effort).toBe("low");
     expect(
       thread.proposedPlans.find(
         (entry: ProviderRuntimeTestProposedPlan) => entry.id === "plan:thread-1:turn:turn-task-1",

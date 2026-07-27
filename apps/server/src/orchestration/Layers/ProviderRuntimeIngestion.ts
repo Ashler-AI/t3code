@@ -22,6 +22,7 @@ import {
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
+import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -33,6 +34,10 @@ import {
   ProviderService,
   type ProviderRuntimeEventDelivery,
 } from "../../provider/Services/ProviderService.ts";
+import {
+  ProviderSessionDirectory,
+  type ProviderCanonicalSourceCursor,
+} from "../../provider/Services/ProviderSessionDirectory.ts";
 import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { isGitRepository } from "../../git/Utils.ts";
@@ -159,6 +164,123 @@ function validateCanonicalEnvelope(envelope: ProviderRuntimeEventEnvelope): void
   ) {
     throw new Error("canonical provider envelope providerInstanceId does not match its event");
   }
+}
+
+type CanonicalCursorDisposition = "next" | "duplicate";
+
+export class OmpCanonicalCursorError extends Error {
+  override readonly name = "OmpCanonicalCursorError";
+}
+
+class CanonicalIngestionAcknowledgmentWindowFullError extends Data.TaggedError(
+  "CanonicalIngestionAcknowledgmentWindowFullError",
+)<{
+  readonly limit: number;
+}> {
+  override get message(): string {
+    return `Canonical ingestion acknowledgment window is full (limit: ${this.limit}).`;
+  }
+}
+
+function sameCanonicalCursorIdentity(
+  cursor: ProviderCanonicalSourceCursor,
+  envelope: ProviderRuntimeEventEnvelope,
+): boolean {
+  return (
+    cursor.environmentId === envelope.environmentId &&
+    cursor.threadId === envelope.threadId &&
+    cursor.providerInstanceId === envelope.providerInstanceId &&
+    cursor.runtimeSessionId === envelope.runtimeSessionId
+  );
+}
+
+function sameCanonicalCursorFence(
+  cursor: ProviderCanonicalSourceCursor,
+  envelope: ProviderRuntimeEventEnvelope,
+): boolean {
+  return (
+    cursor.environmentId === envelope.environmentId &&
+    cursor.threadId === envelope.threadId &&
+    cursor.providerInstanceId === envelope.providerInstanceId
+  );
+}
+
+function classifyOmpCanonicalCursor(
+  envelope: ProviderRuntimeEventEnvelope,
+  cursor: ProviderCanonicalSourceCursor | undefined,
+): CanonicalCursorDisposition {
+  if (envelope.resumeCursor?.kind !== "omp") {
+    throw new OmpCanonicalCursorError("OMP canonical envelope requires an OMP resume cursor.");
+  }
+  if (
+    envelope.runtimeSessionId === undefined ||
+    envelope.runtimeSessionId !== envelope.resumeCursor.sessionId
+  ) {
+    throw new OmpCanonicalCursorError(
+      "OMP canonical envelope runtime session identity does not match its resume cursor.",
+    );
+  }
+  if (envelope.sourceSequence !== envelope.resumeCursor.eventSequence) {
+    throw new OmpCanonicalCursorError(
+      "OMP canonical envelope source sequence does not match its resume cursor.",
+    );
+  }
+  if (cursor === undefined) {
+    if (envelope.sourceSequence !== 1) {
+      throw new OmpCanonicalCursorError(
+        `Fresh OMP canonical source sequence must start at 1, received ${envelope.sourceSequence}.`,
+      );
+    }
+    return "next";
+  }
+  if (!sameCanonicalCursorIdentity(cursor, envelope)) {
+    throw new OmpCanonicalCursorError(
+      "OMP canonical envelope environment, thread, or runtime session identity changed.",
+    );
+  }
+  if (envelope.sourceSequence === cursor.sourceSequence) {
+    if (envelope.eventId === cursor.eventId) return "duplicate";
+    throw new OmpCanonicalCursorError(
+      `OMP canonical source sequence ${envelope.sourceSequence} collides with a different event id.`,
+    );
+  }
+  if (envelope.sourceSequence < cursor.sourceSequence) {
+    throw new OmpCanonicalCursorError(
+      `OMP canonical source sequence ${envelope.sourceSequence} is behind acknowledged sequence ${cursor.sourceSequence}.`,
+    );
+  }
+  const expected = cursor.sourceSequence + 1;
+  if (envelope.sourceSequence !== expected) {
+    throw new OmpCanonicalCursorError(
+      `OMP canonical source sequence gap: expected ${expected}, received ${envelope.sourceSequence}.`,
+    );
+  }
+  return "next";
+}
+
+function canonicalEnvelopeKey(envelope: ProviderRuntimeEventEnvelope): string {
+  return [
+    envelope.environmentId,
+    envelope.threadId,
+    envelope.providerInstanceId,
+    envelope.runtimeSessionId ?? "",
+    envelope.sourceSequence,
+    envelope.eventId,
+  ].join(":");
+}
+
+function hasMalformedCanonicalCursorCause(value: unknown, depth = 0): boolean {
+  if (depth > 4 || value === null || typeof value !== "object") return false;
+  if ("name" in value && value.name === "MalformedProviderCanonicalCursorError") {
+    return true;
+  }
+  return "cause" in value ? hasMalformedCanonicalCursorCause(value.cause, depth + 1) : false;
+}
+
+function persistedOmpRuntimeSessionId(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const sessionId = "sessionId" in value ? value.sessionId : undefined;
+  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
 }
 
 function toTurnId(value: TurnId | string | undefined): TurnId | undefined {
@@ -617,6 +739,8 @@ export function runtimeEventToActivities(
             ...(event.payload.summary ? { summary: truncateDetail(event.payload.summary) } : {}),
             ...(event.payload.lastToolName ? { lastToolName: event.payload.lastToolName } : {}),
             ...(event.payload.usage !== undefined ? { usage: event.payload.usage } : {}),
+            ...(event.payload.model ? { model: event.payload.model } : {}),
+            ...(event.payload.effort ? { effort: event.payload.effort } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -650,6 +774,8 @@ export function runtimeEventToActivities(
                 }
               : {}),
             ...(event.payload.usage !== undefined ? { usage: event.payload.usage } : {}),
+            ...(event.payload.model ? { model: event.payload.model } : {}),
+            ...(event.payload.effort ? { effort: event.payload.effort } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -776,6 +902,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerSessionDirectory = yield* ProviderSessionDirectory;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const serverSettingsService = yield* ServerSettingsService;
   const providerCommandId = (
@@ -2044,13 +2171,49 @@ const make = Effect.gen(function* () {
 
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
 
+  // Entries exist only between a committed projection and its failed durable
+  // cursor acknowledgment. Successful acknowledgments remove them immediately.
+  // If the bounded safety window fills, new deliveries retry without side
+  // effects until an existing cursor acknowledgment resolves.
+  const maxUnacknowledgedCanonicalEnvelopes = 1_024;
   const completedCanonicalEnvelopes = new Set<string>();
-  const processCanonicalEnvelope = (envelope: ProviderRuntimeEventEnvelope) => {
-    const envelopeKey = `${envelope.environmentId}:${envelope.threadId}:${envelope.eventId}`;
-    if (completedCanonicalEnvelopes.has(envelopeKey)) {
-      return Effect.void;
-    }
-    return Effect.sync(() => validateCanonicalEnvelope(envelope)).pipe(
+  const inspectCanonicalEnvelope = Effect.fn("ProviderRuntimeIngestion.inspectCanonicalEnvelope")(
+    function* (envelope: ProviderRuntimeEventEnvelope) {
+      yield* Effect.try({
+        try: () => validateCanonicalEnvelope(envelope),
+        catch: (cause) =>
+          new OmpCanonicalCursorError(
+            cause instanceof Error ? cause.message : "Canonical provider envelope is invalid.",
+          ),
+      });
+      if (envelope.event.provider !== "omp") return "next" as const;
+      const binding = Option.getOrUndefined(
+        yield* providerSessionDirectory.getBinding(envelope.threadId),
+      );
+      if (
+        binding !== undefined &&
+        (binding.provider !== envelope.event.provider ||
+          binding.providerInstanceId !== envelope.providerInstanceId)
+      ) {
+        throw new OmpCanonicalCursorError(
+          "OMP canonical envelope does not match the durably bound provider instance.",
+        );
+      }
+      const existingCursor = binding?.canonicalSourceCursor;
+      const authorizedSessionReset =
+        existingCursor !== undefined &&
+        sameCanonicalCursorFence(existingCursor, envelope) &&
+        existingCursor.runtimeSessionId !== envelope.runtimeSessionId &&
+        persistedOmpRuntimeSessionId(binding?.resumeCursor) === envelope.runtimeSessionId &&
+        envelope.sourceSequence === 1;
+      return classifyOmpCanonicalCursor(
+        envelope,
+        authorizedSessionReset ? undefined : existingCursor,
+      );
+    },
+  );
+  const processCanonicalEnvelope = (envelope: ProviderRuntimeEventEnvelope) =>
+    Effect.sync(() => validateCanonicalEnvelope(envelope)).pipe(
       Effect.andThen(
         processRuntimeEvent(
           envelope.event,
@@ -2058,14 +2221,40 @@ const make = Effect.gen(function* () {
           canonicalEventAttribution(envelope),
         ),
       ),
-      Effect.tap(() => Effect.sync(() => completedCanonicalEnvelopes.add(envelopeKey))),
     );
-  };
 
-  const processInput = (input: RuntimeIngestionInput) =>
+  type RuntimeInputError =
+    | Effect.Error<ReturnType<typeof inspectCanonicalEnvelope>>
+    | Effect.Error<ReturnType<typeof processRuntimeEvent>>
+    | Effect.Error<ProviderRuntimeEventDelivery["acknowledge"]>
+    | CanonicalIngestionAcknowledgmentWindowFullError;
+
+  const processInput = (input: RuntimeIngestionInput): Effect.Effect<void, RuntimeInputError> =>
     input.source === "canonical-delivery"
-      ? processCanonicalEnvelope(input.delivery.envelope).pipe(
-          Effect.andThen(input.delivery.acknowledge),
+      ? inspectCanonicalEnvelope(input.delivery.envelope).pipe(
+          Effect.flatMap((disposition) =>
+            Effect.gen(function* () {
+              const envelopeKey = canonicalEnvelopeKey(input.delivery.envelope);
+              if (disposition === "duplicate" || completedCanonicalEnvelopes.has(envelopeKey)) {
+                yield* input.delivery.acknowledge;
+                completedCanonicalEnvelopes.delete(envelopeKey);
+                return;
+              }
+              if (completedCanonicalEnvelopes.size >= maxUnacknowledgedCanonicalEnvelopes) {
+                return yield* new CanonicalIngestionAcknowledgmentWindowFullError({
+                  limit: maxUnacknowledgedCanonicalEnvelopes,
+                });
+              }
+              yield* processRuntimeEvent(
+                input.delivery.envelope.event,
+                input.delivery.envelope.sourceSequence,
+                canonicalEventAttribution(input.delivery.envelope),
+              );
+              completedCanonicalEnvelopes.add(envelopeKey);
+              yield* input.delivery.acknowledge;
+              completedCanonicalEnvelopes.delete(envelopeKey);
+            }),
+          ),
         )
       : input.source === "canonical-runtime"
         ? processCanonicalEnvelope(input.envelope)
@@ -2097,11 +2286,25 @@ const make = Effect.gen(function* () {
           eventType: event.type,
           cause: Cause.pretty(cause),
         });
+        const failure = Cause.squash(cause);
+        const permanentCanonicalViolation =
+          failure instanceof OmpCanonicalCursorError || hasMalformedCanonicalCursorCause(failure);
         return input.source === "canonical-delivery"
-          ? logFailure.pipe(
-              Effect.andThen(Effect.sleep("100 millis")),
-              Effect.andThen(input.delivery.retry(Cause.squash(cause))),
-            )
+          ? permanentCanonicalViolation
+            ? logFailure.pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    completedCanonicalEnvelopes.delete(
+                      canonicalEnvelopeKey(input.delivery.envelope),
+                    );
+                  }),
+                ),
+                Effect.andThen(input.delivery.reject(failure)),
+              )
+            : logFailure.pipe(
+                Effect.andThen(Effect.sleep("100 millis")),
+                Effect.andThen(input.delivery.retry(failure)),
+              )
           : logFailure;
       }),
     );
@@ -2121,13 +2324,31 @@ const make = Effect.gen(function* () {
       } else if (canonicalEvents) {
         yield* Effect.forkScoped(
           Stream.runForEach(canonicalEvents, (envelope) =>
-            worker.enqueue({ source: "canonical-runtime", envelope }),
+            envelope.event.provider === "omp"
+              ? Effect.logError(
+                  "OMP runtime event rejected because durable delivery is unavailable",
+                  {
+                    threadId: envelope.threadId,
+                    eventId: envelope.eventId,
+                    providerInstanceId: envelope.providerInstanceId,
+                  },
+                )
+              : worker.enqueue({ source: "canonical-runtime", envelope }),
           ),
         );
       } else {
         yield* Effect.forkScoped(
           Stream.runForEach(providerService.streamEvents, (event) =>
-            worker.enqueue({ source: "legacy-runtime", event }),
+            event.provider === "omp"
+              ? Effect.logError(
+                  "OMP runtime event rejected because durable delivery is unavailable",
+                  {
+                    threadId: event.threadId,
+                    eventId: event.eventId,
+                    providerInstanceId: event.providerInstanceId,
+                  },
+                )
+              : worker.enqueue({ source: "legacy-runtime", event }),
           ),
         );
       }

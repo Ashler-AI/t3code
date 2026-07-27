@@ -8,7 +8,11 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
-import { makeSessionFabricDirectoryClient } from "@t3tools/client-runtime/session-source";
+import {
+  makeSessionFabricDirectoryClient,
+  readDefaultSessionFabricAuthorization,
+  type SessionFabricAuthorizationShape,
+} from "@t3tools/client-runtime/session-source";
 import * as Effect from "effect/Effect";
 
 export interface ComposerSessionMention {
@@ -44,9 +48,11 @@ export async function loadComposerFabricSessionMentions(input: {
   readonly query: string;
   readonly limit?: number;
   readonly fetch?: typeof globalThis.fetch;
+  readonly authorization?: SessionFabricAuthorizationShape;
 }): Promise<ReadonlyArray<ComposerFabricSessionMention>> {
   const client = makeSessionFabricDirectoryClient({
     relayBaseUrl: input.relayBaseUrl,
+    authorization: input.authorization ?? readDefaultSessionFabricAuthorization(),
     ...(input.fetch ? { fetch: input.fetch } : {}),
   });
   const query = input.query.trim();

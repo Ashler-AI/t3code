@@ -2,8 +2,8 @@
  * BUILT_IN_DRIVERS — the static set of `ProviderDriver`s this build ships
  * with.
  *
- * Every driver that the server knows how to instantiate from settings is
- * listed here. The `ProviderInstanceRegistry` iterates this array when
+ * Every driver exposed by this product build is listed here. The
+ * `ProviderInstanceRegistry` iterates this array when
  * resolving `providerInstances` entries; anything not in the array surfaces
  * as an `"unavailable"` shadow snapshot at runtime (see
  * `buildUnavailableProviderSnapshot`).
@@ -22,10 +22,7 @@
  */
 import { ClaudeDriver, type ClaudeDriverEnv } from "./Drivers/ClaudeDriver.ts";
 import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
-import { CursorDriver, type CursorDriverEnv } from "./Drivers/CursorDriver.ts";
-import { GrokDriver, type GrokDriverEnv } from "./Drivers/GrokDriver.ts";
 import { OmpDriver, type OmpDriverEnv } from "./Drivers/OmpDriver.ts";
-import { OpenCodeDriver, type OpenCodeDriverEnv } from "./Drivers/OpenCodeDriver.ts";
 import type { AnyProviderDriver } from "./ProviderDriver.ts";
 
 /**
@@ -33,38 +30,43 @@ import type { AnyProviderDriver } from "./ProviderDriver.ts";
  * driver. The registry layer declares `R = BuiltInDriversEnv`; the runtime
  * layer must provide every service in this union.
  */
-export type BuiltInDriversEnv =
-  | ClaudeDriverEnv
-  | CodexDriverEnv
-  | CursorDriverEnv
-  | GrokDriverEnv
-  | OmpDriverEnv
-  | OpenCodeDriverEnv;
+export type BuiltInDriversEnv = ClaudeDriverEnv | CodexDriverEnv | OmpDriverEnv;
 
 /**
  * Ordered list of built-in drivers. Order matters only for tie-breaking in
  * UI presentation — the registry itself is keyed by `driverKind`, so
  * iteration order has no functional effect on instance lookup.
  */
-const ALL_BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> = [
+const LOCAL_PRODUCT_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> = [
   OmpDriver,
   CodexDriver,
   ClaudeDriver,
-  CursorDriver,
-  GrokDriver,
-  OpenCodeDriver,
 ];
 
 /**
- * Scaffold ships a single managed harness. Local installs retain the full T3
- * driver catalog unless they explicitly opt into the same constrained mode.
+ * Scaffold ships a single managed harness. Local installs expose the Ashler
+ * product catalog: OMP plus the optional native Codex and Claude harnesses.
+ *
+ * Cursor, Grok, and OpenCode remain in the fork for upstream compatibility,
+ * but are not advertised or instantiated through the product registry.
  */
 export function builtInDriversForEnvironment(
   environment: NodeJS.ProcessEnv,
 ): ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> {
   const mode = environment.T3_PROVIDER_DRIVER_MODE?.trim();
-  if (!mode || mode === "all") return ALL_BUILT_IN_DRIVERS;
+  const scaffoldRuntimeProfile = environment.SCAFFOLD_RUNTIME_PROFILE?.trim();
+
+  if (scaffoldRuntimeProfile === "agent_t3_omp") {
+    if (mode && mode !== "omp-only") {
+      throw new Error(
+        "agent_t3_omp requires T3_PROVIDER_DRIVER_MODE to be omp-only when configured",
+      );
+    }
+    return [OmpDriver];
+  }
+
   if (mode === "omp-only") return [OmpDriver];
+  if (!mode || mode === "all") return LOCAL_PRODUCT_DRIVERS;
   throw new Error("T3_PROVIDER_DRIVER_MODE must be either all or omp-only");
 }
 

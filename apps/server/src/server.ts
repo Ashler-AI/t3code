@@ -1,6 +1,15 @@
+// @effect-diagnostics nodeBuiltinImport:off globalFetch:off
+import * as NodeFSP from "node:fs/promises";
+
 import { EnvironmentHttpApi } from "@t3tools/contracts";
+import { SessionTransferSource } from "@t3tools/contracts";
+import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
@@ -11,7 +20,11 @@ import {
   serverEnvironmentHttpApiLayer,
   staticAndDevRouteLayer,
   browserApiCorsLayer,
+  makeScaffoldSessionTransferRouteLayer,
+  makeScaffoldWorkspaceMigrationImportRouteLayer,
+  makeScaffoldRetentionCaptureRouteLayer,
   scaffoldPrepareConnectionRouteLayer,
+  scaffoldSessionFabricCapabilityRouteLayer,
 } from "./http.ts";
 import { fixPath } from "./os-jank.ts";
 import { websocketRpcRouteLayer } from "./ws.ts";
@@ -65,9 +78,15 @@ import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
+import { makeLiveWorkspaceMigrationDestination } from "./sessionTransfer/LiveWorkspaceMigrationDestination.ts";
+import { makeLiveScaffoldSessionTransferSource } from "./sessionTransfer/ScaffoldSessionTransferSource.ts";
+import { makeWorkspaceMigrationImportService } from "./sessionTransfer/WorkspaceMigrationImportService.ts";
+import { makeLiveScaffoldRetentionCapture } from "./sessionTransfer/ScaffoldRetentionCapture.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "./git/GitWorkflowService.ts";
+
+const decodeSessionTransferSource = Schema.decodeUnknownSync(SessionTransferSource);
 import * as ReviewService from "./review/ReviewService.ts";
 import * as SourceControlProviderRegistry from "./sourceControl/SourceControlProviderRegistry.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
@@ -344,12 +363,134 @@ const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   Layer.provideMerge(TraceDiagnostics.layer),
   Layer.provideMerge(AnalyticsService.layer),
   Layer.provideMerge(ExternalLauncher.layer),
+  Layer.provideMerge(ProcessRunner.layer),
   Layer.provideMerge(ServerLifecycleEvents.layer),
   Layer.provide(NetService.layer),
 );
 
 const RuntimeServicesLive = ServerRuntimeStartup.layer.pipe(
   Layer.provideMerge(RuntimeDependenciesLive),
+);
+
+const SessionTransferRoutesLive = Layer.unwrap(
+  Effect.gen(function* () {
+    const source = yield* makeLiveScaffoldSessionTransferSource();
+    const sourceRoute = makeScaffoldSessionTransferRouteLayer(source);
+    const [runtimeToken, runtimeDir, scaffoldSessionId, scaffoldLifecycleEpoch] = yield* Effect.all(
+      [
+        Config.string("SCAFFOLD_RUNTIME_API_TOKEN").pipe(Config.option),
+        Config.string("SCAFFOLD_RUNTIME_DIR").pipe(Config.option),
+        Config.string("SCAFFOLD_SESSION_ID").pipe(Config.option),
+        Config.int("SCAFFOLD_LIFECYCLE_EPOCH").pipe(Config.option),
+      ],
+    );
+    if (Option.isNone(runtimeToken) || Option.isNone(runtimeDir)) {
+      return sourceRoute;
+    }
+
+    const serverConfig = yield* ServerConfig.ServerConfig;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const currentSettings = yield* settings.getSettings;
+    const destination = yield* makeLiveWorkspaceMigrationDestination({
+      cwd: serverConfig.cwd,
+      ompSettings: currentSettings.providers.omp,
+      ...(Option.isSome(scaffoldSessionId)
+        ? { destinationT3SessionId: scaffoldSessionId.value }
+        : {}),
+    });
+    const importService = makeWorkspaceMigrationImportService({
+      runtimeDir: runtimeDir.value,
+      workspaceRoot: serverConfig.cwd,
+      paths: {
+        join: (...parts) => path.join(...parts),
+        relative: (from, to) => path.relative(from, to),
+        realPath: (value) => fileSystem.realPath(value).pipe(Effect.runPromise),
+        lstat: async (value) => {
+          try {
+            const info = await NodeFSP.lstat(value);
+            return {
+              kind: info.isFile()
+                ? "file"
+                : info.isDirectory()
+                  ? "directory"
+                  : info.isSymbolicLink()
+                    ? "symbolic-link"
+                    : "other",
+              mode: info.mode,
+            } as const;
+          } catch (cause) {
+            if (
+              typeof cause === "object" &&
+              cause !== null &&
+              "code" in cause &&
+              cause.code === "ENOENT"
+            ) {
+              return undefined;
+            }
+            throw cause;
+          }
+        },
+        readFile: (value) => fileSystem.readFile(value).pipe(Effect.runPromise),
+        writeFileAtomically: (value, bytes) =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const parent = path.dirname(value);
+              yield* fileSystem.makeDirectory(parent, { recursive: true });
+              const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
+                directory: parent,
+                prefix: `${path.basename(value)}.`,
+              });
+              const tempPath = path.join(tempDirectory, "receipt.tmp");
+              const file = yield* fileSystem.open(tempPath, { flag: "wx" });
+              yield* file.writeAll(bytes);
+              yield* file.sync;
+              yield* fileSystem.rename(tempPath, value);
+            }),
+          ).pipe(Effect.runPromise),
+        exists: (value) => fileSystem.exists(value).pipe(Effect.runPromise),
+        readLink: (value) => fileSystem.readLink(value).pipe(Effect.runPromise),
+      },
+      destination,
+      acquireCommitAuthority: async (authority) => {
+        const supervisorPort = process.env.SCAFFOLD_HEALTH_PORT ?? "8080";
+        const response = await fetch(
+          `http://127.0.0.1:${supervisorPort}/migration/import-authority/commit`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-scaffold-runtime-api-token": runtimeToken.value,
+            },
+            body: JSON.stringify(authority),
+            signal: AbortSignal.timeout(5_000),
+          },
+        );
+        if (!response.ok) {
+          throw new Error(`Supervisor rejected migration commit authority (${response.status}).`);
+        }
+      },
+      decodeMetadata: (bytes) =>
+        decodeSessionTransferSource(JSON.parse(new TextDecoder().decode(bytes))),
+    });
+    const retentionRoute =
+      Option.isSome(scaffoldSessionId) && Option.isSome(scaffoldLifecycleEpoch)
+        ? makeScaffoldRetentionCaptureRouteLayer(
+            yield* makeLiveScaffoldRetentionCapture({
+              sessionId: scaffoldSessionId.value,
+              lifecycleEpoch: scaffoldLifecycleEpoch.value,
+              ompSettings: currentSettings.providers.omp,
+            }),
+            runtimeToken.value,
+          )
+        : Layer.empty;
+    return Layer.mergeAll(
+      sourceRoute,
+      makeScaffoldWorkspaceMigrationImportRouteLayer(importService, runtimeToken.value),
+      retentionRoute,
+    );
+  }),
 );
 
 export const makeRoutesLayer = Layer.mergeAll(
@@ -363,6 +504,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     ),
     otlpTracesProxyRouteLayer,
     scaffoldPrepareConnectionRouteLayer,
+    scaffoldSessionFabricCapabilityRouteLayer,
     assetRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
@@ -482,7 +624,7 @@ export const makeServerLayer = Layer.unwrap(
     );
 
     const serverApplicationLayer = Layer.mergeAll(
-      HttpRouter.serve(makeRoutesLayer, {
+      HttpRouter.serve(Layer.mergeAll(makeRoutesLayer, SessionTransferRoutesLive), {
         disableLogger: !config.logWebSocketEvents,
       }),
       httpListeningLayer,

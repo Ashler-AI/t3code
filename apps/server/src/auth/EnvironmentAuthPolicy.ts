@@ -41,6 +41,7 @@ export const make = Effect.gen(function* () {
     sessionCookieName: resolveSessionCookieName({
       mode: config.mode,
       port: config.port,
+      ...(config.devUrl === undefined ? {} : { devUrl: config.devUrl }),
     }),
   };
 

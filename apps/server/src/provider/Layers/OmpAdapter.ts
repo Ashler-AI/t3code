@@ -38,6 +38,7 @@ import * as NodeURL from "node:url";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { resolveAshlerOmpAdvisor } from "../../ashler/OmpModelPolicy.ts";
 import { ServerConfig } from "../../config.ts";
+import { makeOmpMetricRecorder } from "../../observability/OmpMetrics.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterProcessError,
@@ -297,12 +298,24 @@ export function advanceOmpEventCursor(input: {
     Number.isSafeInteger(input.sourceSequence) &&
     input.sourceSequence >= 0
   ) {
+    if (input.sourceSequence > input.currentSequence + 1) {
+      throw new Error(
+        `OMP source sequence gap: expected ${input.currentSequence + 1}, received ${input.sourceSequence}.`,
+      );
+    }
     return {
       sequence: input.sourceSequence,
       duplicate: input.sourceSequence <= input.currentSequence,
     };
   }
   return { sequence: input.currentSequence + 1, duplicate: false };
+}
+
+export function resumedOmpCursorForSession(
+  sessionId: string,
+  resume: ReturnType<typeof parseOmpResume>,
+): ReturnType<typeof parseOmpResume> {
+  return resume?.sessionId === sessionId ? resume : undefined;
 }
 
 function selectPermissionOptionId(
@@ -369,6 +382,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
     const offeredEventIds = new Set<EventId>();
+    const metrics = yield* makeOmpMetricRecorder;
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -440,7 +454,22 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           ctx?.session.resumeCursor !== undefined
             ? { ...event, resumeCursor: ctx.session.resumeCursor }
             : event;
-        return PubSub.publish(runtimeEventPubSub, enriched).pipe(Effect.asVoid);
+        const observe =
+          event.type === "turn.started" && event.turnId !== undefined
+            ? metrics.recordTurnStarted(event.turnId)
+            : event.type === "content.delta" && event.turnId !== undefined
+              ? metrics.recordFirstOutput(
+                  event.turnId,
+                  event.payload.streamKind === "reasoning_text" ? "reasoning" : "text",
+                )
+              : (event.type === "turn.completed" || event.type === "turn.aborted") &&
+                  event.turnId !== undefined
+                ? metrics.recordTurnFinished(event.turnId)
+                : Effect.void;
+        return PubSub.publish(runtimeEventPubSub, enriched).pipe(
+          Effect.andThen(observe),
+          Effect.asVoid,
+        );
       });
 
     const getThreadSemaphore = (threadId: string) =>
@@ -784,6 +813,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
             );
             return;
           case "ToolCallUpdated": {
+            yield* metrics.recordToolUpdate(event.toolCall.status);
             yield* offerRuntimeEvent(
               makeAcpToolCallEvent({
                 stamp: yield* sourceStamp(`tool:${event.toolCall.toolCallId}`),
@@ -798,6 +828,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
               const prior = ctx.subagentTaskStates.get(snapshot.taskId);
               const fingerprint = `${snapshot.status}:${encodeJsonStringForDiagnostics(snapshot) ?? snapshot.taskId}`;
               if (!prior) {
+                yield* metrics.recordSubagentEvent("started");
                 yield* offerRuntimeEvent(
                   makeAcpSubagentTaskEvent({
                     stamp: yield* sourceStamp(`task-started:${snapshot.taskId}`),
@@ -812,6 +843,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
               }
               if (snapshot.status === "pending" || snapshot.status === "running") {
                 if (prior !== fingerprint) {
+                  yield* metrics.recordSubagentEvent("progress");
                   yield* offerRuntimeEvent(
                     makeAcpSubagentTaskEvent({
                       stamp: yield* sourceStamp(`task-progress:${snapshot.taskId}`),
@@ -826,6 +858,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
                 }
                 ctx.subagentTaskStates.set(snapshot.taskId, fingerprint);
               } else if (prior !== fingerprint) {
+                yield* metrics.recordSubagentEvent("completed");
                 yield* offerRuntimeEvent(
                   makeAcpSubagentTaskEvent({
                     stamp: yield* sourceStamp(`task-completed:${snapshot.taskId}`),
@@ -1137,13 +1170,14 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
               ),
           });
 
+          const resumedCursor = resumedOmpCursorForSession(started.sessionId, resume);
           eventSequences.set(input.threadId, {
             sessionId: started.sessionId,
-            sequence: resume?.eventSequence ?? 0,
+            sequence: resumedCursor?.eventSequence ?? 0,
           });
 
           const now = yield* nowIso;
-          const resumedActiveTurnId = resume?.activeTurnId;
+          const resumedActiveTurnId = resumedCursor?.activeTurnId;
           const session: ProviderSession = {
             provider: PROVIDER,
             providerInstanceId: boundInstanceId,
@@ -1155,8 +1189,8 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
             resumeCursor: {
               schemaVersion: OMP_RESUME_VERSION,
               sessionId: started.sessionId,
-              eventSequence: resume?.eventSequence ?? 0,
-              acpSequence: resume?.acpSequence ?? 0,
+              eventSequence: resumedCursor?.eventSequence ?? 0,
+              acpSequence: resumedCursor?.acpSequence ?? 0,
               ...(resumedActiveTurnId ? { activeTurnId: resumedActiveTurnId } : {}),
             },
             ...(resumedActiveTurnId ? { activeTurnId: resumedActiveTurnId } : {}),
@@ -1185,14 +1219,21 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
             currentAdvisorId: boundAdvisorId,
             subagentTaskStates: new Map(),
             availableModelSlugs,
-            acpSequence: resume?.acpSequence ?? 0,
+            acpSequence: resumedCursor?.acpSequence ?? 0,
             stopped: false,
           };
 
           sessions.set(input.threadId, ctx);
           const replayNotifications = yield* acp.getReplayNotifications;
           for (const replay of replayNotifications) {
-            if (replay.sourceSequence <= ctx.acpSequence) continue;
+            if (replay.sourceSequence <= ctx.acpSequence) {
+              yield* metrics.recordReplay("duplicate");
+              continue;
+            }
+            if (replay.sourceSequence > ctx.acpSequence + 1) {
+              yield* metrics.recordReplay("gap");
+            }
+            yield* metrics.recordReplay("replayed");
             const parsed = parseSessionUpdateEvent(replay.notification);
             for (const event of parsed.events) {
               yield* processAcpEvent(ctx, {
@@ -1769,8 +1810,11 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           };
         });
         if (observed._tag === "Ignore") {
+          yield* metrics.recordInterrupt("ignored");
           return;
         }
+
+        yield* metrics.recordInterrupt("requested");
 
         yield* withThreadLock(
           threadId,

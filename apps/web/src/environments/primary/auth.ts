@@ -152,6 +152,8 @@ let bootstrapPromise: Promise<ServerAuthGateState> | null = null;
 let resolvedAuthenticatedGateState: ServerAuthGateState | null = null;
 const AUTH_SESSION_ESTABLISH_TIMEOUT_MS = 2_000;
 const AUTH_SESSION_ESTABLISH_STEP_MS = 100;
+const LOCAL_DEV_AUTO_AUTH_PATH = "/__t3/local-dev/browser-session";
+const LOCAL_DEV_AUTO_AUTH_HEADER = "x-t3-local-dev-bootstrap";
 
 export function peekPairingTokenFromUrl(): string | null {
   return getPairingTokenFromUrl(new URL(window.location.href));
@@ -184,6 +186,17 @@ function getDesktopBootstrapCredential(): string | null {
   return typeof primary?.bootstrapToken === "string" && primary.bootstrapToken.length > 0
     ? primary.bootstrapToken
     : null;
+}
+
+async function exchangeLocalDevBrowserSession(): Promise<void> {
+  const response = await fetch(LOCAL_DEV_AUTO_AUTH_PATH, {
+    method: "POST",
+    credentials: "include",
+    headers: { [LOCAL_DEV_AUTO_AUTH_HEADER]: "1" },
+  });
+  if (!response.ok) {
+    throw new Error("Local development authentication failed.");
+  }
 }
 
 export async function fetchSessionState(): Promise<AuthSessionState> {
@@ -328,6 +341,20 @@ async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
   const currentSession = await fetchSessionState();
   if (currentSession.authenticated) {
     return { status: "authenticated" };
+  }
+
+  if (!bootstrapCredential && import.meta.env.VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED === "true") {
+    try {
+      await exchangeLocalDevBrowserSession();
+      await waitForAuthenticatedSessionAfterBootstrap();
+      return { status: "authenticated" };
+    } catch (error) {
+      return {
+        status: "requires-auth",
+        auth: currentSession.auth,
+        errorMessage: error instanceof Error ? error.message : "Authentication failed.",
+      };
+    }
   }
 
   if (!bootstrapCredential) {

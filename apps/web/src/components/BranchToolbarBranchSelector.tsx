@@ -39,6 +39,7 @@ import {
   resolveBranchToolbarValue,
   resolveDraftEnvModeAfterBranchChange,
   resolveEffectiveEnvMode,
+  resolveInitialWorktreeBaseBranch,
   shouldIncludeBranchPickerItem,
 } from "./BranchToolbar.logic";
 import {
@@ -464,15 +465,15 @@ export function BranchToolbarBranchSelector({
     });
   };
 
-  // Default the worktree base to the repo default branch (origin/HEAD), only
-  // falling back to the checked-out branch when no default is known.
+  // A new worktree starts from the selected repository's checked-out HEAD.
+  // origin/HEAD is only a fallback when the current ref cannot be resolved.
   const defaultBranchName = useMemo(
     () => refs.find((refName) => refName.isDefault)?.name ?? null,
     [refs],
   );
   const worktreeBaseBranchCandidate = isInitialBranchesLoadPending
     ? null
-    : (defaultBranchName ?? currentGitBranch);
+    : resolveInitialWorktreeBaseBranch({ currentGitBranch, defaultBranchName });
 
   useEffect(() => {
     if (

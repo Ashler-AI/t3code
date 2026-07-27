@@ -4,7 +4,13 @@ import {
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
   ScaffoldLifecycleError,
+  SessionFabricSessionId,
+  TrimmedNonEmptyString,
   ScaffoldPrepareConnectionInput,
+  ScaffoldRetentionCaptureInput,
+  ScaffoldRetentionCloneImportInput,
+  ScaffoldSessionTransferStartInput,
+  ScaffoldWorkspaceMigrationImportInput,
 } from "@t3tools/contracts";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
@@ -40,6 +46,9 @@ import {
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
 import { makeScaffoldLifecycleService } from "./scaffold/ScaffoldLifecycleService.ts";
+import type { makeWorkspaceMigrationImportService } from "./sessionTransfer/WorkspaceMigrationImportService.ts";
+import type { ScaffoldRetentionCapturePort } from "./sessionTransfer/ScaffoldRetentionCapture.ts";
+import type { ScaffoldSessionTransferSourcePort } from "./sessionTransfer/ScaffoldSessionTransferSource.ts";
 import * as Schema from "effect/Schema";
 
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
@@ -50,6 +59,42 @@ const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
 const decodeScaffoldPrepareConnectionInput = Schema.decodeUnknownEffect(
   ScaffoldPrepareConnectionInput,
 );
+const decodeScaffoldRetentionCaptureInput = Schema.decodeUnknownEffect(
+  ScaffoldRetentionCaptureInput,
+);
+const decodeScaffoldWorkspaceMigrationImportInput = Schema.decodeUnknownEffect(
+  Schema.Union([ScaffoldWorkspaceMigrationImportInput, ScaffoldRetentionCloneImportInput]),
+);
+const decodeScaffoldSessionTransferStartInput = Schema.decodeUnknownEffect(
+  ScaffoldSessionTransferStartInput,
+);
+const SessionFabricCapabilityProxyRequest = Schema.Struct({
+  deployment: Schema.optional(Schema.Literals(["staging", "production"])),
+  role: Schema.Literals(["viewer", "controller"]),
+  fabricSessionId: Schema.optional(SessionFabricSessionId),
+  scaffoldSessionId: Schema.optional(TrimmedNonEmptyString),
+  scaffoldLifecycleEpoch: Schema.optional(Schema.Number),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+const decodeSessionFabricCapabilityProxyRequest = Schema.decodeUnknownEffect(
+  SessionFabricCapabilityProxyRequest,
+);
+
+export function decodeSessionFabricCapabilityProxyBody(value: unknown) {
+  return Schema.decodeUnknownSync(SessionFabricCapabilityProxyRequest)(value);
+}
+
+export function scaffoldRuntimeTokenMatches(
+  receivedToken: string | undefined,
+  expectedToken: string,
+): boolean {
+  let matches = receivedToken !== undefined && receivedToken.length === expectedToken.length;
+  if (receivedToken !== undefined) {
+    for (let index = 0; index < Math.max(receivedToken.length, expectedToken.length); index += 1) {
+      matches = matches && receivedToken.charCodeAt(index) === expectedToken.charCodeAt(index);
+    }
+  }
+  return expectedToken.length > 0 && matches;
+}
 
 export const browserApiCorsLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -102,6 +147,10 @@ const authenticateRawRouteWithScope = (
       return yield* failEnvironmentScopeRequired(scope);
     }
   });
+
+export function sessionFabricCapabilityProxyScope(role: "viewer" | "controller") {
+  return role === "viewer" ? AuthOrchestrationReadScope : AuthOrchestrationOperateScope;
+}
 
 export const serverEnvironmentHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -228,6 +277,265 @@ export const scaffoldPrepareConnectionRouteLayer = HttpRouter.add(
     }),
   ),
 );
+
+/**
+ * Local browsers obtain short-lived relay capabilities through T3 so Scaffold
+ * OAuth/IAP credentials never cross into browser storage. Mounted Scaffold
+ * routes intercept the same path and apply the authenticated web actor there.
+ */
+export const scaffoldSessionFabricCapabilityRouteLayer = HttpRouter.add(
+  "POST",
+  "/api/session-fabric/capabilities",
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const decoded = yield* decodeSessionFabricCapabilityProxyRequest(yield* request.json).pipe(
+      Effect.option,
+    );
+    if (Option.isNone(decoded)) {
+      return HttpServerResponse.jsonUnsafe(
+        { error: "session_fabric_capability_invalid_request" },
+        { status: 400, headers: { "cache-control": "no-store" } },
+      );
+    }
+    const input = decoded.value;
+    if (
+      (input.role === "viewer" &&
+        (input.fabricSessionId !== undefined ||
+          input.scaffoldSessionId !== undefined ||
+          input.scaffoldLifecycleEpoch !== undefined)) ||
+      (input.role === "controller" &&
+        (input.fabricSessionId === undefined ||
+          input.scaffoldSessionId === undefined ||
+          input.scaffoldLifecycleEpoch === undefined ||
+          !Number.isSafeInteger(input.scaffoldLifecycleEpoch) ||
+          input.scaffoldLifecycleEpoch < 0))
+    ) {
+      return HttpServerResponse.jsonUnsafe(
+        { error: "session_fabric_capability_invalid_request" },
+        { status: 400, headers: { "cache-control": "no-store" } },
+      );
+    }
+    yield* authenticateRawRouteWithScope(sessionFabricCapabilityProxyScope(input.role));
+    const capability =
+      input.role === "viewer"
+        ? ({ role: "viewer" } as const)
+        : ({
+            role: "controller",
+            fabricSessionId: input.fabricSessionId!,
+            scaffoldSessionId: input.scaffoldSessionId!,
+            scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch!,
+          } as const);
+    return yield* Effect.tryPromise(() =>
+      scaffoldLifecycle.issueSessionFabricCapability({
+        ...(input.deployment === undefined ? {} : { deployment: input.deployment }),
+        capability,
+      }),
+    ).pipe(
+      Effect.map((grant) =>
+        HttpServerResponse.jsonUnsafe(grant, {
+          status: 200,
+          headers: { "cache-control": "no-store" },
+        }),
+      ),
+      Effect.catch((error) => {
+        const lifecycleError = isScaffoldLifecycleError(error)
+          ? error
+          : new ScaffoldLifecycleError({
+              reason: "unavailable",
+              message: "Scaffold capability request failed.",
+              status: 503,
+              code: "scaffold_session_fabric_capability_failed",
+            });
+        return Effect.succeed(
+          HttpServerResponse.jsonUnsafe(
+            { error: lifecycleError.code },
+            {
+              status: lifecycleError.status >= 400 ? lifecycleError.status : 503,
+              headers: { "cache-control": "no-store" },
+            },
+          ),
+        );
+      }),
+    );
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
+  ),
+);
+
+/**
+ * Destination-only import endpoint. The sandbox supervisor authenticates with
+ * its process-local migration token. The response deliberately excludes
+ * bootstrap/attach credentials and archive bytes.
+ */
+export const makeScaffoldWorkspaceMigrationImportRouteLayer = (
+  service: ReturnType<typeof makeWorkspaceMigrationImportService>,
+  expectedToken: string,
+) =>
+  HttpRouter.add(
+    "POST",
+    "/internal/scaffold/migrations/import",
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const receivedToken = request.headers["x-scaffold-migration-token"];
+      if (!scaffoldRuntimeTokenMatches(receivedToken, expectedToken)) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "workspace_migration_unauthorized" },
+          { status: 401, headers: { "cache-control": "no-store" } },
+        );
+      }
+      const input = yield* decodeScaffoldWorkspaceMigrationImportInput(yield* request.json).pipe(
+        Effect.option,
+      );
+      if (Option.isNone(input)) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "workspace_migration_invalid_request" },
+          { status: 400 },
+        );
+      }
+      return yield* Effect.tryPromise(() =>
+        input.value.version === "scaffold.t3_workspace_migration.import.v3"
+          ? service.importRetentionClone(input.value)
+          : service.importSession(input.value),
+      ).pipe(
+        Effect.map((result) =>
+          HttpServerResponse.jsonUnsafe(result, {
+            status: 200,
+            headers: { "cache-control": "no-store" },
+          }),
+        ),
+        Effect.catch((error) =>
+          Effect.succeed(
+            HttpServerResponse.jsonUnsafe(
+              {
+                error:
+                  typeof error === "object" && error !== null && "code" in error
+                    ? error.code
+                    : "workspace_migration_import_failed",
+              },
+              { status: 409, headers: { "cache-control": "no-store" } },
+            ),
+          ),
+        ),
+      );
+    }),
+  );
+
+export const makeScaffoldRetentionCaptureRouteLayer = (
+  service: ScaffoldRetentionCapturePort,
+  expectedToken: string,
+) =>
+  HttpRouter.add(
+    "POST",
+    "/internal/scaffold/retention/capture",
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      if (
+        !scaffoldRuntimeTokenMatches(request.headers["x-scaffold-runtime-api-token"], expectedToken)
+      ) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "scaffold_retention_unauthorized" },
+          { status: 401, headers: { "cache-control": "no-store" } },
+        );
+      }
+      const input = yield* decodeScaffoldRetentionCaptureInput(yield* request.json).pipe(
+        Effect.option,
+      );
+      if (Option.isNone(input)) {
+        return HttpServerResponse.jsonUnsafe(
+          { error: "scaffold_retention_invalid_request" },
+          { status: 400, headers: { "cache-control": "no-store" } },
+        );
+      }
+      return yield* Effect.tryPromise(() => service.capture(input.value)).pipe(
+        Effect.map((result) =>
+          HttpServerResponse.jsonUnsafe(result, {
+            status: 200,
+            headers: { "cache-control": "no-store" },
+          }),
+        ),
+        Effect.catch((error) =>
+          Effect.succeed(
+            HttpServerResponse.jsonUnsafe(
+              {
+                error:
+                  typeof error === "object" && error !== null && "code" in error
+                    ? error.code
+                    : "scaffold_retention_capture_failed",
+              },
+              { status: 409, headers: { "cache-control": "no-store" } },
+            ),
+          ),
+        ),
+      );
+    }),
+  );
+
+/** Authenticated local source operation. Archive bytes remain in temp files and subprocess pipes. */
+export const makeScaffoldSessionTransferRouteLayer = (
+  service: ScaffoldSessionTransferSourcePort,
+) => {
+  const route = (
+    path:
+      | "/api/scaffold/session-transfer"
+      | "/api/scaffold/session-transfer/reconcile"
+      | "/api/scaffold/session-transfer/abort",
+    action: "start" | "reconcile" | "abort",
+  ) =>
+    HttpRouter.add(
+      "POST",
+      path,
+      Effect.gen(function* () {
+        yield* authenticateRawRouteWithScope(AuthOrchestrationOperateScope);
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const input = yield* decodeScaffoldSessionTransferStartInput(yield* request.json).pipe(
+          Effect.option,
+        );
+        if (Option.isNone(input)) {
+          return HttpServerResponse.jsonUnsafe(
+            { error: "workspace_migration_invalid_request" },
+            { status: 400 },
+          );
+        }
+        return yield* service[action](input.value).pipe(
+          Effect.map((result) =>
+            HttpServerResponse.jsonUnsafe(result ?? { ok: true }, {
+              status: 200,
+              headers: { "cache-control": "no-store" },
+            }),
+          ),
+          Effect.catch((error) =>
+            Effect.succeed(
+              HttpServerResponse.jsonUnsafe(
+                {
+                  error:
+                    typeof error === "object" && error !== null && "code" in error
+                      ? error.code
+                      : "workspace_migration_failed",
+                },
+                { status: 409, headers: { "cache-control": "no-store" } },
+              ),
+            ),
+          ),
+        );
+      }).pipe(
+        Effect.catchTags({
+          EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+          EnvironmentInternalError: HttpServerRespondable.toResponse,
+          EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+        }),
+      ),
+    );
+
+  return Layer.mergeAll(
+    route("/api/scaffold/session-transfer", "start"),
+    route("/api/scaffold/session-transfer/reconcile", "reconcile"),
+    route("/api/scaffold/session-transfer/abort", "abort"),
+  );
+};
 
 export const assetRouteLayer = HttpRouter.add(
   "GET",

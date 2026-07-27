@@ -4,7 +4,6 @@ import {
   EventId,
   ProjectId,
   ProviderInstanceId,
-  SESSION_FABRIC_PROTOCOL_VERSION,
   SessionFabricClientFrame,
   SessionFabricClientId,
   SessionFabricServerFrame,
@@ -31,6 +30,10 @@ import {
   makeRelaySessionFabricUiSessionSource,
   makeRelaySessionFabricWebSocketUrl,
 } from "./relaySessionFabric.ts";
+import {
+  makeRuntimeSessionFabricAuthorization,
+  makeSessionFabricCapabilityAuthorization,
+} from "./sessionFabricAuthorization.ts";
 
 const SESSION_ID = SessionFabricSessionId.make("session-fabric-1");
 const THREAD_ID = ThreadId.make("thread-1");
@@ -104,14 +107,15 @@ const snapshot: SessionFabricSnapshot = {
     publication: "public",
     runnerState: "online",
     location: {
-      environmentKind: "local",
+      environmentKind: "scaffold",
       environmentId: ENVIRONMENT_ID,
       projectId: PROJECT_ID,
       threadId: THREAD_ID,
       repositoryRoot: project.workspaceRoot,
       worktreePath: thread.worktreePath,
-      scaffoldSessionId: null,
-      scaffoldSessionUrl: null,
+      scaffoldSessionId: "ses-scaffold-1",
+      scaffoldSessionUrl: "https://scaffold.example/sessions/ses-scaffold-1",
+      scaffoldLifecycleEpoch: 2,
     },
     initialPrompt: "Build multiplayer sessions",
     searchableText: "Build multiplayer sessions\nThe relay is connected.",
@@ -174,11 +178,13 @@ class TestWebSocket {
 
   readyState = TestWebSocket.CONNECTING;
   readonly url: string;
+  readonly protocols: ReadonlyArray<string>;
   private readonly listeners = new Map<SocketEventType, Set<SocketListener>>();
   private readonly relay: TestRelay;
 
-  constructor(url: string, relay: TestRelay) {
+  constructor(url: string, relay: TestRelay, protocols?: string | Array<string>) {
     this.url = url;
+    this.protocols = typeof protocols === "string" ? [protocols] : (protocols ?? []);
     this.relay = relay;
   }
 
@@ -190,6 +196,10 @@ class TestWebSocket {
 
   removeEventListener(type: SocketEventType, listener: SocketListener) {
     this.listeners.get(type)?.delete(listener);
+  }
+
+  listenerCount(type: SocketEventType) {
+    return this.listeners.get(type)?.size ?? 0;
   }
 
   send(data: string) {
@@ -220,8 +230,8 @@ class TestRelay {
   readonly sockets: TestWebSocket[] = [];
   clientHelloCount = 0;
 
-  readonly construct = (url: string) => {
-    const socket = new TestWebSocket(url, this);
+  readonly construct = (url: string, protocols?: string | Array<string>) => {
+    const socket = new TestWebSocket(url, this, protocols);
     this.sockets.push(socket);
     return socket as unknown as globalThis.WebSocket;
   };
@@ -301,13 +311,34 @@ const awaitHelloCount = Effect.fn("TestRelay.awaitHelloCount")(function* (
   return yield* Effect.die(new Error(`Expected ${count} Relay client hellos.`));
 });
 
+const awaitCloseListener = Effect.fn("TestRelay.awaitCloseListener")(function* (
+  socket: TestWebSocket,
+) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (socket.listenerCount("close") > 0) return;
+    yield* Effect.yieldNow;
+  }
+  return yield* Effect.die(new Error("Expected the Relay websocket close listener."));
+});
+
 function makeSource(relay: TestRelay, clientId: string) {
+  const capabilityFetch = () => {
+    throw new Error("Loopback disabled auth must not request a session fabric capability.");
+  };
   return makeRelaySessionFabricUiSessionSource({
-    relayBaseUrl: "https://relay.example.test/base/",
+    relayBaseUrl: "http://127.0.0.1:8787/base/",
     sessionId: SESSION_ID,
     clientId: SessionFabricClientId.make(clientId),
     environmentId: ENVIRONMENT_ID,
     environmentLabel: "Relay test",
+    authorization: makeRuntimeSessionFabricAuthorization({
+      endpoint: "http://localhost:5733/api/session-fabric/capabilities",
+      authMode: "disabled",
+      appUrl: "http://localhost:5733/session-fabric:session-fabric-1/thread-1",
+      relayBaseUrl: "http://127.0.0.1:8787/base/",
+      localDevAutoAuthEnabled: true,
+      fetch: capabilityFetch as typeof fetch,
+    }),
     fetch: (() => Promise.resolve(new Response(JSON.stringify(snapshot)))) as typeof fetch,
     webSocketConstructor: relay.construct,
     now: () => NOW,
@@ -360,6 +391,10 @@ describe("Relay session fabric UI source", () => {
         const firstFrames = yield* Effect.forkChild(subscribe(first));
         const secondFrames = yield* Effect.forkChild(subscribe(second));
         yield* awaitSocketCount(relay, 2);
+        expect(relay.sockets.map((socket) => socket.protocols)).toEqual([[], []]);
+        expect(relay.sockets[0]!.url).toBe(
+          "ws://127.0.0.1:8787/base/v1/session-fabric/sessions/session-fabric-1/connect",
+        );
         relay.sockets[0]!.open();
         relay.sockets[1]!.open();
         yield* awaitHelloCount(relay, 2);
@@ -397,5 +432,382 @@ describe("Relay session fabric UI source", () => {
           );
         }
       }),
+  );
+
+  it.effect("uses viewer authority for reads and a separate controller for commands", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      const fetchCalls: Array<{ readonly url: string; readonly authorization: string | null }> = [];
+      const capabilityCalls: string[] = [];
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+        fetch: (async (_input, init) => {
+          const role = (JSON.parse(String(init?.body)) as { role: string }).role;
+          capabilityCalls.push(role);
+          return Response.json({
+            capability: `${role}-secret`,
+            tokenType: "Bearer",
+            role,
+            scopes:
+              role === "viewer"
+                ? ["directory:read", "session:read"]
+                : ["session:read", "session:command"],
+            expiresAt: "2026-07-24T21:00:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings:
+              role === "viewer"
+                ? {}
+                : {
+                    fabricSessionId: SESSION_ID,
+                    scaffoldSessionId: "ses-scaffold-1",
+                    scaffoldLifecycleEpoch: 2,
+                  },
+          });
+        }) as typeof fetch,
+      });
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/base/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-authorized"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Relay test",
+        authorization,
+        fetch: (async (input, init) => {
+          fetchCalls.push({
+            url: String(input),
+            authorization: new Headers(init?.headers).get("authorization"),
+          });
+          return Response.json(snapshot);
+        }) as typeof fetch,
+        webSocketConstructor: relay.construct,
+        now: () => NOW,
+      });
+
+      yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID);
+      expect(fetchCalls).toEqual([
+        {
+          url: "https://relay.example.test/base/v1/session-fabric/sessions/session-fabric-1/snapshot",
+          authorization: "Bearer viewer-secret",
+        },
+      ]);
+
+      const dispatched = yield* Effect.forkChild(
+        source
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("command-authorized"),
+            threadId: THREAD_ID,
+            title: "Authorized",
+          })
+          .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
+      );
+      yield* awaitSocketCount(relay, 1);
+      expect(relay.sockets[0]!.url).not.toContain("secret");
+      expect(relay.sockets[0]!.protocols).toEqual([
+        "t3.session-fabric.v1",
+        "t3.session-fabric.capability.controller-secret",
+      ]);
+      relay.sockets[0]!.open();
+      expect(yield* Fiber.join(dispatched)).toEqual({ sequence: 8 });
+      expect(capabilityCalls).toEqual(["viewer", "controller"]);
+    }),
+  );
+
+  it.effect("refreshes an expired viewer websocket capability once", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      let capabilityCalls = 0;
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+        fetch: (async () => {
+          capabilityCalls += 1;
+          return Response.json({
+            capability: `viewer-${capabilityCalls}`,
+            tokenType: "Bearer",
+            role: "viewer",
+            scopes: ["directory:read", "session:read"],
+            expiresAt: "2026-07-24T21:00:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings: {},
+          });
+        }) as typeof fetch,
+      });
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-refresh"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Relay test",
+        authorization,
+        fetch: (() => Promise.resolve(Response.json(snapshot))) as typeof fetch,
+        webSocketConstructor: relay.construct,
+        reconnectDelay: 0,
+        now: () => NOW,
+      });
+      const streamed = yield* Effect.forkChild(
+        source
+          .subscribeThread(() =>
+            Effect.succeed({
+              threadId: THREAD_ID,
+              afterSequence: 0,
+              requestCompletionMarker: true,
+            }),
+          )
+          .pipe(
+            Stream.runDrain,
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          ),
+      );
+
+      yield* awaitSocketCount(relay, 1);
+      expect(relay.sockets[0]!.protocols.at(-1)).toBe("t3.session-fabric.capability.viewer-1");
+      relay.sockets[0]!.open();
+      yield* awaitHelloCount(relay, 1);
+      relay.sockets[0]!.close(4401, "expired");
+      yield* awaitSocketCount(relay, 2);
+      expect(relay.sockets[1]!.protocols.at(-1)).toBe("t3.session-fabric.capability.viewer-2");
+      yield* awaitCloseListener(relay.sockets[1]!);
+      relay.sockets[1]!.close(4401, "revoked");
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+
+      yield* Fiber.interrupt(streamed);
+      expect(capabilityCalls).toBe(2);
+      expect(relay.sockets).toHaveLength(2);
+    }),
+  );
+
+  it.effect("does not reconnect a viewer websocket denied with 4403", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      let capabilityCalls = 0;
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-read-only"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Relay test",
+        authorization: makeSessionFabricCapabilityAuthorization({
+          endpoint: "https://t3.example/api/session-fabric/capabilities",
+          fetch: (async () => {
+            capabilityCalls += 1;
+            return Response.json({
+              capability: "viewer-secret",
+              tokenType: "Bearer",
+              role: "viewer",
+              scopes: ["directory:read", "session:read"],
+              expiresAt: "2026-07-24T21:00:00.000Z",
+              issuer: "scaffold",
+              audience: "session-fabric",
+              keyId: "key-1",
+              bindings: {},
+            });
+          }) as typeof fetch,
+        }),
+        fetch: (() => Promise.resolve(Response.json(snapshot))) as typeof fetch,
+        webSocketConstructor: relay.construct,
+        reconnectDelay: 0,
+      });
+      const streamed = yield* Effect.forkChild(
+        source
+          .subscribeThread(() =>
+            Effect.succeed({
+              threadId: THREAD_ID,
+              afterSequence: 0,
+              requestCompletionMarker: true,
+            }),
+          )
+          .pipe(
+            Stream.runDrain,
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          ),
+      );
+
+      yield* awaitSocketCount(relay, 1);
+      yield* awaitCloseListener(relay.sockets[0]!);
+      relay.sockets[0]!.close(4403, "read only");
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+
+      yield* Fiber.interrupt(streamed);
+      expect(relay.sockets).toHaveLength(1);
+      expect(capabilityCalls).toBe(1);
+    }),
+  );
+
+  it.effect("forces one viewer refresh when an upgrade fails as 1006", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      let capabilityCalls = 0;
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-upgrade-refresh"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Relay test",
+        authorization: makeSessionFabricCapabilityAuthorization({
+          endpoint: "https://t3.example/api/session-fabric/capabilities",
+          fetch: (async () => {
+            capabilityCalls += 1;
+            return Response.json({
+              capability: `viewer-${capabilityCalls}`,
+              tokenType: "Bearer",
+              role: "viewer",
+              scopes: ["directory:read", "session:read"],
+              expiresAt: "2026-07-24T21:00:00.000Z",
+              issuer: "scaffold",
+              audience: "session-fabric",
+              keyId: "key-1",
+              bindings: {},
+            });
+          }) as typeof fetch,
+        }),
+        fetch: (() => Promise.resolve(Response.json(snapshot))) as typeof fetch,
+        webSocketConstructor: relay.construct,
+        reconnectDelay: 0,
+      });
+      const streamed = yield* Effect.forkChild(
+        source
+          .subscribeThread(() =>
+            Effect.succeed({
+              threadId: THREAD_ID,
+              afterSequence: 0,
+              requestCompletionMarker: true,
+            }),
+          )
+          .pipe(
+            Stream.runDrain,
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          ),
+      );
+
+      yield* awaitSocketCount(relay, 1);
+      yield* awaitCloseListener(relay.sockets[0]!);
+      relay.sockets[0]!.close(1006, "upgrade rejected");
+      yield* awaitSocketCount(relay, 2);
+      expect(relay.sockets[1]!.protocols.at(-1)).toBe("t3.session-fabric.capability.viewer-2");
+      yield* awaitCloseListener(relay.sockets[1]!);
+      relay.sockets[1]!.close(1006, "upgrade rejected again");
+      for (let attempt = 0; attempt < 10; attempt += 1) yield* Effect.yieldNow;
+
+      yield* Fiber.interrupt(streamed);
+      expect(capabilityCalls).toBe(2);
+      expect(relay.sockets).toHaveLength(2);
+    }),
+  );
+
+  it.effect("keeps a shared session read-only when controller authority is denied", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-viewer-only"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Relay test",
+        authorization: makeSessionFabricCapabilityAuthorization({
+          endpoint: "https://t3.example/api/session-fabric/capabilities",
+          fetch: (async (_input, init) => {
+            const role = (JSON.parse(String(init?.body)) as { role: string }).role;
+            return role === "controller"
+              ? new Response(null, { status: 403 })
+              : Response.json({
+                  capability: "viewer-secret",
+                  tokenType: "Bearer",
+                  role: "viewer",
+                  scopes: ["directory:read", "session:read"],
+                  expiresAt: "2026-07-24T21:00:00.000Z",
+                  issuer: "scaffold",
+                  audience: "session-fabric",
+                  keyId: "key-1",
+                  bindings: {},
+                });
+          }) as typeof fetch,
+        }),
+        fetch: (() => Promise.resolve(Response.json(snapshot))) as typeof fetch,
+        webSocketConstructor: relay.construct,
+      });
+
+      const error = yield* source
+        .dispatch({
+          type: "thread.meta.update",
+          commandId: CommandId.make("command-denied"),
+          threadId: THREAD_ID,
+          title: "Denied",
+        })
+        .pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.flip,
+        );
+      expect(error.message).toContain("read-only");
+      expect(relay.sockets).toHaveLength(0);
+    }),
+  );
+
+  it.effect("keeps a shared session read-only when the relay closes commands with 4403", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-controller-read-only"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Relay test",
+        authorization: makeSessionFabricCapabilityAuthorization({
+          endpoint: "https://t3.example/api/session-fabric/capabilities",
+          fetch: (async (_input, init) => {
+            const role = (JSON.parse(String(init?.body)) as { role: string }).role;
+            return Response.json({
+              capability: `${role}-secret`,
+              tokenType: "Bearer",
+              role,
+              scopes:
+                role === "viewer"
+                  ? ["directory:read", "session:read"]
+                  : ["session:read", "session:command"],
+              expiresAt: "2026-07-24T21:00:00.000Z",
+              issuer: "scaffold",
+              audience: "session-fabric",
+              keyId: "key-1",
+              bindings:
+                role === "viewer"
+                  ? {}
+                  : {
+                      fabricSessionId: SESSION_ID,
+                      scaffoldSessionId: "ses-scaffold-1",
+                      scaffoldLifecycleEpoch: 2,
+                    },
+            });
+          }) as typeof fetch,
+        }),
+        fetch: (() => Promise.resolve(Response.json(snapshot))) as typeof fetch,
+        webSocketConstructor: relay.construct,
+      });
+
+      const dispatched = yield* Effect.forkChild(
+        source
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("command-controller-denied"),
+            threadId: THREAD_ID,
+            title: "Denied",
+          })
+          .pipe(
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+            Effect.flip,
+          ),
+      );
+      yield* awaitSocketCount(relay, 1);
+      yield* awaitCloseListener(relay.sockets[0]!);
+      relay.sockets[0]!.close(4403, "read only");
+
+      const error = yield* Fiber.join(dispatched);
+      expect(error.message).toContain("read-only");
+      expect(relay.sockets).toHaveLength(1);
+    }),
   );
 });

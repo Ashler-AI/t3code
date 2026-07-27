@@ -236,51 +236,55 @@ function subagentSnapshotsFromUnknown(value: unknown): ReadonlyArray<AcpSubagent
   const details = isRecord(value.details) ? value.details : value;
   const progress = Array.isArray(details.progress) ? details.progress : [];
   const results = Array.isArray(details.results) ? details.results : [];
-  const snapshots = [...progress, ...results].flatMap((entry): Array<AcpSubagentSnapshot> => {
-    if (!isRecord(entry)) return [];
-    const taskId = trimmedString(entry.id);
-    if (!taskId) return [];
-    const rawStatus = trimmedString(entry.status);
-    const status =
-      rawStatus === "pending" ||
-      rawStatus === "running" ||
-      rawStatus === "completed" ||
-      rawStatus === "failed" ||
-      rawStatus === "aborted"
-        ? rawStatus
-        : typeof entry.exitCode === "number"
-          ? entry.exitCode === 0
-            ? "completed"
-            : "failed"
-          : undefined;
-    if (!status) return [];
-    const metadata = subagentModelMetadata(entry.resolvedModel);
-    const explicitEffort = trimmedString(entry.effort) ?? trimmedString(entry.thinkingLevel);
-    const description =
-      trimmedString(entry.description) ??
-      trimmedString(entry.assignment) ??
-      trimmedString(entry.task);
-    const recentOutput = Array.isArray(entry.recentOutput)
-      ? entry.recentOutput
-          .filter((part): part is string => typeof part === "string")
-          .join("\n")
-          .trim()
-      : undefined;
-    const summary = trimmedString(entry.output) ?? recentOutput;
-    const lastToolName = trimmedString(entry.currentTool);
-    return [
-      {
-        taskId,
-        status,
-        ...(description ? { description } : {}),
-        ...(summary ? { summary } : {}),
-        ...(entry.usage !== undefined ? { usage: entry.usage } : {}),
-        ...(lastToolName ? { lastToolName } : {}),
-        ...metadata,
-        ...(explicitEffort ? { effort: explicitEffort } : {}),
-      },
-    ];
-  });
+  const jobs = Array.isArray(details.jobs) ? details.jobs : [];
+  const snapshots = [...progress, ...results, ...jobs].flatMap(
+    (entry): Array<AcpSubagentSnapshot> => {
+      if (!isRecord(entry)) return [];
+      const taskId = trimmedString(entry.id);
+      if (!taskId) return [];
+      const rawStatus = trimmedString(entry.status);
+      const status =
+        rawStatus === "pending" ||
+        rawStatus === "running" ||
+        rawStatus === "completed" ||
+        rawStatus === "failed" ||
+        rawStatus === "aborted"
+          ? rawStatus
+          : typeof entry.exitCode === "number"
+            ? entry.exitCode === 0
+              ? "completed"
+              : "failed"
+            : undefined;
+      if (!status) return [];
+      const metadata = subagentModelMetadata(entry.resolvedModel);
+      const explicitEffort = trimmedString(entry.effort) ?? trimmedString(entry.thinkingLevel);
+      const description =
+        trimmedString(entry.description) ??
+        trimmedString(entry.assignment) ??
+        trimmedString(entry.task) ??
+        trimmedString(entry.label);
+      const recentOutput = Array.isArray(entry.recentOutput)
+        ? entry.recentOutput
+            .filter((part): part is string => typeof part === "string")
+            .join("\n")
+            .trim()
+        : undefined;
+      const summary = trimmedString(entry.output) ?? recentOutput;
+      const lastToolName = trimmedString(entry.currentTool);
+      return [
+        {
+          taskId,
+          status,
+          ...(description ? { description } : {}),
+          ...(summary ? { summary } : {}),
+          ...(entry.usage !== undefined ? { usage: entry.usage } : {}),
+          ...(lastToolName ? { lastToolName } : {}),
+          ...metadata,
+          ...(explicitEffort ? { effort: explicitEffort } : {}),
+        },
+      ];
+    },
+  );
   return Array.from(new Map(snapshots.map((snapshot) => [snapshot.taskId, snapshot])).values());
 }
 
@@ -335,6 +339,8 @@ export function makeAcpSubagentTaskEvent(input: {
         ...(input.snapshot.summary ? { summary: input.snapshot.summary } : {}),
         ...(input.snapshot.usage !== undefined ? { usage: input.snapshot.usage } : {}),
         ...(input.snapshot.lastToolName ? { lastToolName: input.snapshot.lastToolName } : {}),
+        ...(input.snapshot.model ? { model: input.snapshot.model } : {}),
+        ...(input.snapshot.effort ? { effort: input.snapshot.effort } : {}),
       },
     };
   }
@@ -351,6 +357,8 @@ export function makeAcpSubagentTaskEvent(input: {
             : "failed",
       ...(input.snapshot.summary ? { summary: input.snapshot.summary } : {}),
       ...(input.snapshot.usage !== undefined ? { usage: input.snapshot.usage } : {}),
+      ...(input.snapshot.model ? { model: input.snapshot.model } : {}),
+      ...(input.snapshot.effort ? { effort: input.snapshot.effort } : {}),
     },
   };
 }

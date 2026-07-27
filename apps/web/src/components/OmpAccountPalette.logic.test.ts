@@ -1,4 +1,4 @@
-import { OmpAccountRef } from "@t3tools/contracts";
+import { OmpAccountRef, type OmpLoginChallenge } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -10,6 +10,7 @@ import {
   formatOmpUsageAmount,
   getOmpLoginActionPresentation,
   normalizeOmpLoginChallengeResponse,
+  ompLoginChallengeExpiryDelay,
   preserveOmpOverviewAfterRefreshFailure,
   providerDisplayName,
 } from "./OmpAccountPalette.logic";
@@ -106,6 +107,24 @@ describe("OMP account palette presentation", () => {
     expect(describeOmpLoginFailure({ cause: { token: "secret" } })).toBeUndefined();
   });
 
+  it("derives a bounded delay for expiring login input panels", () => {
+    const challenge: OmpLoginChallenge = {
+      flowId: "login_expiry",
+      provider: "anthropic",
+      kind: "input",
+      expiresAt: 12_000,
+    };
+
+    expect(ompLoginChallengeExpiryDelay(challenge, 10_000)).toBe(2_000);
+    expect(ompLoginChallengeExpiryDelay(challenge, 15_000)).toBe(0);
+    expect(
+      ompLoginChallengeExpiryDelay(
+        { flowId: challenge.flowId, provider: challenge.provider, kind: challenge.kind },
+        10_000,
+      ),
+    ).toBeNull();
+  });
+
   it("filters the ChatGPT Spark quota while keeping other account windows", () => {
     const rows = buildOmpUsageDisplayRows([
       {
@@ -162,6 +181,64 @@ describe("OMP account palette presentation", () => {
         key: "cl***de@example.com:weekly",
         title: "Claude · Weekly quota",
         description: "cl***de@example.com · 60% remaining · Last known",
+        stale: true,
+      },
+    ]);
+  });
+
+  it("shows a concise unavailable row for a connected account omitted from usage refresh", () => {
+    const rows = buildOmpUsageDisplayRows(
+      [
+        {
+          provider: "openai-codex",
+          accountRef: OmpAccountRef.make("acct_openai_first"),
+          maskedAccount: "fi***st@example.com",
+          fetchedAt: 1,
+          limits: [],
+        },
+      ],
+      [
+        {
+          accountRef: OmpAccountRef.make("acct_openai_first"),
+          provider: "openai-codex",
+          authKind: "oauth",
+          displayName: "fi***st@example.com",
+          maskedEmail: "fi***st@example.com",
+          state: "available",
+          managed: false,
+        },
+        {
+          accountRef: OmpAccountRef.make("acct_openai_second"),
+          provider: "openai-codex",
+          authKind: "oauth",
+          displayName: "se***nd@example.com",
+          maskedEmail: "se***nd@example.com",
+          state: "available",
+          managed: false,
+        },
+        {
+          accountRef: OmpAccountRef.make("acct_claude_disabled"),
+          provider: "anthropic",
+          authKind: "oauth",
+          displayName: "cl***de@example.com",
+          maskedEmail: "cl***de@example.com",
+          state: "unavailable",
+          managed: false,
+        },
+      ],
+    );
+
+    expect(rows).toEqual([
+      {
+        key: "acct_openai_first:unavailable",
+        title: "ChatGPT · fi***st@example.com",
+        description: "Usage unavailable",
+        stale: true,
+      },
+      {
+        key: "acct_openai_second:unavailable",
+        title: "ChatGPT · se***nd@example.com",
+        description: "Usage unavailable",
         stale: true,
       },
     ]);

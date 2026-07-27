@@ -5,7 +5,6 @@ import {
   SessionFabricServerFrame,
   SessionFabricSessionId,
   SessionFabricSnapshot as SessionFabricSnapshotSchema,
-  type ClientOrchestrationCommand,
   type OrchestrationShellStreamItem,
   type OrchestrationSubscribeShellInput,
   type OrchestrationSubscribeThreadInput,
@@ -25,10 +24,18 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Socket from "effect/unstable/socket/Socket";
 
 import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
+import {
+  SessionFabricAuthorizationError,
+  type SessionFabricAuthorizationShape,
+  type SessionFabricControllerBinding,
+  sessionFabricAuthorizationHeaders,
+  sessionFabricWebSocketProtocols,
+} from "./sessionFabricAuthorization.ts";
 import type { UiSessionSourceCapabilities, UiSessionSourceShape } from "./source.ts";
 
 const CAPABILITIES: UiSessionSourceCapabilities = {
@@ -47,12 +54,27 @@ type WebSocketConstructor = (
   protocols?: string | Array<string>,
 ) => globalThis.WebSocket;
 
+const isSessionFabricAuthorizationError = Schema.is(SessionFabricAuthorizationError);
+
+function relayCloseCode(cause: unknown, fallback = 1006): number {
+  if (isSessionFabricAuthorizationError(cause)) {
+    if (cause.reason === "permission") return 4403;
+    if (cause.reason === "authentication") return 4401;
+    return fallback;
+  }
+  if (Socket.SocketError.is(cause) && cause.reason._tag === "SocketCloseError") {
+    return cause.reason.code;
+  }
+  return fallback;
+}
+
 export interface RelaySessionFabricSourceOptions {
   readonly relayBaseUrl: string | URL;
   readonly sessionId: SessionFabricSessionId;
   readonly clientId: SessionFabricClientId;
   readonly environmentId: string;
   readonly environmentLabel: string;
+  readonly authorization: SessionFabricAuthorizationShape;
   readonly fetch?: typeof globalThis.fetch;
   readonly webSocketConstructor?: WebSocketConstructor;
   readonly now?: () => string;
@@ -99,6 +121,7 @@ export function makeRelaySessionFabricUiSessionSource(
     options.webSocketConstructor ?? ((url, protocols) => new globalThis.WebSocket(url, protocols));
   const webSocketLayer = Layer.succeed(Socket.WebSocketConstructor, webSocketConstructor);
   const socketUrl = makeRelaySessionFabricWebSocketUrl(options.relayBaseUrl, options.sessionId);
+  let latestSnapshot: SessionFabricSnapshot | null = null;
 
   const unavailable = (message: string) =>
     new EnvironmentRpcUnavailableError({
@@ -106,18 +129,66 @@ export function makeRelaySessionFabricUiSessionSource(
       message,
     });
 
-  const loadSnapshot = Effect.fn("relay_session_fabric.load_snapshot")(function* () {
-    const url = makeRelaySessionFabricHttpUrl(options.relayBaseUrl, options.sessionId, "snapshot");
-    const response = yield* Effect.promise(() => fetchImplementation(url)).pipe(Effect.option);
-    if (Option.isNone(response) || !response.value.ok) {
-      return Option.none<SessionFabricSnapshot>();
+  const fetchSnapshot = (
+    forceRefresh: boolean,
+  ): Effect.Effect<Option.Option<Response>, SessionFabricAuthorizationError> =>
+    Effect.gen(function* () {
+      const url = makeRelaySessionFabricHttpUrl(
+        options.relayBaseUrl,
+        options.sessionId,
+        "snapshot",
+      );
+      const grant = yield* options.authorization.viewer({ forceRefresh });
+      const response = yield* Effect.promise(() =>
+        fetchImplementation(url, { headers: sessionFabricAuthorizationHeaders(grant) }),
+      ).pipe(Effect.option);
+      if (
+        Option.isSome(response) &&
+        response.value.status === 401 &&
+        !forceRefresh &&
+        options.authorization.mode === "capability"
+      ) {
+        options.authorization.invalidate("viewer");
+        return yield* fetchSnapshot(true);
+      }
+      return response;
+    });
+
+  const loadSnapshot = (): Effect.Effect<Option.Option<SessionFabricSnapshot>> =>
+    Effect.gen(function* () {
+      const response = yield* fetchSnapshot(false).pipe(
+        Effect.catch(() => Effect.succeed(Option.none<Response>())),
+      );
+      if (Option.isNone(response) || !response.value.ok) {
+        return Option.none<SessionFabricSnapshot>();
+      }
+      const payload = yield* Effect.promise(() => response.value.json() as Promise<unknown>).pipe(
+        Effect.option,
+      );
+      if (Option.isNone(payload)) return Option.none<SessionFabricSnapshot>();
+      const decoded = yield* decodeSnapshot(payload.value).pipe(Effect.option);
+      if (Option.isSome(decoded)) latestSnapshot = decoded.value;
+      return decoded;
+    });
+
+  const controllerBinding = Effect.fn("relay_session_fabric.controller_binding")(function* () {
+    const snapshot = latestSnapshot ?? Option.getOrNull(yield* loadSnapshot());
+    const location = snapshot?.session.location;
+    if (
+      location?.environmentKind !== "scaffold" ||
+      location.scaffoldSessionId === null ||
+      location.scaffoldLifecycleEpoch === null ||
+      location.scaffoldLifecycleEpoch === undefined
+    ) {
+      return yield* unavailable(
+        "The shared session does not have an authoritative Scaffold execution binding.",
+      );
     }
-    const payload = yield* Effect.promise(() => response.value.json() as Promise<unknown>).pipe(
-      Effect.option,
-    );
-    if (Option.isNone(payload)) return Option.none<SessionFabricSnapshot>();
-    const decoded = yield* decodeSnapshot(payload.value).pipe(Effect.option);
-    return decoded;
+    return {
+      fabricSessionId: options.sessionId,
+      scaffoldSessionId: location.scaffoldSessionId,
+      scaffoldLifecycleEpoch: location.scaffoldLifecycleEpoch,
+    } satisfies SessionFabricControllerBinding;
   });
 
   const makeHello = (afterEventSequence: number) => ({
@@ -153,60 +224,93 @@ export function makeRelaySessionFabricUiSessionSource(
 
         if (socketUrl === null) return Stream.fromQueue(output);
 
-        const runConnection = Effect.gen(function* () {
-          const socket = yield* Socket.makeWebSocket(socketUrl.toString(), {
-            closeCodeIsError: () => true,
-            openTimeout: "10 seconds",
-          });
-          const write = yield* socket.writer;
-          const incoming = yield* Queue.unbounded<SessionFabricServerFrameType>();
-          const read = socket.runString(
-            (message) =>
-              decodeServerFrame(message).pipe(
-                Effect.flatMap((frame) => Queue.offer(incoming, frame)),
-                Effect.catch(() => Effect.void),
+        const runConnection = (forceRefresh: boolean) => {
+          let closeCode = 1006;
+          let opened = false;
+          return Effect.gen(function* () {
+            const grant = yield* options.authorization.viewer({ forceRefresh });
+            const socket = yield* Socket.makeWebSocket(socketUrl.toString(), {
+              closeCodeIsError: (code) => {
+                closeCode = code;
+                return true;
+              },
+              openTimeout: "10 seconds",
+              protocols: [...sessionFabricWebSocketProtocols(grant)],
+            });
+            const write = yield* socket.writer;
+            const incoming = yield* Queue.unbounded<SessionFabricServerFrameType>();
+            const read = socket.runString(
+              (message) =>
+                decodeServerFrame(message).pipe(
+                  Effect.flatMap((frame) => Queue.offer(incoming, frame)),
+                  Effect.catch(() => Effect.void),
+                ),
+              {
+                onOpen: Effect.sync(() => {
+                  opened = true;
+                }).pipe(
+                  Effect.andThen(Ref.get(fabricSequence)),
+                  Effect.flatMap((sequence) => write(encodeClientFrame(makeHello(sequence)))),
+                  Effect.catchCause(() => Effect.void),
+                ),
+              },
+            );
+            const consume = Effect.forever(
+              Queue.take(incoming).pipe(
+                Effect.flatMap((frame) => {
+                  const updateFabricSequence =
+                    frame.type === "session.event"
+                      ? Ref.update(fabricSequence, (sequence) => Math.max(sequence, frame.sequence))
+                      : frame.type === "session.synchronized"
+                        ? Ref.update(fabricSequence, (sequence) =>
+                            Math.max(sequence, frame.cursor.eventSequence),
+                          )
+                        : Effect.void;
+                  return updateFabricSequence.pipe(
+                    Effect.andThen(input.project(frame, localSequence, requestCompletionMarker)),
+                    Effect.flatMap(
+                      Option.match({
+                        onNone: () => Effect.void,
+                        onSome: (item) => Queue.offer(output, item).pipe(Effect.asVoid),
+                      }),
+                    ),
+                  );
+                }),
               ),
-            {
-              onOpen: Ref.get(fabricSequence).pipe(
-                Effect.flatMap((sequence) => write(encodeClientFrame(makeHello(sequence)))),
-                Effect.catchCause(() => Effect.void),
-              ),
-            },
-          );
-          const consume = Effect.forever(
-            Queue.take(incoming).pipe(
-              Effect.flatMap((frame) => {
-                const updateFabricSequence =
-                  frame.type === "session.event"
-                    ? Ref.update(fabricSequence, (sequence) => Math.max(sequence, frame.sequence))
-                    : frame.type === "session.synchronized"
-                      ? Ref.update(fabricSequence, (sequence) =>
-                          Math.max(sequence, frame.cursor.eventSequence),
-                        )
-                      : Effect.void;
-                return updateFabricSequence.pipe(
-                  Effect.andThen(input.project(frame, localSequence, requestCompletionMarker)),
-                  Effect.flatMap(
-                    Option.match({
-                      onNone: () => Effect.void,
-                      onSome: (item) => Queue.offer(output, item).pipe(Effect.asVoid),
-                    }),
-                  ),
-                );
-              }),
+            );
+            yield* Effect.raceFirst(read, consume);
+          }).pipe(
+            Effect.provide(webSocketLayer),
+            Effect.catch((cause) =>
+              Effect.fail({ closeCode: relayCloseCode(cause, closeCode), opened }),
             ),
           );
-          yield* Effect.raceFirst(read, consume);
-        }).pipe(Effect.provide(webSocketLayer));
+        };
 
-        yield* Effect.forkScoped(
-          Effect.forever(
-            runConnection.pipe(
-              Effect.catchCause(() => Effect.void),
-              Effect.andThen(Effect.sleep(options.reconnectDelay ?? "1 second")),
-            ),
-          ),
-        );
+        const runConnectionLoop = (
+          forceRefresh: boolean,
+          authRetryUsed: boolean,
+        ): Effect.Effect<void, never, Scope.Scope> =>
+          runConnection(forceRefresh).pipe(
+            Effect.catch((failure) => {
+              if (failure.closeCode === 4403) return Effect.void;
+              const retryAlreadyUsed = failure.opened ? false : authRetryUsed;
+              const mayBeAuthenticationFailure =
+                failure.closeCode === 4401 || (failure.closeCode === 1006 && !failure.opened);
+              if (mayBeAuthenticationFailure) {
+                if (retryAlreadyUsed || options.authorization.mode !== "capability") {
+                  return Effect.void;
+                }
+                options.authorization.invalidate("viewer");
+                return runConnectionLoop(true, true);
+              }
+              return Effect.sleep(options.reconnectDelay ?? "1 second").pipe(
+                Effect.andThen(runConnectionLoop(false, retryAlreadyUsed)),
+              );
+            }),
+          );
+
+        yield* Effect.forkScoped(runConnectionLoop(false, false));
         return Stream.fromQueue(output);
       }),
     );
@@ -272,58 +376,122 @@ export function makeRelaySessionFabricUiSessionSource(
     }
     return Effect.scoped(
       Effect.gen(function* () {
-        const receipt = yield* Deferred.make<SessionFabricCommandReceipt>();
-        const socket = yield* Socket.makeWebSocket(socketUrl.toString(), {
-          closeCodeIsError: () => true,
-          openTimeout: "10 seconds",
-        });
-        const write = yield* socket.writer;
-        const submittedAt = now();
-        const run = socket.runString(
-          (message) =>
-            decodeServerFrame(message).pipe(
-              Effect.flatMap((frame) => {
-                if (
-                  frame.type !== "command.receipt" ||
-                  frame.receipt.commandId !== command.commandId
-                ) {
-                  return Effect.void;
-                }
-                return frame.receipt.status === "accepted" || frame.receipt.status === "rejected"
-                  ? Deferred.succeed(receipt, frame.receipt).pipe(Effect.asVoid)
-                  : Effect.void;
-              }),
-              Effect.catch(() => Effect.void),
-            ),
-          {
-            onOpen: Effect.gen(function* () {
-              yield* write(encodeClientFrame(makeHello(0)));
-              yield* write(
-                encodeClientFrame({
-                  type: "command.submit",
-                  command: {
-                    sessionId: options.sessionId,
-                    commandId: command.commandId,
-                    clientId: options.clientId,
-                    command,
-                    submittedAt,
-                  },
-                }),
-              );
-            }).pipe(Effect.catchCause(() => Effect.void)),
-          },
-        );
-        yield* Effect.forkScoped(run);
-        const completed = yield* Deferred.await(receipt).pipe(
-          Effect.timeout(options.dispatchTimeout ?? "30 seconds"),
-          Effect.mapError(() => unavailable("The session runner did not accept the command.")),
-        );
-        if (completed.status === "accepted") {
-          return { sequence: completed.resultSequence };
-        }
-        return yield* new OrchestrationDispatchCommandError({
-          message: completed.detail ?? "The session runner rejected this command.",
-        });
+        const dispatchAttempt = (
+          forceRefresh: boolean,
+        ): Effect.Effect<
+          { readonly sequence: number },
+          EnvironmentRpcUnavailableError | OrchestrationDispatchCommandError,
+          Socket.WebSocketConstructor | Scope.Scope
+        > =>
+          Effect.gen(function* () {
+            const receipt = yield* Deferred.make<SessionFabricCommandReceipt>();
+            const closed = yield* Deferred.make<number>();
+            const binding = yield* controllerBinding();
+            const grant = yield* options.authorization.controller(binding, { forceRefresh }).pipe(
+              Effect.mapError((error) =>
+                error.reason === "permission"
+                  ? new OrchestrationDispatchCommandError({
+                      message: "This shared session is available as read-only.",
+                    })
+                  : unavailable(error.detail),
+              ),
+            );
+            let closeCode = 1006;
+            let opened = false;
+            const socket = yield* Socket.makeWebSocket(socketUrl.toString(), {
+              closeCodeIsError: (code) => {
+                closeCode = code;
+                if (code === 4401) options.authorization.invalidate("controller", binding);
+                return true;
+              },
+              openTimeout: "10 seconds",
+              protocols: [...sessionFabricWebSocketProtocols(grant)],
+            });
+            const write = yield* socket.writer;
+            const submittedAt = now();
+            const run = socket.runString(
+              (message) =>
+                decodeServerFrame(message).pipe(
+                  Effect.flatMap((frame) => {
+                    if (
+                      frame.type !== "command.receipt" ||
+                      frame.receipt.commandId !== command.commandId
+                    ) {
+                      return Effect.void;
+                    }
+                    return frame.receipt.status === "accepted" ||
+                      frame.receipt.status === "rejected"
+                      ? Deferred.succeed(receipt, frame.receipt).pipe(Effect.asVoid)
+                      : Effect.void;
+                  }),
+                  Effect.catch(() => Effect.void),
+                ),
+              {
+                onOpen: Effect.gen(function* () {
+                  opened = true;
+                  yield* write(encodeClientFrame(makeHello(0)));
+                  yield* write(
+                    encodeClientFrame({
+                      type: "command.submit",
+                      command: {
+                        sessionId: options.sessionId,
+                        commandId: command.commandId,
+                        clientId: options.clientId,
+                        command,
+                        submittedAt,
+                      },
+                    }),
+                  );
+                }).pipe(Effect.catchCause(() => Effect.void)),
+              },
+            );
+            yield* Effect.forkScoped(
+              run.pipe(
+                Effect.catch((cause) =>
+                  Effect.sync(() => {
+                    closeCode = relayCloseCode(cause, closeCode);
+                  }).pipe(Effect.andThen(Effect.fail(cause))),
+                ),
+                Effect.ensuring(
+                  Effect.suspend(() => Deferred.succeed(closed, closeCode)).pipe(Effect.asVoid),
+                ),
+              ),
+            );
+            const completed = yield* Effect.raceFirst(
+              Deferred.await(receipt),
+              Deferred.await(closed).pipe(Effect.flatMap((code) => Effect.fail(code))),
+            ).pipe(
+              Effect.timeout(options.dispatchTimeout ?? "30 seconds"),
+              Effect.catch((cause) =>
+                (cause === 4401 || (cause === 1006 && !opened)) && !forceRefresh
+                  ? dispatchAttempt(true).pipe(
+                      Effect.map((result) => ({
+                        status: "accepted" as const,
+                        resultSequence: result.sequence,
+                        sessionId: options.sessionId,
+                        commandId: command.commandId,
+                        detail: null,
+                        updatedAt: now(),
+                      })),
+                    )
+                  : cause === 4403
+                    ? Effect.fail(
+                        new OrchestrationDispatchCommandError({
+                          message: "This shared session is available as read-only.",
+                        }),
+                      )
+                    : Effect.fail(unavailable("The session runner did not accept the command.")),
+              ),
+            );
+            if (completed.status === "accepted") {
+              return { sequence: completed.resultSequence };
+            }
+            return yield* new OrchestrationDispatchCommandError({
+              message: completed.detail ?? "The session runner rejected this command.",
+            });
+          });
+
+        return yield* dispatchAttempt(false);
       }).pipe(Effect.provide(webSocketLayer)),
     );
   };

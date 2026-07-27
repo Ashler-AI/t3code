@@ -1,4 +1,5 @@
 import {
+  AuthOrchestrationReadScope,
   AuthAdministrativeScopes,
   AuthSessionId,
   AuthStandardClientScopes,
@@ -76,6 +77,15 @@ const baseUrlFlag = Flag.string("base-url").pipe(
   Flag.optional,
 );
 
+const pairingAccessModeFlag = Flag.choice("access-mode", ["view", "control"] as const).pipe(
+  Flag.withDescription("Fixed pairing access mode. View grants orchestration read access only."),
+  Flag.withDefault("control"),
+);
+
+export function pairingScopesForAccessMode(accessMode: "view" | "control") {
+  return accessMode === "view" ? [AuthOrchestrationReadScope] : AuthStandardClientScopes;
+}
+
 const tokenOnlyFlag = Flag.boolean("token-only").pipe(
   Flag.withDescription("Print only the issued bearer token."),
   Flag.withDefault(false),
@@ -86,6 +96,7 @@ const pairingCreateCommand = Command.make("create", {
   ttl: ttlFlag,
   label: labelFlag,
   baseUrl: baseUrlFlag,
+  accessMode: pairingAccessModeFlag,
   json: jsonFlag,
 }).pipe(
   Command.withDescription("Issue a new client pairing token."),
@@ -95,7 +106,7 @@ const pairingCreateCommand = Command.make("create", {
       (environmentAuth) =>
         Effect.gen(function* () {
           const issued = yield* environmentAuth.createPairingLink({
-            scopes: AuthStandardClientScopes,
+            scopes: pairingScopesForAccessMode(flags.accessMode),
             subject: "one-time-token",
             ...(Option.isSome(flags.ttl) ? { ttl: flags.ttl.value } : {}),
             ...(Option.isSome(flags.label) ? { label: flags.label.value } : {}),

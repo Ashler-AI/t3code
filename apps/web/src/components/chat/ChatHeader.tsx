@@ -30,19 +30,19 @@ export interface OmpAccountAssignmentPresentation {
 function automaticAssignmentDetail(reason: OmpAccountAssignment["reassignmentReason"]): string {
   switch (reason) {
     case "initial-assignment":
-      return "Automatically assigned for this session.";
+    case undefined:
+      return "Assigned to this session.";
     case "load-balanced":
       return "Automatically assigned to balance usage across accounts.";
     case "usage-limited":
       return "Automatically reassigned because another account reached a usage limit.";
     case "quota-exhausted":
-      return "Automatically reassigned because another account exhausted its quota.";
+      return "Switched accounts because the previous account reached its quota.";
     case "account-unavailable":
-      return "Automatically reassigned because another account became unavailable.";
+      return "Switched accounts because the previous account became unavailable.";
     case "broker-policy":
       return "Automatically reassigned by the Scaffold account policy.";
     case "unknown":
-    case undefined:
       return "Automatically assigned to keep this session available.";
   }
 }

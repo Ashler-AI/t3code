@@ -13,6 +13,14 @@ and embedding values:
 - `CLOUDFLARE_API_TOKEN` as an environment secret.
 - `BASETEN_EMBEDDING_URL` as an environment variable.
 - `BASETEN_API_KEY` as an environment secret.
+- `SESSION_FABRIC_ALLOWED_ORIGINS` as a comma-separated environment variable
+  containing the exact Scaffold web origins allowed to call the proof Worker.
+
+The workflow always deploys the Worker with required capability auth. It uses
+the dedicated proof issuer and audience declared in the workflow, generates an
+ephemeral Ed25519 signing key for each deploy run, binds only that run's public
+key to the Worker, and removes the temporary private key after verification.
+No persistent session-fabric signing-key secret is required.
 
 The Baseten bindings are required for the zero-lexical-overlap semantic search
 proof. Without them, the Worker deliberately falls back to lexical ranking.
@@ -21,6 +29,12 @@ The deploy uses Cloudflare-backed Alchemy state so later deploys and the
 explicit destroy operation share one authoritative resource history. The
 Worker has the stable name `ashler-session-fabric-proof` and uses its
 `workers.dev` URL; no DNS mutation is required.
+
+The post-deploy smoke mints separate short-lived viewer and runner
+capabilities. It proves that anonymous directory and snapshot reads return
+`401`, an allowed Scaffold-origin preflight returns `204`, the runner can
+publish a public Scaffold snapshot, and the viewer can read the retained
+offline snapshot after the runner disconnects.
 
 After deployment, configure a proof T3 runner with the workflow's `relay_url`
 output as `T3CODE_SESSION_FABRIC_RELAY_URL`. The shared public-config loader

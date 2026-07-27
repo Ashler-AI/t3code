@@ -1,7 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import * as Schema from "effect/Schema";
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 
 import { isElectron } from "../env";
@@ -29,10 +29,13 @@ import {
   useSidebarVisibility,
 } from "./ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
+import { toastManager } from "./ui/toast";
 import { ThreadAttentionNotifications } from "./ThreadAttentionNotifications";
 import { useScaffoldSessionUiStore } from "../scaffoldSessionUiStore";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useProjects } from "../state/entities";
+import { useEnvironments } from "../state/environments";
+import { threadEnvironment } from "../state/threads";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { useAtomCommand } from "../state/use-atom-command";
 import { connectScaffoldEnvironment } from "../connection/scaffoldOnboarding";
@@ -41,8 +44,16 @@ import {
   drainScaffoldLifecycleActions,
   subscribeScaffoldLifecycleDrain,
 } from "../connection/scaffoldLifecycleOutbox";
+import {
+  browserPendingTurnOutbox,
+  discardPendingTurn,
+  drainPendingTurnOutbox,
+  retargetPendingTurnsForDraft,
+  subscribePendingTurnDrain,
+} from "../connection/pendingTurnOutbox";
 
 const MACOS_TRAFFIC_LIGHTS_LEFT_INSET = "90px";
+const notifiedTerminalPendingTurns = new Set<string>();
 
 function ScaffoldSessionCoordinator() {
   const entriesByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
@@ -86,11 +97,6 @@ function ScaffoldSessionCoordinator() {
             };
           }
           scaffoldUi.connected(entry.draftId, result.value.binding);
-          useComposerDraftStore.getState().setDraftThreadContext(entry.draftId, {
-            projectRef: scopeProjectRef(result.value.target.environmentId, entry.sourceProjectId),
-            envMode: "local",
-            worktreePath: null,
-          });
           return { _tag: "acknowledged" };
         },
         onBlocked: (action) => {
@@ -132,6 +138,7 @@ function ScaffoldSessionCoordinator() {
   }, [connectScaffold]);
 
   useEffect(() => {
+    let disposed = false;
     const draftStore = useComposerDraftStore.getState();
     for (const entry of Object.values(entriesByDraftId)) {
       if (entry.environmentId === null || entry.phase === "creating" || entry.phase === "failed") {
@@ -141,20 +148,134 @@ function ScaffoldSessionCoordinator() {
       if (!draft) continue;
       const currentProjectExists = projects.some(
         (project) =>
-          project.environmentId === draft.environmentId && project.id === draft.projectId,
+          draft.environmentId === entry.environmentId &&
+          project.environmentId === entry.environmentId &&
+          project.id === draft.projectId,
       );
       if (currentProjectExists) continue;
       const remoteProject = projects.find(
         (project) => project.environmentId === entry.environmentId,
       );
       if (!remoteProject) continue;
-      draftStore.setDraftThreadContext(entry.draftId, {
-        projectRef: scopeProjectRef(remoteProject.environmentId, remoteProject.id),
-        envMode: "local",
-        worktreePath: null,
-      });
+      void retargetPendingTurnsForDraft(
+        browserPendingTurnOutbox,
+        entry.draftId,
+        remoteProject.environmentId,
+        remoteProject.id,
+      )
+        .then(() => {
+          if (disposed) return;
+          draftStore.setDraftThreadContext(entry.draftId, {
+            projectRef: scopeProjectRef(remoteProject.environmentId, remoteProject.id),
+            envMode: "local",
+            worktreePath: null,
+          });
+        })
+        .catch((error: unknown) => {
+          console.error("Could not route the pending turn to its Scaffold project.", error);
+        });
     }
+    return () => {
+      disposed = true;
+    };
   }, [entriesByDraftId, projects]);
+
+  return null;
+}
+
+/** Drains accepted chat commands independently of whichever thread is visible. */
+function PendingTurnCoordinator() {
+  const { environments } = useEnvironments();
+  const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const connectedEnvironmentIds = useMemo(
+    () =>
+      environments
+        .filter((environment) => environment.connection.phase === "connected")
+        .map((environment) => environment.environmentId),
+    [environments],
+  );
+
+  useEffect(() => {
+    let disposed = false;
+    let running: Promise<void> | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const drain = () => {
+      if (disposed || running !== null) return;
+      running = (async () => {
+        for (const environmentId of connectedEnvironmentIds) {
+          const results = await drainPendingTurnOutbox({
+            storage: browserPendingTurnOutbox,
+            environmentId,
+            dispatch: async (entry) => {
+              const result = await startThreadTurn({ environmentId, input: entry.input });
+              if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+            },
+          });
+          for (const result of results) {
+            if (
+              result.outcome !== "terminal" ||
+              notifiedTerminalPendingTurns.has(result.entry.idempotencyKey)
+            ) {
+              continue;
+            }
+            notifiedTerminalPendingTurns.add(result.entry.idempotencyKey);
+            const toastId = toastManager.add({
+              type: "error",
+              title: "Message could not be sent",
+              description: result.error ?? "The server rejected this message.",
+              timeout: 0,
+              actionProps: {
+                children: "Discard",
+                onClick: () => {
+                  void discardPendingTurn(
+                    browserPendingTurnOutbox,
+                    result.entry.idempotencyKey,
+                  ).then(() => {
+                    notifiedTerminalPendingTurns.delete(result.entry.idempotencyKey);
+                    toastManager.close(toastId);
+                  });
+                },
+              },
+            });
+          }
+        }
+      })()
+        .catch((error: unknown) => {
+          console.error("Could not drain the pending-turn outbox.", error);
+        })
+        .finally(async () => {
+          running = null;
+          if (disposed) return;
+          const entries = await browserPendingTurnOutbox.list();
+          const retryable = entries.filter(
+            (entry, entryIndex) =>
+              entry.status !== "terminal" &&
+              connectedEnvironmentIds.includes(entry.environmentId) &&
+              !entries
+                .slice(0, entryIndex)
+                .some(
+                  (candidate) =>
+                    candidate.status === "terminal" &&
+                    candidate.environmentId === entry.environmentId &&
+                    candidate.threadId === entry.threadId,
+                ),
+          );
+          if (retryable.length > 0) {
+            const attemptCount = Math.min(...retryable.map((entry) => entry.attemptCount));
+            retryTimer = setTimeout(drain, Math.min(30_000, 1_000 * 2 ** attemptCount));
+          }
+        });
+    };
+
+    const unsubscribe = subscribePendingTurnDrain(drain);
+    drain();
+    return () => {
+      disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      unsubscribe();
+    };
+  }, [connectedEnvironmentIds, startThreadTurn]);
 
   return null;
 }
@@ -292,6 +413,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
     <SidebarProvider className="h-dvh! min-h-0!" defaultOpen style={sidebarProviderStyle}>
       <ThreadAttentionNotifications />
       <ScaffoldSessionCoordinator />
+      <PendingTurnCoordinator />
       <Sidebar
         side="left"
         collapsible="offcanvas"

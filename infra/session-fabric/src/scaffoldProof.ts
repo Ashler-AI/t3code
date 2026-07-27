@@ -20,6 +20,7 @@ export async function fetchScaffoldProofSnapshotResponse(input: {
   readonly url: URL;
   readonly timeoutMs: number;
   readonly fetch: typeof fetch;
+  readonly capability?: string;
 }): Promise<Response> {
   const signal = AbortSignal.timeout(input.timeoutMs);
   const timeout = new Promise<never>((_, reject) => {
@@ -30,7 +31,10 @@ export async function fetchScaffoldProofSnapshotResponse(input: {
     );
   });
   const request = input.fetch(input.url, {
-    headers: { "cache-control": "no-cache" },
+    headers: {
+      "cache-control": "no-cache",
+      ...(input.capability === undefined ? {} : { authorization: `Bearer ${input.capability}` }),
+    },
     signal,
   });
   return await Promise.race([timeout, request]);
