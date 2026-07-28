@@ -1468,6 +1468,29 @@ function OpenCommandPaletteDialog(props: {
     [handleNewThread, pickerProjects, projectGroupByTargetKey],
   );
 
+  const newLocalSessionProjectItems = useMemo(
+    () =>
+      enumerateCommandPaletteItems(
+        buildProjectActionItems({
+          projects: pickerProjects,
+          valuePrefix: "new-local-session-in",
+          searchTerms: (project) => {
+            const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
+            return (
+              group?.memberProjects.flatMap((member) => [member.title, member.workspaceRoot]) ?? []
+            );
+          },
+          icon: renderProjectFavicon,
+          runProject: async (project) => {
+            await handleNewThread(scopeProjectRef(project.environmentId, project.id), {
+              forceNew: true,
+            });
+          },
+        }),
+      ),
+    [handleNewThread, pickerProjects, projectGroupByTargetKey],
+  );
+
   function pushPaletteView(view: CommandPaletteView): void {
     setViewStack((previousViews) => [
       ...previousViews,
@@ -1763,7 +1786,7 @@ function OpenCommandPaletteDialog(props: {
             icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
             addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
             disabled: projects.length === 0,
-            groups: [{ value: "projects", label: "Project", items: projectThreadItems }],
+            groups: [{ value: "projects", label: "Project", items: newLocalSessionProjectItems }],
           },
           {
             kind: "action",
@@ -1789,7 +1812,7 @@ function OpenCommandPaletteDialog(props: {
       },
     ],
     [
-      projectThreadItems,
+      newLocalSessionProjectItems,
       projects.length,
       scaffoldNewSessionActionPresentation,
       startScaffoldThread,
