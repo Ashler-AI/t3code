@@ -17,12 +17,105 @@ import {
   resolveLocalCheckoutBranchMismatch,
   resolvePreviousWorktreeLabel,
   resolvePreviousWorktreeSeed,
+  resolveScaffoldDraftTargetPresentation,
+  shouldBlockComposerForConnection,
+  shouldIgnoreSourceEnvironmentForScaffoldDraft,
   shouldIncludeBranchPickerItem,
+  shouldRenderBranchToolbar,
+  shouldShowComposerContextStrip,
   shouldShowEnvironmentIndicator,
 } from "./BranchToolbar.logic";
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
 const remoteEnvironmentId = EnvironmentId.make("environment-remote");
+
+describe("Scaffold draft presentation", () => {
+  it("shows the selected deployment and starting phase instead of a local worktree", () => {
+    expect(
+      resolveScaffoldDraftTargetPresentation({ deployment: "production", phase: "creating" }),
+    ).toEqual({ targetLabel: "Scaffold production", statusLabel: "Starting", actionLabel: null });
+    expect(
+      resolveScaffoldDraftTargetPresentation({ deployment: "staging", phase: "failed" }),
+    ).toEqual({ targetLabel: "Scaffold staging", statusLabel: "Failed", actionLabel: "Retry" });
+    expect(
+      resolveScaffoldDraftTargetPresentation({
+        deployment: "staging",
+        phase: "failed",
+        replacementRequired: true,
+      }),
+    ).toEqual({
+      targetLabel: "Scaffold",
+      statusLabel: "Target not recorded",
+      actionLabel: "New session",
+    });
+  });
+
+  it("keeps first send enabled while Scaffold starts", () => {
+    expect(
+      shouldBlockComposerForConnection({
+        transportConnecting: false,
+        scaffoldPhase: "creating",
+      }),
+    ).toBe(false);
+    expect(
+      shouldBlockComposerForConnection({
+        transportConnecting: true,
+        scaffoldPhase: "creating",
+      }),
+    ).toBe(true);
+  });
+
+  it("ignores the source device connection only while an unbound Scaffold draft starts", () => {
+    expect(
+      shouldIgnoreSourceEnvironmentForScaffoldDraft({
+        scaffoldEnvironmentId: null,
+        scaffoldPhase: "creating",
+      }),
+    ).toBe(true);
+    expect(
+      shouldIgnoreSourceEnvironmentForScaffoldDraft({
+        scaffoldEnvironmentId: null,
+        scaffoldPhase: "resuming",
+      }),
+    ).toBe(true);
+    expect(
+      shouldIgnoreSourceEnvironmentForScaffoldDraft({
+        scaffoldEnvironmentId: null,
+        scaffoldPhase: "failed",
+      }),
+    ).toBe(false);
+    expect(
+      shouldIgnoreSourceEnvironmentForScaffoldDraft({
+        scaffoldEnvironmentId: remoteEnvironmentId,
+        scaffoldPhase: "creating",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps the Scaffold target visible without Git or project context", () => {
+    expect(
+      shouldShowComposerContextStrip({
+        isGitRepo: false,
+        hasActiveProject: false,
+        hasScaffoldDraft: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRenderBranchToolbar({
+        hasActiveThread: true,
+        hasActiveProject: false,
+        hasScaffoldDraftTarget: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRenderBranchToolbar({
+        hasActiveThread: true,
+        hasActiveProject: false,
+        hasScaffoldDraftTarget: false,
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("resolvePreviousWorktreeSeed", () => {
   it("picks the most recently updated worktree thread", () => {

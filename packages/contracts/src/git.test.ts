@@ -40,6 +40,18 @@ describe("VcsCreateWorktreeInput", () => {
 
     expect(parsed.baseRefName).toBe("origin/main");
   });
+
+  it("accepts explicit exact-target reconciliation for idempotent recovery", () => {
+    const parsed = decodeCreateWorktreeInput({
+      cwd: "/repo",
+      refName: "0123456789abcdef",
+      newRefName: "feature/replayed",
+      path: "/tmp/worktree",
+      reconcileExistingExactTarget: true,
+    });
+
+    expect(parsed.reconcileExistingExactTarget).toBe(true);
+  });
 });
 
 describe("GitPreparePullRequestThreadInput", () => {

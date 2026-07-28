@@ -4,10 +4,16 @@ import { builtInDriversForEnvironment } from "./builtInDrivers.ts";
 
 describe("built-in provider driver profile", () => {
   it("retains native provider choices for local installs", () => {
-    expect(builtInDriversForEnvironment({}).map(({ driverKind }) => driverKind)).toEqual([
+    const localDrivers = builtInDriversForEnvironment({});
+    expect(localDrivers.map(({ driverKind }) => driverKind)).toEqual([
       "omp",
       "codex",
       "claudeAgent",
+    ]);
+    expect(localDrivers.map(({ metadata }) => metadata.displayName)).toEqual([
+      "OMP",
+      "Codex CLI",
+      "Claude Code",
     ]);
     expect(
       builtInDriversForEnvironment({ T3_PROVIDER_DRIVER_MODE: "all" }).map(

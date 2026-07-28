@@ -7,11 +7,13 @@ import {
 import type * as EffectAcpSchema from "effect-acp/schema";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
+import type * as Scope from "effect/Scope";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { createModelCapabilities } from "@t3tools/shared/model";
@@ -31,6 +33,7 @@ import {
 } from "../providerMaintenance.ts";
 import {
   buildOmpSkillsFromAvailableCommands,
+  configuredManagedScaffoldOmpModels,
   makeOmpAcpRuntime,
   OMP_MODEL_CONFIG_ID,
   OMP_THINKING_CONFIG_ID,
@@ -50,7 +53,7 @@ const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
 // development machine. Keep the availability probe bounded, but do not hide
 // the entire model catalog because a cold `omp --version` crossed four seconds.
 const VERSION_PROBE_TIMEOUT_MS = 15_000;
-const OMP_ACP_MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
+export const OMP_ACP_MODEL_DISCOVERY_TIMEOUT_MS = 30_000;
 
 export function buildInitialOmpProviderSnapshot(
   ompSettings: OmpSettings,
@@ -93,6 +96,7 @@ export function buildInitialOmpProviderSnapshot(
 
 export function buildOmpDiscoveredModelsFromConfigOptions(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption> | null | undefined,
+  environment?: NodeJS.ProcessEnv,
 ): ReadonlyArray<ServerProviderModel> {
   const modelOption = configOptions?.find(
     (option) => option.id === OMP_MODEL_CONFIG_ID && option.type === "select",
@@ -151,10 +155,40 @@ export function buildOmpDiscoveredModelsFromConfigOptions(
       };
     })
     .filter((model): model is ServerProviderModel => model !== undefined);
-  return filterAshlerOmpModels(discoveredModels);
+  const policy = environment ? configuredManagedScaffoldOmpModels(environment) : null;
+  const policyFilteredModels = policy
+    ? discoveredModels
+        .filter((model) => policy.allowedModels.includes(model.slug))
+        .map((model) => ({
+          ...model,
+          ...(model.slug === policy.model ? { isDefault: true } : { isDefault: undefined }),
+        }))
+    : discoveredModels;
+  // A managed Scaffold runtime's exact launch grant is authoritative even when
+  // it is newer than the static local model policy bundled with this T3 build.
+  // Local catalogs remain policy-filtered so arbitrary OMP routes do not appear.
+  return policy ? policyFilteredModels : filterAshlerOmpModels(policyFilteredModels);
 }
 
-const discoverOmpCatalogViaAcp = (
+type OmpDiscoveredCatalog = {
+  readonly models: ReadonlyArray<ServerProviderModel>;
+  readonly skills: ServerProvider["skills"];
+};
+
+class OmpCatalogDiscoveryError extends Data.TaggedError("OmpCatalogDiscoveryError")<{
+  readonly cause: unknown;
+}> {}
+
+type OmpCatalogDiscovery = (
+  ompSettings: OmpSettings,
+  environment?: NodeJS.ProcessEnv,
+) => Effect.Effect<
+  OmpDiscoveredCatalog,
+  OmpCatalogDiscoveryError,
+  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto | Scope.Scope
+>;
+
+const discoverOmpCatalogViaAcp: OmpCatalogDiscovery = (
   ompSettings: OmpSettings,
   environment: NodeJS.ProcessEnv = process.env,
 ) =>
@@ -173,10 +207,13 @@ const discoverOmpCatalogViaAcp = (
       Effect.map(Option.getOrElse(() => [])),
     );
     return {
-      models: buildOmpDiscoveredModelsFromConfigOptions(started.sessionSetupResult.configOptions),
+      models: buildOmpDiscoveredModelsFromConfigOptions(
+        started.sessionSetupResult.configOptions,
+        environment,
+      ),
       skills: buildOmpSkillsFromAvailableCommands(availableCommands),
     };
-  }).pipe(Effect.scoped);
+  }).pipe(Effect.mapError((cause) => new OmpCatalogDiscoveryError({ cause })));
 
 const runOmpVersionCommand = (
   ompSettings: OmpSettings,
@@ -199,6 +236,7 @@ const runOmpVersionCommand = (
 export const checkOmpProviderStatus = Effect.fn("checkOmpProviderStatus")(function* (
   ompSettings: OmpSettings,
   environment: NodeJS.ProcessEnv = process.env,
+  discoverCatalog: OmpCatalogDiscovery = discoverOmpCatalogViaAcp,
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
@@ -291,7 +329,8 @@ export const checkOmpProviderStatus = Effect.fn("checkOmpProviderStatus")(functi
     });
   }
 
-  const discoveryExit = yield* discoverOmpCatalogViaAcp(ompSettings, environment).pipe(
+  const discoveryExit = yield* discoverCatalog(ompSettings, environment).pipe(
+    Effect.scoped,
     Effect.timeoutOption(OMP_ACP_MODEL_DISCOVERY_TIMEOUT_MS),
     Effect.exit,
   );

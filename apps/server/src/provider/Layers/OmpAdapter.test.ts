@@ -835,6 +835,108 @@ it.layer(testLayer)("OmpAdapter", (it) => {
     }),
   );
 
+  it.effect("rejects an active Scaffold model outside the launch-time allowlist", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("omp-scaffold-model-policy");
+      const requestLogPath = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "omp-acp-scaffold-policy-log-")).then(
+          (dir) => NodePath.join(dir, "requests.ndjson"),
+        ),
+      );
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockOmpWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_OMP_CONFIG_OPTIONS: "1",
+        }),
+      );
+      const adapter = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }), {
+        environment: {
+          ...process.env,
+          SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+          OMP_AGENT_MODEL: "openai/gpt-5.6",
+          OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6,anthropic/claude-sonnet-5",
+        },
+      });
+
+      const error = yield* Effect.flip(
+        adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("omp"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("omp"),
+            model: "anthropic/claude-sonnet-5",
+          },
+        }),
+      );
+
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag === "ProviderAdapterValidationError") {
+        assert.equal(error.operation, "startSession/model-policy");
+        assert.include(error.issue, 'Model "anthropic/claude-sonnet-5" is not allowed');
+      }
+      const requestLog = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
+      assert.notInclude(requestLog, '"method":"session/set_config_option"');
+    }),
+  );
+
+  it.effect("rejects a managed mid-session model switch outside the launch allowlist", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("omp-scaffold-model-switch-policy");
+      const requestLogPath = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "omp-acp-scaffold-switch-log-")).then(
+          (dir) => NodePath.join(dir, "requests.ndjson"),
+        ),
+      );
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockOmpWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_OMP_CONFIG_OPTIONS: "1",
+        }),
+      );
+      const adapter = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }), {
+        environment: {
+          ...process.env,
+          SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+          OMP_AGENT_MODEL: "openai/gpt-5.6",
+          OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6,anthropic/claude-sonnet-5",
+        },
+      });
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("omp"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("omp"),
+          model: "openai/gpt-5.6",
+        },
+      });
+      yield* Effect.promise(() => NodeFSP.writeFile(requestLogPath, "", "utf8"));
+
+      const error = yield* Effect.flip(
+        adapter.sendTurn({
+          threadId,
+          input: "try a forbidden model",
+          attachments: [],
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("omp"),
+            model: "anthropic/claude-sonnet-5",
+          },
+        }),
+      );
+
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      if (error._tag === "ProviderAdapterValidationError") {
+        assert.equal(error.operation, "sendTurn/model-policy");
+      }
+      const requestLog = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
+      assert.notInclude(requestLog, '"method":"session/set_config_option"');
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("routes a mid-turn text send through OMP native steering", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("omp-native-steer");

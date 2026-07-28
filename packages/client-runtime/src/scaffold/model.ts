@@ -1,4 +1,11 @@
-import { EnvironmentId, NonNegativeInt, TrimmedNonEmptyString } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  type ModelSelection,
+  NonNegativeInt,
+  ProjectId,
+  ScaffoldAgentEffort,
+  TrimmedNonEmptyString,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 export const ScaffoldDeployment = Schema.Literals(["staging", "production"]);
@@ -47,7 +54,46 @@ export class ScaffoldCreateParameters extends Schema.Class<ScaffoldCreateParamet
   sourceRef: Schema.optionalKey(TrimmedNonEmptyString),
   snapshotId: Schema.optionalKey(TrimmedNonEmptyString),
   name: Schema.optionalKey(TrimmedNonEmptyString),
+  modelRouteId: Schema.optionalKey(TrimmedNonEmptyString),
+  agentEffort: Schema.optionalKey(ScaffoldAgentEffort),
 }) {}
+
+const SCAFFOLD_AGENT_EFFORTS = new Set<string>(ScaffoldAgentEffort.literals);
+
+/**
+ * Converts an OMP catalog selection into the logical route granted when the
+ * Scaffold sandbox is created. The route is durable, but contains no account
+ * credential or provider grant.
+ */
+export function scaffoldCreateParametersForModelSelection(
+  selection: ModelSelection,
+): Pick<ScaffoldCreateParameters, "modelRouteId" | "agentEffort"> | null {
+  if (selection.instanceId !== "omp") return null;
+
+  const [provider, ...modelSegments] = selection.model.trim().split("/");
+  const model = modelSegments.join("/");
+  if (!provider || !model) return null;
+  const modelRouteId =
+    provider === "openai" || provider === "openai-codex"
+      ? `scaffold-openai/${model}`
+      : provider === "anthropic" || provider === "ashler"
+        ? `${provider}/${model}`
+        : null;
+  if (modelRouteId === null) return null;
+
+  const effort = selection.options?.find(
+    (option) =>
+      option.id === "reasoningEffort" || option.id === "reasoning_effort" || option.id === "effort",
+  )?.value;
+  const agentEffort =
+    typeof effort === "string" && SCAFFOLD_AGENT_EFFORTS.has(effort)
+      ? (effort as ScaffoldAgentEffort)
+      : undefined;
+  return {
+    modelRouteId,
+    ...(agentEffort ? { agentEffort } : {}),
+  };
+}
 
 const ScaffoldLifecycleActionBase = {
   actionId: TrimmedNonEmptyString,
@@ -68,6 +114,12 @@ export class ScaffoldCreateLifecycleAction extends Schema.Class<ScaffoldCreateLi
 )({
   ...ScaffoldLifecycleActionBase,
   kind: Schema.Literal("create"),
+  // Optional only so persisted pre-target actions can still be decoded and
+  // quarantined. Every newly constructed create action must supply a target.
+  deployment: Schema.optionalKey(ScaffoldDeployment),
+  draftId: Schema.optionalKey(TrimmedNonEmptyString),
+  sourceEnvironmentId: Schema.optionalKey(EnvironmentId),
+  sourceProjectId: Schema.optionalKey(ProjectId),
   create: ScaffoldCreateParameters,
 }) {}
 

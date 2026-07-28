@@ -7,7 +7,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { requestScaffoldPreparedConnection } from "./scaffold";
+import { DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS, requestScaffoldPreparedConnection } from "./scaffold";
 
 const prepared = new ScaffoldPreparedConnection({
   binding: new ScaffoldEnvironmentBinding({
@@ -31,6 +31,10 @@ const prepared = new ScaffoldPreparedConnection({
 });
 
 describe("Scaffold connection lifecycle client", () => {
+  it("keeps the browser deadline above the server readiness window", () => {
+    expect(DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS).toBeGreaterThan(60_000);
+  });
+
   it("uses only the local lifecycle route and returns ephemeral authority in memory", async () => {
     const calls: Array<readonly [RequestInfo | URL, RequestInit | undefined]> = [];
     const fetchMock = async (request: RequestInfo | URL, init?: RequestInit) => {
@@ -60,5 +64,29 @@ describe("Scaffold connection lifecycle client", () => {
     expect(init).toMatchObject({ method: "POST", credentials: "include" });
     expect(String(init?.body)).toContain('"operationId":"operation-1"');
     expect(String(init?.body)).not.toContain("one-time-bootstrap");
+  });
+
+  it("aborts a hung local lifecycle request at the configured deadline", async () => {
+    const input = new ScaffoldCreateAndPrepareInput({
+      deployment: "staging",
+      operationId: "operation-hung",
+      create: {},
+    });
+    const hangingFetch = async (_request: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+
+    await expect(
+      requestScaffoldPreparedConnection(
+        input,
+        hangingFetch,
+        "http://127.0.0.1:3773/api/scaffold/connection",
+        5,
+      ),
+    ).rejects.toMatchObject({
+      reason: "network",
+      code: "scaffold_local_network_error",
+    });
   });
 });

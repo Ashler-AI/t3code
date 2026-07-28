@@ -58,4 +58,53 @@ describe("OmpLoginChallengePanel", () => {
 
     expect(markup).not.toContain("Open sign-in");
   });
+
+  it("keeps a manual sign-in fallback visible during browser-only long polling", () => {
+    const markup = renderToStaticMarkup(
+      <OmpLoginChallengePanel
+        challenge={null}
+        authorizationProvider="openai"
+        authorizationFlowId="login_browser"
+        authorizationUrl="https://accounts.example.test/oauth"
+        onSubmit={() => undefined}
+        onCancel={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("Finish adding ChatGPT");
+    expect(markup).toContain("blocked or closed");
+    expect(markup).toContain("Open sign-in");
+    expect(markup).toContain("Cancel");
+    expect(markup).toContain('href="https://accounts.example.test/oauth"');
+    expect(markup).not.toContain("Redirect URL or code");
+  });
+
+  it("never renders an unsafe authorization URL as a fallback link", () => {
+    const browserOnlyMarkup = renderToStaticMarkup(
+      <OmpLoginChallengePanel
+        challenge={null}
+        authorizationProvider="openai"
+        authorizationFlowId="login_unsafe"
+        authorizationUrl="javascript:alert(1)"
+        onSubmit={() => undefined}
+        onCancel={() => undefined}
+      />,
+    );
+    const inputMarkup = renderToStaticMarkup(
+      <OmpLoginChallengePanel
+        challenge={{
+          flowId: "login_unsafe",
+          provider: "openai",
+          kind: "input",
+        }}
+        authorizationUrl="http://accounts.example.test/oauth"
+        onSubmit={() => undefined}
+        onCancel={() => undefined}
+      />,
+    );
+
+    expect(browserOnlyMarkup).toBe("");
+    expect(inputMarkup).not.toContain("Open sign-in");
+    expect(inputMarkup).not.toContain("accounts.example.test");
+  });
 });

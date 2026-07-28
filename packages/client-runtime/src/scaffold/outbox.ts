@@ -1,9 +1,12 @@
+import type { ProjectId, ScaffoldAgentEffort } from "@t3tools/contracts";
+
 import {
   ScaffoldCreateLifecycleAction,
   ScaffoldCreateParameters,
   ScaffoldLifecycleAction,
   ScaffoldPauseLifecycleAction,
   ScaffoldResumeLifecycleAction,
+  type ScaffoldDeployment,
   type ScaffoldLifecycleActionKind,
 } from "./model.ts";
 
@@ -55,7 +58,14 @@ export function makeScaffoldLifecycleOutbox(options: ScaffoldLifecycleOutboxOpti
   const drainOnce = async (): Promise<void> => {
     const pending = [...(await withStoreLock(() => options.store.list()))].sort(byCreationOrder);
     for (const action of pending) {
-      if (action.blocked) continue;
+      if (action.blocked) {
+        // The UI projection is persisted separately from this outbox. Re-emit
+        // terminal state after a reload so a blocked create cannot remain as
+        // an indefinitely "Connecting" draft when the original callback was
+        // interrupted before the projection committed.
+        options.onBlocked?.(action);
+        continue;
+      }
       if (action.nextAttemptAt !== null && action.nextAttemptAt > now()) continue;
       let result: ScaffoldOutboxExecutionResult;
       try {
@@ -137,13 +147,23 @@ type MakeScaffoldLifecycleActionInput = MakeScaffoldLifecycleActionBase &
   (
     | {
         readonly kind: "create";
+        readonly deployment: ScaffoldDeployment;
+        readonly draftId: string;
+        readonly sourceEnvironmentId: ScaffoldLifecycleAction["environmentId"];
+        readonly sourceProjectId: ProjectId;
         readonly create?: {
           readonly sourceRef?: string;
           readonly snapshotId?: string;
           readonly name?: string;
+          readonly modelRouteId?: string;
+          readonly agentEffort?: ScaffoldAgentEffort;
         };
       }
-    | { readonly kind: Exclude<ScaffoldLifecycleActionKind, "create">; readonly create?: never }
+    | {
+        readonly kind: Exclude<ScaffoldLifecycleActionKind, "create">;
+        readonly deployment?: never;
+        readonly create?: never;
+      }
   );
 
 export function makeScaffoldLifecycleAction(
@@ -166,6 +186,10 @@ export function makeScaffoldLifecycleAction(
       return new ScaffoldCreateLifecycleAction({
         ...fields,
         kind: "create",
+        deployment: input.deployment,
+        draftId: input.draftId,
+        sourceEnvironmentId: input.sourceEnvironmentId,
+        sourceProjectId: input.sourceProjectId,
         create: new ScaffoldCreateParameters(input.create ?? {}),
       });
     case "resume":

@@ -1,5 +1,5 @@
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type { EnvironmentId, ScaffoldDeployment, ThreadId } from "@t3tools/contracts";
 import {
   ChevronDownIcon,
   CloudIcon,
@@ -23,7 +23,10 @@ import {
   resolveLockedWorkspaceLabel,
   resolvePreviousWorktreeLabel,
   resolvePreviousWorktreeSeed,
+  resolveScaffoldDraftTargetPresentation,
+  shouldRenderBranchToolbar,
   shouldShowEnvironmentIndicator,
+  type ScaffoldDraftPhase,
 } from "./BranchToolbar.logic";
 import { BranchToolbarBranchSelector } from "./BranchToolbarBranchSelector";
 import { BranchToolbarEnvironmentSelector } from "./BranchToolbarEnvironmentSelector";
@@ -56,6 +59,14 @@ interface BranchToolbarProps {
   onComposerFocusRequest?: () => void;
   availableEnvironments?: readonly EnvironmentOption[];
   onEnvironmentChange?: (environmentId: EnvironmentId) => void;
+  scaffoldDraftTarget?: {
+    deployment: ScaffoldDeployment;
+    phase: ScaffoldDraftPhase;
+    replacementRequired?: boolean;
+  };
+  scaffoldDraftRetrying?: boolean;
+  onRetryScaffoldDraft?: () => void;
+  onReplaceScaffoldDraft?: () => void;
 }
 
 interface MobileRunContextSelectorProps {
@@ -229,6 +240,10 @@ export const BranchToolbar = memo(function BranchToolbar({
   onComposerFocusRequest,
   availableEnvironments,
   onEnvironmentChange,
+  scaffoldDraftTarget,
+  scaffoldDraftRetrying = false,
+  onRetryScaffoldDraft,
+  onReplaceScaffoldDraft,
 }: BranchToolbarProps) {
   const threadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
@@ -299,13 +314,54 @@ export const BranchToolbar = memo(function BranchToolbar({
     activeEnvironment: activeEnvironmentOption,
     canPickEnvironment: showEnvironmentPicker,
   });
+  const scaffoldDraftPresentation = scaffoldDraftTarget
+    ? resolveScaffoldDraftTargetPresentation(scaffoldDraftTarget)
+    : null;
+  const scaffoldDraftAction = scaffoldDraftTarget?.replacementRequired
+    ? onReplaceScaffoldDraft
+    : onRetryScaffoldDraft;
   const isMobile = useIsMobile();
 
-  if (!hasActiveThread || !activeProject) return null;
+  if (
+    !shouldRenderBranchToolbar({
+      hasActiveThread,
+      hasActiveProject: activeProject !== null,
+      hasScaffoldDraftTarget: scaffoldDraftPresentation !== null,
+    })
+  ) {
+    return null;
+  }
 
   return (
     <div className="chat-composer-context-strip -mt-4 mx-auto flex w-[calc(100%-2.75rem)] max-w-[calc(48rem-2.75rem)] items-center gap-2 px-1 pt-5 pb-1">
-      {isMobile ? (
+      {scaffoldDraftPresentation ? (
+        <span
+          data-scaffold-draft-target="true"
+          className="inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded px-2 text-sm font-medium text-muted-foreground/70"
+        >
+          <CloudIcon className="size-3 shrink-0" />
+          <span className="min-w-0 truncate">{scaffoldDraftPresentation.targetLabel}</span>
+          <span
+            className={
+              scaffoldDraftTarget?.phase === "failed" ? "text-destructive" : "text-muted-foreground"
+            }
+          >
+            {scaffoldDraftPresentation.statusLabel}
+          </span>
+          {scaffoldDraftPresentation.actionLabel && scaffoldDraftAction ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              disabled={scaffoldDraftRetrying}
+              onClick={scaffoldDraftAction}
+              className="ml-0.5 h-6 px-1.5"
+            >
+              {scaffoldDraftRetrying ? "Retrying" : scaffoldDraftPresentation.actionLabel}
+            </Button>
+          ) : null}
+        </span>
+      ) : isMobile ? (
         <MobileRunContextSelector
           envLocked={envLocked}
           envModeLocked={envModeLocked}
@@ -344,20 +400,22 @@ export const BranchToolbar = memo(function BranchToolbar({
         </div>
       )}
 
-      <BranchToolbarBranchSelector
-        className="min-w-0 flex-1 justify-end md:ml-auto md:flex-none"
-        environmentId={environmentId}
-        threadId={threadId}
-        {...(draftId ? { draftId } : {})}
-        envLocked={envLocked}
-        {...(effectiveEnvModeOverride ? { effectiveEnvModeOverride } : {})}
-        {...(activeThreadBranchOverride !== undefined ? { activeThreadBranchOverride } : {})}
-        {...(onActiveThreadBranchOverrideChange ? { onActiveThreadBranchOverrideChange } : {})}
-        startFromOrigin={startFromOrigin}
-        onStartFromOriginChange={onStartFromOriginChange}
-        {...(onCheckoutPullRequestRequest ? { onCheckoutPullRequestRequest } : {})}
-        {...(onComposerFocusRequest ? { onComposerFocusRequest } : {})}
-      />
+      {activeProject ? (
+        <BranchToolbarBranchSelector
+          className="min-w-0 flex-1 justify-end md:ml-auto md:flex-none"
+          environmentId={environmentId}
+          threadId={threadId}
+          {...(draftId ? { draftId } : {})}
+          envLocked={envLocked}
+          {...(effectiveEnvModeOverride ? { effectiveEnvModeOverride } : {})}
+          {...(activeThreadBranchOverride !== undefined ? { activeThreadBranchOverride } : {})}
+          {...(onActiveThreadBranchOverrideChange ? { onActiveThreadBranchOverrideChange } : {})}
+          startFromOrigin={startFromOrigin}
+          onStartFromOriginChange={onStartFromOriginChange}
+          {...(onCheckoutPullRequestRequest ? { onCheckoutPullRequestRequest } : {})}
+          {...(onComposerFocusRequest ? { onComposerFocusRequest } : {})}
+        />
+      ) : null}
     </div>
   );
 });

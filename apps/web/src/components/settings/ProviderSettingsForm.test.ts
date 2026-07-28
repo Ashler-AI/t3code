@@ -22,6 +22,13 @@ describe("ProviderSettingsForm helpers", () => {
     ]);
   });
 
+  it("distinguishes optional native harnesses from OMP-backed accounts", () => {
+    expect(DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("codex")]?.label).toBe("Codex CLI");
+    expect(DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("claudeAgent")]?.label).toBe(
+      "Claude Code",
+    );
+  });
+
   it("derives visible provider config fields from the client definition schema", () => {
     const codex = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("codex")];
 

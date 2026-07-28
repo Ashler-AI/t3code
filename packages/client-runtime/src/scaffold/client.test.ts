@@ -18,6 +18,32 @@ function jsonResponse(body: unknown, status = 200, headers?: HeadersInit): Respo
 }
 
 describe("Scaffold control-plane client", () => {
+  it("sends the model-bound create grant with the durable operation", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const client = makeScaffoldControlPlaneClient({
+      deployment: "staging",
+      baseUrl: "https://scaffold.example.com",
+      fetch: async (_input, init) => {
+        requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return jsonResponse({ sessionId: "session-1", status: "creating", lifecycleEpoch: 0 });
+      },
+    });
+
+    await client.createSession({
+      sessionId: "session-1",
+      operationId: "operation-1",
+      modelRouteId: "scaffold-openai/gpt-5.6-sol",
+      agentEffort: "high",
+    });
+
+    expect(requestBody).toMatchObject({
+      id: "session-1",
+      operationId: "operation-1",
+      modelRouteId: "scaffold-openai/gpt-5.6-sol",
+      agentEffort: "high",
+    });
+  });
+
   it("strictly parses sessionId, known status, and a safe non-negative epoch", () => {
     expect(
       parseScaffoldSessionObservation({

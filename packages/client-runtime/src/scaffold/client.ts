@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, type ScaffoldAgentEffort } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
@@ -48,6 +48,8 @@ export interface ScaffoldCreateSessionInput {
   readonly sourceRef?: string;
   readonly snapshotId?: string;
   readonly name?: string;
+  readonly modelRouteId?: string;
+  readonly agentEffort?: ScaffoldAgentEffort;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -269,6 +271,8 @@ export function makeScaffoldControlPlaneClient(options: ScaffoldControlPlaneClie
           ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
           ...(input.snapshotId ? { snapshotId: input.snapshotId } : {}),
           ...(input.name ? { name: input.name } : {}),
+          ...(input.modelRouteId ? { modelRouteId: input.modelRouteId } : {}),
+          ...(input.agentEffort ? { agentEffort: input.agentEffort } : {}),
         }),
       });
       const observation = parseScaffoldSessionObservation(body);

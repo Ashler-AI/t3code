@@ -19,6 +19,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -31,6 +32,7 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeClaudeAdapter } from "../Layers/ClaudeAdapter.ts";
 import {
   checkClaudeProviderStatus,
+  CLAUDE_CAPABILITIES_PROBE_TIMED_OUT,
   makePendingClaudeProvider,
   probeClaudeCapabilities,
 } from "../Layers/ClaudeProvider.ts";
@@ -55,6 +57,7 @@ import {
   type ProviderSnapshotSettings,
 } from "../providerUpdateSettings.ts";
 import { makeClaudeCapabilitiesCacheKey, makeClaudeContinuationGroupKey } from "./ClaudeHome.ts";
+import { loadVerifiedCachedProviderSnapshot } from "./cachedProviderSnapshot.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -111,7 +114,7 @@ const withInstanceIdentity =
 export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
   driverKind: DRIVER_KIND,
   metadata: {
-    displayName: "Claude",
+    displayName: "Claude Code",
     supportsMultipleInstances: true,
   },
   configSchema: ClaudeSettings,
@@ -121,7 +124,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
-      const { cwd } = yield* ServerConfig;
+      const { cwd, providerStatusCacheDir } = yield* ServerConfig;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
@@ -162,14 +165,41 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
           ),
       });
       const capabilitiesCacheKey = yield* makeClaudeCapabilitiesCacheKey(effectiveConfig, cwd);
+      const resolveCapabilities = () =>
+        Cache.get(capabilitiesProbeCache, capabilitiesCacheKey).pipe(
+          // Do not pin a typed timeout for the full five-minute success TTL;
+          // the next serialized provider refresh should be allowed to retry.
+          Effect.tap((capabilities) =>
+            capabilities === CLAUDE_CAPABILITIES_PROBE_TIMED_OUT
+              ? Cache.invalidate(capabilitiesProbeCache, capabilitiesCacheKey)
+              : Effect.void,
+          ),
+        );
 
-      const checkProvider = checkClaudeProviderStatus(
-        effectiveConfig,
-        () => Cache.get(capabilitiesProbeCache, capabilitiesCacheKey),
-        processEnv,
-        cwd,
-      ).pipe(
+      const pendingSnapshot = yield* makePendingClaudeProvider(effectiveConfig).pipe(
         Effect.map(stampIdentity),
+      );
+      const cachedSnapshot = yield* loadVerifiedCachedProviderSnapshot({
+        cacheDir: providerStatusCacheDir,
+        instanceId,
+        fallbackProvider: pendingSnapshot,
+      });
+      const previousSnapshotRef = yield* Ref.make<ServerProviderDraft | undefined>(cachedSnapshot);
+      const checkProvider = Effect.gen(function* () {
+        const previousSnapshot = yield* Ref.get(previousSnapshotRef);
+        const nextSnapshot = yield* checkClaudeProviderStatus(
+          effectiveConfig,
+          resolveCapabilities,
+          processEnv,
+          cwd,
+          previousSnapshot,
+        );
+        yield* Ref.set(
+          previousSnapshotRef,
+          nextSnapshot.status === "ready" ? nextSnapshot : undefined,
+        );
+        return stampIdentity(nextSnapshot);
+      }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
@@ -182,7 +212,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
-          makePendingClaudeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
+          cachedSnapshot
+            ? Effect.succeed(cachedSnapshot)
+            : makePendingClaudeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
           enrichProviderSnapshotWithVersionAdvisory(snapshot, maintenanceCapabilities, {

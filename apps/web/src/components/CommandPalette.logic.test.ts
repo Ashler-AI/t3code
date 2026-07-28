@@ -9,6 +9,8 @@ import {
   filterCommandPaletteGroups,
   reduceCommandPaletteUiState,
   getCommandPaletteInputPlaceholder,
+  getScaffoldNewSessionActionPresentation,
+  runScaffoldDraftLaunch,
   shouldRefreshOmpOverviewOnOpen,
   type CommandPaletteActionItem,
   type CommandPaletteGroup,
@@ -201,6 +203,78 @@ describe("Ashler command palette root", () => {
     expect(shouldRefreshOmpOverviewOnOpen({ cacheHydrated: true, hasEnvironment: false })).toBe(
       false,
     );
+  });
+
+  it("requires a contextual project before offering Scaffold session creation", () => {
+    expect(getScaffoldNewSessionActionPresentation({ hasContextualProject: false })).toEqual({
+      disabled: true,
+      description: "Add or open a local project first",
+    });
+    expect(getScaffoldNewSessionActionPresentation({ hasContextualProject: true })).toEqual({
+      disabled: false,
+      description: "New Scaffold sandbox",
+    });
+  });
+});
+
+describe("runScaffoldDraftLaunch", () => {
+  it("projects and persists the exact target before the draft becomes visible", async () => {
+    const events: string[] = [];
+    await runScaffoldDraftLaunch({
+      createDraft: async (prepareBeforeNavigation) => {
+        events.push("draft:created");
+        await prepareBeforeNavigation("draft-production");
+        events.push("draft:navigated");
+      },
+      createAction: (draftId) => ({ draftId, deployment: "production" as const }),
+      showCreating: (_draftId, action) => events.push(`ui:${action.deployment}:creating`),
+      persistAction: async (action) => {
+        events.push(`outbox:${action.deployment}:persisted`);
+      },
+      actionPersisted: () => events.push("ui:volatile-cleared"),
+      showFailure: () => events.push("ui:failed"),
+      requestDrain: (action) => events.push(`outbox:${action.deployment}:drain`),
+    });
+
+    expect(events).toEqual([
+      "draft:created",
+      "ui:production:creating",
+      "outbox:production:persisted",
+      "ui:volatile-cleared",
+      "outbox:production:drain",
+      "draft:navigated",
+    ]);
+  });
+
+  it("navigates to a target-labelled failed draft when the first durable write fails", async () => {
+    const events: string[] = [];
+    await expect(
+      runScaffoldDraftLaunch({
+        createDraft: async (prepareBeforeNavigation) => {
+          events.push("draft:created");
+          await prepareBeforeNavigation("draft-staging");
+          events.push("draft:navigated");
+        },
+        createAction: (draftId) => ({ draftId, deployment: "staging" as const }),
+        showCreating: (_draftId, action) => events.push(`ui:${action.deployment}:creating`),
+        persistAction: async () => {
+          events.push("outbox:write-failed");
+          throw new Error("IndexedDB unavailable");
+        },
+        actionPersisted: () => events.push("ui:volatile-cleared"),
+        showFailure: (_draftId, error) =>
+          events.push(`ui:staging:failed:${error instanceof Error ? error.message : "unknown"}`),
+        requestDrain: () => events.push("outbox:drain"),
+      }),
+    ).rejects.toThrow("IndexedDB unavailable");
+
+    expect(events).toEqual([
+      "draft:created",
+      "ui:staging:creating",
+      "outbox:write-failed",
+      "ui:staging:failed:IndexedDB unavailable",
+      "draft:navigated",
+    ]);
   });
 });
 

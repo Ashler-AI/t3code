@@ -10,9 +10,35 @@ export const resolveCodexLaunchArgs = (
 export const codexLaunchArgv = (launchArgs?: string): ReadonlyArray<string> =>
   tokenizeCliArgs(launchArgs);
 
+const codexAppServerLaunchArgs = (launchArgs?: string): ReadonlyArray<string> => {
+  const args = codexLaunchArgv(launchArgs);
+  const normalized: Array<string> = [];
+
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === undefined) continue;
+
+    // T3 owns the child process over stdio. Newer Codex builds default
+    // `app-server` to their remote-control transport, while passing two
+    // `--listen` flags is rejected. Remove any configured override before
+    // installing the transport required by the provider protocol.
+    if (arg === "--listen") {
+      if (args[index + 1] !== undefined) index++;
+      continue;
+    }
+    if (arg.startsWith("--listen=")) continue;
+
+    normalized.push(arg);
+  }
+
+  return normalized;
+};
+
 export const codexAppServerArgs = (launchArgs?: string) => [
   "app-server",
-  ...codexLaunchArgv(launchArgs),
+  "--listen",
+  "stdio://",
+  ...codexAppServerLaunchArgs(launchArgs),
 ];
 
 export const codexExecLaunchArgs = (launchArgs?: string) => {

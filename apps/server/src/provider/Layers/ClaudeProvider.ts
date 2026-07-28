@@ -32,7 +32,6 @@ import {
   buildBooleanOptionDescriptor,
   buildSelectOptionDescriptor,
   buildServerProvider,
-  DEFAULT_TIMEOUT_MS,
   isCommandMissingCause,
   parseGenericCliVersion,
   providerModelsFromSettings,
@@ -48,7 +47,7 @@ const DEFAULT_CLAUDE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabili
 });
 
 const CLAUDE_PRESENTATION = {
-  displayName: "Claude",
+  displayName: "Claude Code",
   showInteractionModeToggle: true,
 } as const;
 const MINIMUM_CLAUDE_OPUS_5_VERSION = "2.1.219";
@@ -560,7 +559,12 @@ function apiProviderAuthMetadata(
 // Bedrock backend and runs the `awsAuthRefresh` credential hook before returning
 // account info. The previous 8s budget expired mid-init, so the probe returned
 // `undefined` and left the provider unverified and unselectable in the picker.
-const CAPABILITIES_PROBE_TIMEOUT_MS = 25_000;
+/** Cold Claude Code startup includes local config and account initialization. */
+export const CLAUDE_CAPABILITIES_PROBE_TIMEOUT_MS = 30_000;
+/** Keep the lightweight version child bounded without the old four-second false negative. */
+export const CLAUDE_VERSION_PROBE_TIMEOUT_MS = 30_000;
+export const CLAUDE_STALE_CATALOG_MESSAGE =
+  "Claude Code status refresh timed out. Using the last verified account and model catalog.";
 
 /**
  * Keep workspace-scoped command discovery intact while isolating the periodic
@@ -617,6 +621,12 @@ type ClaudeCapabilitiesProbe = {
   readonly apiProvider: string | undefined;
   readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
 };
+
+export const CLAUDE_CAPABILITIES_PROBE_TIMED_OUT = Symbol("ClaudeCapabilitiesProbeTimedOut");
+type ClaudeCapabilitiesProbeResolution =
+  | ClaudeCapabilitiesProbe
+  | typeof CLAUDE_CAPABILITIES_PROBE_TIMED_OUT
+  | undefined;
 
 function parseClaudeInitializationCommands(
   commands: ReadonlyArray<ClaudeSlashCommand> | undefined,
@@ -691,6 +701,32 @@ function waitForAbortSignal(signal: AbortSignal): Promise<void> {
 }
 
 /**
+ * Claude's native installer places its launcher in `~/.local/bin`, which is
+ * commonly absent from GUI-app PATH values on macOS. Resolve that documented
+ * per-user launcher before falling back to normal PATH lookup. Explicit
+ * configured paths and alternate command names remain untouched.
+ */
+export const resolveClaudeProbeBinaryPath = Effect.fn("resolveClaudeProbeBinaryPath")(function* (
+  binaryPath: string,
+  environment: NodeJS.ProcessEnv,
+): Effect.fn.Return<string, never, FileSystem.FileSystem | Path.Path> {
+  if (binaryPath !== "claude") {
+    return binaryPath;
+  }
+  const homePath = environment.HOME?.trim();
+  if (!homePath) {
+    return binaryPath;
+  }
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const nativeLauncher = path.join(homePath, ".local", "bin", "claude");
+  const nativeLauncherExists = yield* fileSystem
+    .exists(nativeLauncher)
+    .pipe(Effect.orElseSucceed(() => false));
+  return nativeLauncherExists ? nativeLauncher : binaryPath;
+});
+
+/**
  * Probe account information by spawning a lightweight Claude Agent SDK
  * session and reading the initialization result.
  *
@@ -711,8 +747,12 @@ const probeClaudeCapabilities = (
   const abort = new AbortController();
   return Effect.gen(function* () {
     const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, environment);
-    const executablePath = yield* resolveClaudeSdkExecutablePath(
+    const probeBinaryPath = yield* resolveClaudeProbeBinaryPath(
       claudeSettings.binaryPath,
+      claudeEnvironment,
+    );
+    const executablePath = yield* resolveClaudeSdkExecutablePath(
+      probeBinaryPath,
       claudeEnvironment,
     );
     return yield* Effect.tryPromise(async () => {
@@ -753,11 +793,13 @@ const probeClaudeCapabilities = (
         if (!abort.signal.aborted) abort.abort();
       }),
     ),
-    Effect.timeoutOption(CAPABILITIES_PROBE_TIMEOUT_MS),
+    Effect.timeoutOption(CLAUDE_CAPABILITIES_PROBE_TIMEOUT_MS),
     Effect.result,
-    Effect.map((result) => {
+    Effect.map((result): ClaudeCapabilitiesProbeResolution => {
       if (Result.isFailure(result)) return undefined;
-      return Option.isSome(result.success) ? result.success.value : undefined;
+      return Option.isSome(result.success)
+        ? result.success.value
+        : CLAUDE_CAPABILITIES_PROBE_TIMED_OUT;
     }),
   );
 };
@@ -768,23 +810,28 @@ const runClaudeCommand = Effect.fn("runClaudeCommand")(function* (
   environment?: NodeJS.ProcessEnv,
 ) {
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, environment);
-  const spawnCommand = yield* resolveSpawnCommand(claudeSettings.binaryPath, args, {
+  const probeBinaryPath = yield* resolveClaudeProbeBinaryPath(
+    claudeSettings.binaryPath,
+    claudeEnvironment,
+  );
+  const spawnCommand = yield* resolveSpawnCommand(probeBinaryPath, args, {
     env: claudeEnvironment,
   });
   const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
     env: claudeEnvironment,
     shell: spawnCommand.shell,
   });
-  return yield* spawnAndCollect(claudeSettings.binaryPath, command);
+  return yield* spawnAndCollect(probeBinaryPath, command);
 });
 
 export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(function* (
   claudeSettings: ClaudeSettings,
   resolveCapabilities?: (
     claudeSettings: ClaudeSettings,
-  ) => Effect.Effect<ClaudeCapabilitiesProbe | undefined>,
+  ) => Effect.Effect<ClaudeCapabilitiesProbeResolution>,
   environment?: NodeJS.ProcessEnv,
   cwd?: string,
+  previousSnapshot?: ServerProviderDraft,
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
@@ -809,7 +856,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Claude is disabled in T3 Code settings.",
+        message: "The optional Claude Code harness is disabled in T3 Code settings.",
       },
     });
   }
@@ -818,7 +865,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
     claudeSettings,
     ["--version"],
     resolvedEnvironment,
-  ).pipe(Effect.timeoutOption(DEFAULT_TIMEOUT_MS), Effect.result);
+  ).pipe(Effect.timeoutOption(CLAUDE_VERSION_PROBE_TIMEOUT_MS), Effect.result);
 
   if (Result.isFailure(versionProbe)) {
     const error = versionProbe.failure;
@@ -843,6 +890,13 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   }
 
   if (Option.isNone(versionProbe.success)) {
+    if (previousSnapshot?.status === "ready" && previousSnapshot.models.length > 0) {
+      return {
+        ...previousSnapshot,
+        checkedAt,
+        message: CLAUDE_STALE_CATALOG_MESSAGE,
+      } satisfies ServerProviderDraft;
+    }
     return buildServerProvider({
       presentation: CLAUDE_PRESENTATION,
       enabled: claudeSettings.enabled,
@@ -897,9 +951,24 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
           ? formatClaudeOpus48UpgradeMessage(parsedVersion)
           : formatClaudeOpus47UpgradeMessage(parsedVersion);
 
-  const capabilities = resolveCapabilities
+  const capabilitiesResolution = resolveCapabilities
     ? yield* resolveCapabilities(claudeSettings).pipe(Effect.orElseSucceed(() => undefined))
     : undefined;
+  if (
+    capabilitiesResolution === CLAUDE_CAPABILITIES_PROBE_TIMED_OUT &&
+    previousSnapshot?.status === "ready" &&
+    previousSnapshot.models.length > 0
+  ) {
+    return {
+      ...previousSnapshot,
+      checkedAt,
+      message: CLAUDE_STALE_CATALOG_MESSAGE,
+    } satisfies ServerProviderDraft;
+  }
+  const capabilities =
+    capabilitiesResolution === CLAUDE_CAPABILITIES_PROBE_TIMED_OUT
+      ? undefined
+      : capabilitiesResolution;
   const skills = yield* discoverClaudeSkills(claudeSettings, cwd, resolvedEnvironment);
   const slashCommands = capabilities?.slashCommands ?? [];
   const dedupedSlashCommands = dedupeSlashCommands(slashCommands);
@@ -972,7 +1041,7 @@ export const makePendingClaudeProvider = (
           version: null,
           status: "warning",
           auth: { status: "unknown" },
-          message: "Claude is disabled in T3 Code settings.",
+          message: "The optional Claude Code harness is disabled in T3 Code settings.",
         },
       });
     }
@@ -987,7 +1056,7 @@ export const makePendingClaudeProvider = (
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Claude provider status has not been checked in this session yet.",
+        message: "The optional Claude Code harness has not been checked in this session yet.",
       },
     });
   });

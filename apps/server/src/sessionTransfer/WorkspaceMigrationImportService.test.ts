@@ -281,7 +281,7 @@ describe("WorkspaceMigrationImportService", () => {
     };
 
     expect(workspaceMigrationPayloadDigest(payload)).toBe(
-      "124f9bef5f57cca2bba74b6d29c82e22d5cd115fc48aa76901ad7bbd8896e704",
+      "3e1a966724c4540923e4826a08877db9f30b6d1431f7216e2dfc06c98d1507a3",
     );
   });
 

@@ -188,6 +188,11 @@ export const ServerProvider = Schema.Struct({
   // Human-readable reason populated when `availability === "unavailable"`.
   // Surfaces in the UI alongside the missing-driver affordance.
   unavailableReason: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * When true, the server-reported catalog is the complete selection
+   * authority. Clients must not append locally configured custom models.
+   */
+  modelCatalogAuthoritative: Schema.optional(Schema.Boolean),
   models: Schema.Array(ServerProviderModel),
   slashCommands: Schema.Array(ServerProviderSlashCommand).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),

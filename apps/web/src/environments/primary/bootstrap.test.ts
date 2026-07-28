@@ -165,13 +165,15 @@ describe("environmentBootstrap", () => {
     );
   });
 
-  it("keeps same-origin HTTP and websocket targets under the runtime session mount", () => {
+  it("keeps same-origin auth and websocket targets under a proxy-rewritten document base", () => {
     vi.stubGlobal("window", {
-      __T3CODE_BASE_PATH__: "/sessions/session-123/agent",
       location: new URL("https://platform.example.test/sessions/session-123/agent/"),
       history: {
         replaceState: vi.fn(),
       },
+    });
+    vi.stubGlobal("document", {
+      baseURI: "https://platform.example.test/sessions/session-123/agent/",
     });
 
     expect(readPrimaryEnvironmentTarget()).toEqual({

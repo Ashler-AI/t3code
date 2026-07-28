@@ -2736,6 +2736,7 @@ interface SidebarProjectsContentProps {
   threadPreviewCount: SidebarThreadPreviewCount;
   updateSettings: ReturnType<typeof useUpdateClientSettings>;
   openAddProject: () => void;
+  openNewSession: () => void;
   isManualProjectSorting: boolean;
   projectDnDSensors: ReturnType<typeof useSensors>;
   projectCollisionDetection: CollisionDetection;
@@ -2776,6 +2777,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     threadPreviewCount,
     updateSettings,
     openAddProject,
+    openNewSession,
     isManualProjectSorting,
     projectDnDSensors,
     projectCollisionDetection,
@@ -2844,6 +2846,18 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                   </Kbd>
                 ) : null}
               </CommandDialogTrigger>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                size="sm"
+                type="button"
+                aria-label="New session"
+                className="h-8 gap-2 rounded-md px-2 py-1.5 text-sidebar-muted-foreground/80 hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-0"
+                onClick={openNewSession}
+              >
+                <SquarePenIcon className="size-4 shrink-0 text-sidebar-muted-foreground/80" />
+                <span className="flex-1 truncate text-left text-sm font-medium">New session</span>
+              </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
         </SidebarGroup>
@@ -3026,6 +3040,10 @@ export default function Sidebar() {
     () => openCommandPalette({ open: "add-project" }),
     [],
   );
+  const openNewSessionCommandPalette = useCallback(() => {
+    if (isMobile) setOpenMobile(false);
+    openCommandPalette({ open: "new-session" });
+  }, [isMobile, setOpenMobile]);
   const [expandedThreadListsByProject, setExpandedThreadListsByProject] = useState<
     ReadonlySet<string>
   >(() => new Set());
@@ -3606,6 +3624,7 @@ export default function Sidebar() {
             threadPreviewCount={sidebarThreadPreviewCount}
             updateSettings={updateSettings}
             openAddProject={openAddProjectCommandPalette}
+            openNewSession={openNewSessionCommandPalette}
             isManualProjectSorting={isManualProjectSorting}
             projectDnDSensors={projectDnDSensors}
             projectCollisionDetection={projectCollisionDetection}

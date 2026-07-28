@@ -4,8 +4,10 @@ import * as Effect from "effect/Effect";
 import {
   applyOmpAcpSelection,
   applyOmpAdvisorSelection,
+  assertManagedScaffoldOmpModelAllowed,
   buildOmpSkillsFromAvailableCommands,
   buildOmpAcpSpawnInput,
+  filterManagedScaffoldOmpModelSlugs,
   currentOmpModelIdFromSessionSetup,
   currentOmpAdvisorIdFromSessionSetup,
   ompModelSlugsFromSessionSetup,
@@ -85,7 +87,7 @@ describe("buildOmpAcpSpawnInput", () => {
     });
   });
 
-  it("passes Scaffold model routing through OMP's native ACP CLI flags", () => {
+  it("passes configured local model routing through OMP's native ACP CLI flags", () => {
     expect(
       buildOmpAcpSpawnInput({ binaryPath: "/opt/omp" }, "/tmp/project", {
         OMP_AGENT_MODEL: " openai/gpt-5.6-sol ",
@@ -100,6 +102,18 @@ describe("buildOmpAcpSpawnInput", () => {
         "--models",
         "openai/gpt-5.6-sol,anthropic/claude-sonnet-5",
       ],
+    });
+  });
+
+  it("collapses a managed Scaffold ACP catalog to its exact granted model", () => {
+    expect(
+      buildOmpAcpSpawnInput({ binaryPath: "/opt/omp" }, "/tmp/project", {
+        SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+        OMP_AGENT_MODEL: "openai/gpt-5.6-sol",
+        OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol,anthropic/claude-sonnet-5",
+      }),
+    ).toMatchObject({
+      args: ["acp", "--model", "openai/gpt-5.6-sol", "--models", "openai/gpt-5.6-sol"],
     });
   });
 
@@ -120,6 +134,42 @@ describe("buildOmpAcpSpawnInput", () => {
         OMP_AGENT_ALLOWED_MODELS: "anthropic/claude-sonnet-5",
       }),
     ).toThrow("OMP_AGENT_MODEL must be included in OMP_AGENT_ALLOWED_MODELS");
+    expect(() =>
+      buildOmpAcpSpawnInput(undefined, "/tmp/project", {
+        SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+      }),
+    ).toThrow("OMP_AGENT_MODEL is required for agent_t3_omp");
+  });
+
+  it("filters and validates active Scaffold models against the exact launch policy", () => {
+    const environment = {
+      SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+      OMP_AGENT_MODEL: "openai/gpt-5.6-sol",
+      OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol,anthropic/claude-sonnet-5",
+    };
+
+    expect(
+      filterManagedScaffoldOmpModelSlugs(environment, [
+        "openai/gpt-5.6-sol",
+        "x-ai/grok-4.5",
+        "anthropic/claude-sonnet-5",
+      ]),
+    ).toEqual(["openai/gpt-5.6-sol"]);
+    expect(() => assertManagedScaffoldOmpModelAllowed(environment, "x-ai/grok-4.5")).toThrow(
+      'Model "x-ai/grok-4.5" is not allowed',
+    );
+    expect(() =>
+      assertManagedScaffoldOmpModelAllowed(environment, "anthropic/claude-sonnet-5"),
+    ).toThrow('Model "anthropic/claude-sonnet-5" is not allowed');
+  });
+
+  it("leaves local model switching unrestricted", () => {
+    const localEnvironment = {};
+    expect(filterManagedScaffoldOmpModelSlugs(localEnvironment, ["one/a", "two/b"])).toEqual([
+      "one/a",
+      "two/b",
+    ]);
+    expect(() => assertManagedScaffoldOmpModelAllowed(localEnvironment, "two/b")).not.toThrow();
   });
 });
 

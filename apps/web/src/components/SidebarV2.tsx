@@ -2248,21 +2248,14 @@ export default function SidebarV2() {
     autoAnimate(node, { duration: 150, easing: "ease-out" });
   }, []);
 
-  // New thread defaults to the project you're in (active thread's project,
-  // falling back to the top project) — same resolution the command palette
-  // uses. The command palette already offers a "New thread in..." submenu
-  // for multi-project setups.
-  const handleNewThreadClick = useCallback(() => {
+  // Open the existing session-location chooser. Project hover actions continue
+  // to create a local thread directly in that project.
+  const handleNewSessionClick = useCallback(() => {
     if (isMobile) setOpenMobile(false);
-    openCommandPalette();
+    openCommandPalette({ open: "new-session" });
   }, [isMobile, setOpenMobile]);
 
   const commandPaletteShortcutLabel = shortcutLabelForCommand(keybindings, "commandPalette.toggle");
-  // Same resolution as v1: prefer the local-thread binding, fall back to
-  // chat.new, no platform gating — web users have working shortcuts too.
-  const newThreadShortcutLabel =
-    shortcutLabelForCommand(keybindings, "chat.newLocal") ??
-    shortcutLabelForCommand(keybindings, "chat.new");
   return (
     <>
       <SidebarChromeHeader isElectron={isElectron} />
@@ -2299,9 +2292,8 @@ export default function SidebarV2() {
                         size="icon"
                         type="button"
                         className="relative focus-visible:ring-offset-2 focus-visible:ring-offset-sidebar"
-                        onClick={handleNewThreadClick}
-                        disabled={projects.length === 0}
-                        aria-label="New thread"
+                        onClick={handleNewSessionClick}
+                        aria-label="New session"
                       />
                     }
                   >
@@ -2311,11 +2303,7 @@ export default function SidebarV2() {
                       aria-hidden="true"
                     />
                   </TooltipTrigger>
-                  <TooltipPopup side="right">
-                    {newThreadShortcutLabel
-                      ? `New thread (${newThreadShortcutLabel})`
-                      : "New thread"}
-                  </TooltipPopup>
+                  <TooltipPopup side="right">New session</TooltipPopup>
                 </Tooltip>
               </div>
             </div>

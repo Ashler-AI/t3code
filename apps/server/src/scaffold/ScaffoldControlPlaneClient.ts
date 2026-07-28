@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  type ScaffoldAgentEffort,
   SessionFabricCapabilityGrant,
   type SessionFabricSessionId,
   type ScaffoldDeployment,
@@ -18,7 +19,8 @@ export type ScaffoldFetch = (
 
 export interface ScaffoldEphemeralTransport {
   readonly environmentId: EnvironmentId;
-  readonly sessionId: string;
+  /** One-time pairing grant identity returned by Scaffold; not the sandbox session id. */
+  readonly pairingId: string;
   readonly lifecycleEpoch: number;
   readonly httpBaseUrl: string;
   readonly wsBaseUrl: string;
@@ -49,7 +51,9 @@ export interface ScaffoldRunnerCapabilityInput {
 }
 
 const decodeSessionFabricCapabilityGrant = Schema.decodeUnknownSync(SessionFabricCapabilityGrant);
+const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
 const JWT_COMPACT_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u;
+const DEFAULT_LIFECYCLE_REQUEST_TIMEOUT_MS = 15_000;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -260,6 +264,7 @@ export function makeScaffoldControlPlaneClient(options: {
   readonly target: ScaffoldTargetConfig;
   readonly fetch?: ScaffoldFetch;
   readonly now?: () => number;
+  readonly timeoutMs?: number;
 }) {
   const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
   const now = options.now ?? Date.now;
@@ -273,6 +278,9 @@ export function makeScaffoldControlPlaneClient(options: {
           ...(options.target.authorization ? { authorization: options.target.authorization } : {}),
           ...init.headers,
         },
+        signal:
+          init.signal ??
+          AbortSignal.timeout(options.timeoutMs ?? DEFAULT_LIFECYCLE_REQUEST_TIMEOUT_MS),
       });
     } catch {
       throw new ScaffoldLifecycleError({
@@ -335,31 +343,70 @@ export function makeScaffoldControlPlaneClient(options: {
       input.sessionId,
     );
 
+  const createSession = async (input: {
+    readonly sessionId?: string;
+    readonly operationId: string;
+    readonly sourceRef?: string;
+    readonly snapshotId?: string;
+    readonly name?: string;
+    readonly modelRouteId?: string;
+    readonly agentEffort?: ScaffoldAgentEffort;
+  }) => {
+    const init: RequestInit = {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": input.operationId },
+      body: JSON.stringify(
+        options.target.authMode === "oauth"
+          ? {
+              harness: "t3_omp",
+              ...(input.name ? { name: input.name } : {}),
+              ...(input.modelRouteId ? { modelRouteId: input.modelRouteId } : {}),
+              ...(input.agentEffort ? { agentEffort: input.agentEffort } : {}),
+            }
+          : {
+              ...(input.sessionId ? { id: input.sessionId } : {}),
+              runtimeProfile: "agent_t3_omp",
+              origin: { type: "t3" },
+              ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
+              ...(input.snapshotId ? { snapshotId: input.snapshotId } : {}),
+              ...(input.name ? { name: input.name } : {}),
+              ...(input.modelRouteId ? { modelRouteId: input.modelRouteId } : {}),
+              ...(input.agentEffort ? { agentEffort: input.agentEffort } : {}),
+            },
+      ),
+    };
+    const create = async () =>
+      expectObservation(
+        await request(options.target.collectionPath, init),
+        options.target.authMode === "iap" ? input.sessionId : undefined,
+      );
+    try {
+      return await create();
+    } catch (error) {
+      // OAuth creates use a server-minted id, so a lost response cannot be
+      // reconciled with GET by the caller. Replaying the exact request with
+      // the same idempotency key lets Scaffold return the original resource.
+      if (
+        options.target.authMode !== "oauth" ||
+        !isScaffoldLifecycleError(error) ||
+        !(
+          error.status === 0 ||
+          error.status === 408 ||
+          error.status === 409 ||
+          error.status === 429 ||
+          error.status >= 500
+        )
+      ) {
+        throw error;
+      }
+      return create();
+    }
+  };
+
   return {
     deployment: options.target.deployment as ScaffoldDeployment,
     baseUrl: options.target.baseUrl,
-    createSession: async (input: {
-      readonly sessionId?: string;
-      readonly operationId: string;
-      readonly sourceRef?: string;
-      readonly snapshotId?: string;
-      readonly name?: string;
-    }) =>
-      expectObservation(
-        await request(options.target.collectionPath, {
-          method: "POST",
-          headers: { "content-type": "application/json", "idempotency-key": input.operationId },
-          body: JSON.stringify({
-            ...(input.sessionId ? { id: input.sessionId } : {}),
-            runtimeProfile: "agent_t3_omp",
-            origin: { type: "t3" },
-            ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
-            ...(input.snapshotId ? { snapshotId: input.snapshotId } : {}),
-            ...(input.name ? { name: input.name } : {}),
-          }),
-        }),
-        input.sessionId,
-      ),
+    createSession,
     getSession: async (sessionId: string) =>
       expectObservation(
         await request(`${options.target.collectionPath}/${encodeURIComponent(sessionId)}`),
@@ -397,7 +444,10 @@ export function makeScaffoldControlPlaneClient(options: {
       );
       const transport = record(body?.transport) ?? body;
       const environmentId = stringValue(body?.environmentId);
-      const sessionId = stringValue(body?.id);
+      // The control plane returns the one-time pairing grant id at top-level
+      // `id`. The sandbox session id is already bound by the request path and
+      // is intentionally not repeated in this response.
+      const pairingId = stringValue(body?.id);
       const lifecycleEpoch = numberValue(body?.lifecycleEpoch);
       const httpBaseUrl = validatedEndpoint(transport?.httpBaseUrl, "https:");
       const wsBaseUrl = validatedEndpoint(transport?.wsBaseUrl, "wss:");
@@ -410,7 +460,7 @@ export function makeScaffoldControlPlaneClient(options: {
       if (
         !environmentId ||
         (input.environmentId !== undefined && environmentId !== input.environmentId) ||
-        sessionId !== input.sessionId ||
+        !pairingId ||
         lifecycleEpoch !== input.lifecycleEpoch ||
         !httpBaseUrl ||
         !wsBaseUrl ||
@@ -429,7 +479,7 @@ export function makeScaffoldControlPlaneClient(options: {
       }
       return {
         environmentId: EnvironmentId.make(environmentId),
-        sessionId,
+        pairingId,
         lifecycleEpoch,
         httpBaseUrl,
         wsBaseUrl,

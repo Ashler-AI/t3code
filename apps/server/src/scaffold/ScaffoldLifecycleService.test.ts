@@ -41,7 +41,7 @@ function fakeClient(
     pauseSession: async () => observation("paused", 2),
     issueT3Transport: async () => ({
       environmentId: ENVIRONMENT_ID,
-      sessionId: "ses_1",
+      pairingId: "pairing_1",
       lifecycleEpoch: 1,
       httpBaseUrl: "https://sandbox.example.com/",
       wsBaseUrl: "wss://sandbox.example.com/",
@@ -138,7 +138,7 @@ describe("ScaffoldLifecycleService", () => {
       .fn<ScaffoldControlPlaneClient["issueT3Transport"]>()
       .mockResolvedValueOnce({
         environmentId: ENVIRONMENT_ID,
-        sessionId: "ses_1",
+        pairingId: "pairing_generation_1",
         lifecycleEpoch: 1,
         httpBaseUrl: "https://sandbox-generation-1.example.com/",
         wsBaseUrl: "wss://sandbox-generation-1.example.com/",
@@ -148,7 +148,7 @@ describe("ScaffoldLifecycleService", () => {
       })
       .mockResolvedValueOnce({
         environmentId: ENVIRONMENT_ID,
-        sessionId: "ses_1",
+        pairingId: "pairing_generation_2",
         lifecycleEpoch: 3,
         httpBaseUrl: "https://sandbox-generation-2.example.com/",
         wsBaseUrl: "wss://sandbox-generation-2.example.com/",
@@ -280,7 +280,7 @@ describe("ScaffoldLifecycleService", () => {
           getSession: async () => observation("ready", 2),
           issueT3Transport: async () => ({
             environmentId: ENVIRONMENT_ID,
-            sessionId: "ses_1",
+            pairingId: "pairing_2",
             lifecycleEpoch: 2,
             httpBaseUrl: "https://sandbox.example.com/",
             wsBaseUrl: "wss://sandbox.example.com/",
@@ -325,13 +325,18 @@ describe("ScaffoldLifecycleService", () => {
           deployment: "staging",
           operationId: "op_stable",
           sessionId: "ses_1",
-          create: {},
+          create: {
+            modelRouteId: "scaffold-openai/gpt-5.6-sol",
+            agentEffort: "high",
+          },
         }),
       ),
     ).resolves.toMatchObject({ binding: { sessionId: "ses_1", status: "ready" } });
     expect(createSession).toHaveBeenCalledWith({
       operationId: "op_stable",
       sessionId: "ses_1",
+      modelRouteId: "scaffold-openai/gpt-5.6-sol",
+      agentEffort: "high",
     });
   });
 

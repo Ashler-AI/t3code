@@ -2711,39 +2711,45 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       },
     );
 
-    yield* executeGit("GitVcsDriver.createWorktree", input.cwd, args, {
-      fallbackErrorDetail: "git worktree add failed",
-      timeoutMs: WORKTREE_CREATE_TIMEOUT_MS,
-    }).pipe(
-      Effect.onInterrupt(() => cleanupIncompleteWorktree().pipe(Effect.asVoid)),
-      Effect.catchIf(
-        (error) => error.detail.includes("timed out"),
-        (timeoutError) =>
-          reconcileCompletedWorktree().pipe(
-            Effect.orElseSucceed(() => false),
-            Effect.flatMap((completed) => {
-              if (completed) {
-                return Effect.void;
-              }
-              return cleanupIncompleteWorktree().pipe(
-                Effect.flatMap((cleanupComplete) =>
-                  Effect.fail(
-                    new GitCommandError({
-                      ...gitCommandContext({
-                        operation: "GitVcsDriver.createWorktree",
-                        cwd: input.cwd,
-                        args,
+    const targetAlreadyMaterialized =
+      input.reconcileExistingExactTarget && targetPathExistedBefore
+        ? yield* reconcileCompletedWorktree().pipe(Effect.orElseSucceed(() => false))
+        : false;
+    if (!targetAlreadyMaterialized) {
+      yield* executeGit("GitVcsDriver.createWorktree", input.cwd, args, {
+        fallbackErrorDetail: "git worktree add failed",
+        timeoutMs: WORKTREE_CREATE_TIMEOUT_MS,
+      }).pipe(
+        Effect.onInterrupt(() => cleanupIncompleteWorktree().pipe(Effect.asVoid)),
+        Effect.catchIf(
+          (error) => error.detail.includes("timed out"),
+          (timeoutError) =>
+            reconcileCompletedWorktree().pipe(
+              Effect.orElseSucceed(() => false),
+              Effect.flatMap((completed) => {
+                if (completed) {
+                  return Effect.void;
+                }
+                return cleanupIncompleteWorktree().pipe(
+                  Effect.flatMap((cleanupComplete) =>
+                    Effect.fail(
+                      new GitCommandError({
+                        ...gitCommandContext({
+                          operation: "GitVcsDriver.createWorktree",
+                          cwd: input.cwd,
+                          args,
+                        }),
+                        detail: `Git worktree materialization timed out after ${WORKTREE_CREATE_TIMEOUT_MS}ms; the process was stopped, the target could not be verified as complete, and exact-target cleanup ${cleanupComplete ? "completed" : "could not be verified"}.`,
+                        cause: timeoutError,
                       }),
-                      detail: `Git worktree materialization timed out after ${WORKTREE_CREATE_TIMEOUT_MS}ms; the process was stopped, the target could not be verified as complete, and exact-target cleanup ${cleanupComplete ? "completed" : "could not be verified"}.`,
-                      cause: timeoutError,
-                    }),
+                    ),
                   ),
-                ),
-              );
-            }),
-          ),
-      ),
-    );
+                );
+              }),
+            ),
+        ),
+      );
+    }
 
     if (input.newRefName && input.baseRefName) {
       const remoteNames = yield* listRemoteNames(input.cwd).pipe(Effect.orElseSucceed(() => []));

@@ -133,6 +133,8 @@ type OmpAcpRuntimeSettings = Pick<OmpSettings, "binaryPath">;
 
 const OMP_AGENT_MODEL_ENV = "OMP_AGENT_MODEL";
 const OMP_AGENT_ALLOWED_MODELS_ENV = "OMP_AGENT_ALLOWED_MODELS";
+const SCAFFOLD_RUNTIME_PROFILE_ENV = "SCAFFOLD_RUNTIME_PROFILE";
+const SCAFFOLD_OMP_RUNTIME_PROFILE = "agent_t3_omp";
 const OMP_MODEL_ROUTE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
 
 function configuredOmpModelRoute(
@@ -158,6 +160,61 @@ function configuredOmpAllowedModelRoutes(environment: NodeJS.ProcessEnv): Readon
   return [...new Set(routes)];
 }
 
+export function isManagedScaffoldOmpEnvironment(environment: NodeJS.ProcessEnv): boolean {
+  return environment[SCAFFOLD_RUNTIME_PROFILE_ENV]?.trim() === SCAFFOLD_OMP_RUNTIME_PROFILE;
+}
+
+export function configuredManagedScaffoldOmpModels(environment: NodeJS.ProcessEnv): {
+  readonly model: string;
+  readonly allowedModels: ReadonlyArray<string>;
+} | null {
+  if (!isManagedScaffoldOmpEnvironment(environment)) return null;
+
+  const model = configuredOmpModelRoute(environment, OMP_AGENT_MODEL_ENV);
+  const allowedModels = configuredOmpAllowedModelRoutes(environment);
+  if (!model) {
+    throw new Error(`${OMP_AGENT_MODEL_ENV} is required for ${SCAFFOLD_OMP_RUNTIME_PROFILE}.`);
+  }
+  if (allowedModels.length === 0) {
+    throw new Error(
+      `${OMP_AGENT_ALLOWED_MODELS_ENV} is required for ${SCAFFOLD_OMP_RUNTIME_PROFILE}.`,
+    );
+  }
+  if (!allowedModels.includes(model)) {
+    throw new Error(`${OMP_AGENT_MODEL_ENV} must be included in ${OMP_AGENT_ALLOWED_MODELS_ENV}.`);
+  }
+  // Scaffold currently grants exactly OMP_AGENT_MODEL. The broader
+  // OMP_AGENT_ALLOWED_MODELS value is a curated image catalog, not proof that
+  // this session holds grants for every entry. Keep selection single-model
+  // until a durable grant-generation reconfiguration protocol exists.
+  return { model, allowedModels: [model] };
+}
+
+export function assertManagedScaffoldOmpModelAllowed(
+  environment: NodeJS.ProcessEnv,
+  model: string | undefined,
+): void {
+  const policy = configuredManagedScaffoldOmpModels(environment);
+  if (!policy) return;
+  if (!model || !policy.allowedModels.includes(model)) {
+    throw new Error(
+      model
+        ? `Model "${model}" is not allowed by ${OMP_AGENT_ALLOWED_MODELS_ENV}.`
+        : `A model from ${OMP_AGENT_ALLOWED_MODELS_ENV} is required for ${SCAFFOLD_OMP_RUNTIME_PROFILE}.`,
+    );
+  }
+}
+
+export function filterManagedScaffoldOmpModelSlugs(
+  environment: NodeJS.ProcessEnv,
+  models: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  const policy = configuredManagedScaffoldOmpModels(environment);
+  if (!policy) return models;
+  const allowed = new Set(policy.allowedModels);
+  return models.filter((model) => allowed.has(model));
+}
+
 type OmpConfigOptionSnapshot = {
   readonly configOptions?: ReadonlyArray<EffectAcpSchema.SessionConfigOption> | null;
 };
@@ -179,12 +236,14 @@ export function buildOmpAcpSpawnInput(
   const args = ["acp"];
   if (environment) {
     const model = configuredOmpModelRoute(environment, OMP_AGENT_MODEL_ENV);
-    const allowedModels = configuredOmpAllowedModelRoutes(environment);
-    if (model && allowedModels.length > 0 && !allowedModels.includes(model)) {
+    const configuredAllowedModels = configuredOmpAllowedModelRoutes(environment);
+    const managedPolicy = configuredManagedScaffoldOmpModels(environment);
+    if (model && configuredAllowedModels.length > 0 && !configuredAllowedModels.includes(model)) {
       throw new Error(
         `${OMP_AGENT_MODEL_ENV} must be included in ${OMP_AGENT_ALLOWED_MODELS_ENV}.`,
       );
     }
+    const allowedModels = managedPolicy?.allowedModels ?? configuredAllowedModels;
     if (model) args.push("--model", model);
     if (allowedModels.length > 0) args.push("--models", allowedModels.join(","));
   }
