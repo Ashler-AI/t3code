@@ -3,6 +3,7 @@ import { describe, it, assert } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
@@ -31,7 +32,13 @@ import { createModelCapabilities } from "@t3tools/shared/model";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
-import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import {
+  checkClaudeProviderStatus,
+  CLAUDE_CAPABILITIES_PROBE_TIMED_OUT,
+  CLAUDE_CAPABILITIES_PROBE_TIMEOUT_MS,
+  CLAUDE_VERSION_PROBE_TIMEOUT_MS,
+  resolveClaudeProbeBinaryPath,
+} from "./ClaudeProvider.ts";
 import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
@@ -234,6 +241,41 @@ function hangingScopedSpawnerLayer(killCalls: Ref.Ref<number>) {
         yield* Effect.addFinalizer(() => handle.kill().pipe(Effect.ignore));
         return handle;
       }),
+    ),
+  );
+}
+
+function alternatingHangingClaudeVersionSpawnerLayer(
+  spawnCalls: Ref.Ref<number>,
+  killCalls: Ref.Ref<number>,
+) {
+  return Layer.succeed(
+    ChildProcessSpawner.ChildProcessSpawner,
+    ChildProcessSpawner.make(() =>
+      Ref.updateAndGet(spawnCalls, (current) => current + 1).pipe(
+        Effect.flatMap((call) => {
+          if (call === 2) {
+            return Effect.succeed(mockHandle({ stdout: "2.1.220\n", stderr: "", code: 0 }));
+          }
+          return Effect.gen(function* () {
+            const handle = ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(call),
+              exitCode: Effect.never,
+              isRunning: Effect.succeed(true),
+              kill: () => Ref.update(killCalls, (current) => current + 1),
+              unref: Effect.succeed(Effect.void),
+              stdin: Sink.drain,
+              stdout: Stream.never,
+              stderr: Stream.never,
+              all: Stream.never,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+            });
+            yield* Effect.addFinalizer(() => handle.kill().pipe(Effect.ignore));
+            return handle;
+          });
+        }),
+      ),
     ),
   );
 }
@@ -475,14 +517,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           );
 
           yield* Effect.yieldNow;
-          yield* TestClock.adjust("11 seconds");
+          yield* TestClock.adjust("31 seconds");
           yield* Effect.yieldNow;
 
           const status = yield* Fiber.join(statusFiber);
           assert.strictEqual(status.status, "error");
           assert.strictEqual(
             status.message,
-            "Timed out while checking Codex app-server provider status.",
+            "Timed out while checking the optional Codex CLI harness.",
           );
           assert.strictEqual(yield* Ref.get(killCalls), 1);
         }),
@@ -1572,7 +1614,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             );
             assert.strictEqual(initialCodex?.status, "error");
             assert.strictEqual(initialCodex?.installed, false);
-            assert.deepStrictEqual(spawnedCommands, [firstMissing]);
+            assert.strictEqual(
+              spawnedCommands.filter((command) => command === firstMissing).length,
+              1,
+            );
 
             // Drive a settings change. The Hydration layer's
             // `SettingsWatcherLive` consumes this via `streamChanges`,
@@ -1609,7 +1654,12 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             });
 
             const reprobedCodex = refreshed.find((provider) => provider.instanceId === "codex");
-            assert.deepStrictEqual(spawnedCommands, [firstMissing, secondMissing]);
+            assert.deepStrictEqual(
+              spawnedCommands.filter(
+                (command) => command === firstMissing || command === secondMissing,
+              ),
+              [firstMissing, secondMissing],
+            );
             assert.strictEqual(reprobedCodex?.status, "error");
             assert.strictEqual(reprobedCodex?.installed, false);
           }).pipe(Effect.provide(runtimeServices));
@@ -1678,102 +1728,93 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         }),
       );
 
-      it.effect(
-        "keeps cursor disabled and skips probing when the provider setting is disabled",
-        () =>
-          Effect.gen(function* () {
-            const serverSettings = yield* makeMutableServerSettingsService(
-              decodeServerSettings(
-                deepMerge(encodedDefaultServerSettings, {
-                  providers: {
-                    codex: {
-                      enabled: false,
-                    },
-                    cursor: {
-                      enabled: false,
-                    },
-                    grok: {
-                      enabled: false,
-                    },
+      it.effect("omits the unshipped cursor provider and skips probing its legacy setting", () =>
+        Effect.gen(function* () {
+          const serverSettings = yield* makeMutableServerSettingsService(
+            decodeServerSettings(
+              deepMerge(encodedDefaultServerSettings, {
+                providers: {
+                  codex: {
+                    enabled: false,
                   },
-                }),
+                  cursor: {
+                    enabled: false,
+                  },
+                  grok: {
+                    enabled: false,
+                  },
+                },
+              }),
+            ),
+          );
+          let cursorSpawned = false;
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const providerRegistryLayer = ProviderRegistryLive.pipe(
+            Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+            Layer.provideMerge(
+              Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
+            ),
+            Layer.provideMerge(
+              ServerConfig.layerTest(process.cwd(), {
+                prefix: "t3-provider-registry-",
+              }),
+            ),
+            Layer.provideMerge(TestHttpClientLive),
+            Layer.provideMerge(
+              Layer.succeed(
+                ProviderEventLoggers.ProviderEventLoggers,
+                ProviderEventLoggers.NoOpProviderEventLoggers,
               ),
-            );
-            let cursorSpawned = false;
-            const scope = yield* Scope.make();
-            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
-            const providerRegistryLayer = ProviderRegistryLive.pipe(
-              Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
-              Layer.provideMerge(
-                Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
-              ),
-              Layer.provideMerge(
-                ServerConfig.layerTest(process.cwd(), {
-                  prefix: "t3-provider-registry-",
-                }),
-              ),
-              Layer.provideMerge(TestHttpClientLive),
-              Layer.provideMerge(
-                Layer.succeed(
-                  ProviderEventLoggers.ProviderEventLoggers,
-                  ProviderEventLoggers.NoOpProviderEventLoggers,
-                ),
-              ),
-              Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
-              Layer.provideMerge(
-                mockCommandSpawnerLayer((command, args) => {
-                  if (command === "cursor-agent") {
-                    cursorSpawned = true;
-                  }
-                  const joined = args.join(" ");
-                  if (joined === "--version") {
-                    return {
-                      stdout: `${command} 1.0.0\n`,
-                      stderr: "",
-                      code: 0,
-                    };
-                  }
-                  if (joined === "auth status") {
-                    return {
-                      stdout: '{"authenticated":true}\n',
-                      stderr: "",
-                      code: 0,
-                    };
-                  }
-                  throw new Error(`Unexpected args: ${command} ${joined}`);
-                }),
-              ),
-            );
-            const runtimeServices = yield* Layer.build(
-              Layer.mergeAll(
-                Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
-                providerRegistryLayer,
-              ),
-            ).pipe(Scope.provide(scope));
+            ),
+            Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+            Layer.provideMerge(
+              mockCommandSpawnerLayer((command, args) => {
+                if (command === "cursor-agent") {
+                  cursorSpawned = true;
+                }
+                const joined = args.join(" ");
+                if (joined === "--version") {
+                  return {
+                    stdout: `${command} 1.0.0\n`,
+                    stderr: "",
+                    code: 0,
+                  };
+                }
+                if (joined === "auth status") {
+                  return {
+                    stdout: '{"authenticated":true}\n',
+                    stderr: "",
+                    code: 0,
+                  };
+                }
+                throw new Error(`Unexpected args: ${command} ${joined}`);
+              }),
+            ),
+          );
+          const runtimeServices = yield* Layer.build(
+            Layer.mergeAll(
+              Layer.succeed(ServerSettingsModule.ServerSettingsService, serverSettings),
+              providerRegistryLayer,
+            ),
+          ).pipe(Scope.provide(scope));
 
-            yield* Effect.gen(function* () {
-              const registry = yield* ProviderRegistry.ProviderRegistry;
-              const providers = yield* registry.getProviders;
-              const cursorProvider = providers.find(
-                (provider) => provider.instanceId === ProviderInstanceId.make("cursor"),
-              );
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            const providers = yield* registry.getProviders;
+            const cursorProvider = providers.find(
+              (provider) => provider.instanceId === ProviderInstanceId.make("cursor"),
+            );
 
-              assert.deepStrictEqual(providers.map((provider) => provider.instanceId).toSorted(), [
-                "claudeAgent",
-                "codex",
-                "cursor",
-                "grok",
-                "opencode",
-              ]);
-              assert.strictEqual(cursorProvider?.enabled, false);
-              assert.strictEqual(cursorProvider?.status, "disabled");
-              assert.strictEqual(
-                cursorProvider?.message,
-                "Cursor is disabled in T3 Code settings.",
-              );
-              assert.strictEqual(cursorSpawned, false);
-            }).pipe(Effect.provide(runtimeServices));
-          }),
+            assert.deepStrictEqual(providers.map((provider) => provider.instanceId).toSorted(), [
+              "claudeAgent",
+              "codex",
+              "omp",
+            ]);
+            assert.strictEqual(cursorProvider, undefined);
+            assert.strictEqual(cursorSpawned, false);
+          }).pipe(Effect.provide(runtimeServices));
+        }),
       );
 
       it.effect("skips codex probes entirely when the provider is disabled", () =>
@@ -1784,7 +1825,10 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           assert.strictEqual(status.enabled, false);
           assert.strictEqual(status.status, "disabled");
           assert.strictEqual(status.installed, false);
-          assert.strictEqual(status.message, "Codex is disabled in T3 Code settings.");
+          assert.strictEqual(
+            status.message,
+            "The optional Codex CLI harness is disabled in T3 Code settings.",
+          );
         }),
       );
     });
@@ -1792,6 +1836,110 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
     // ── checkClaudeProviderStatus tests ──────────────────────────
 
     describe("checkClaudeProviderStatus", () => {
+      it.effect("finds the native Claude launcher outside a GUI application's PATH", () =>
+        Effect.gen(function* () {
+          const expected = "/Users/test/.local/bin/claude";
+          const fileSystem = FileSystem.makeNoop({
+            exists: (path) => Effect.succeed(path === expected),
+          });
+          const resolved = yield* resolveClaudeProbeBinaryPath("claude", {
+            HOME: "/Users/test",
+            PATH: "/usr/bin:/bin",
+          }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+          assert.strictEqual(resolved, expected);
+        }),
+      );
+
+      it("uses bounded cold-start deadlines for native Claude probes", () => {
+        assert.strictEqual(CLAUDE_VERSION_PROBE_TIMEOUT_MS, 30_000);
+        assert.strictEqual(CLAUDE_CAPABILITIES_PROBE_TIMEOUT_MS, 30_000);
+      });
+
+      it.effect(
+        "recovers after a delayed first version probe and retains the verified catalog on timeout",
+        () =>
+          Effect.gen(function* () {
+            const spawnCalls = yield* Ref.make(0);
+            const killCalls = yield* Ref.make(0);
+            const spawner = alternatingHangingClaudeVersionSpawnerLayer(spawnCalls, killCalls);
+
+            const firstFiber = yield* checkClaudeProviderStatus(
+              defaultClaudeSettings,
+              claudeCapabilities(),
+            ).pipe(Effect.provide(spawner), Effect.forkChild);
+            yield* Effect.yieldNow;
+            yield* TestClock.adjust("31 seconds");
+            const first = yield* Fiber.join(firstFiber);
+            assert.strictEqual(first.status, "error");
+            assert.strictEqual(yield* Ref.get(killCalls), 1);
+
+            const recovered = yield* checkClaudeProviderStatus(
+              defaultClaudeSettings,
+              claudeCapabilities(),
+            ).pipe(Effect.provide(spawner));
+            assert.strictEqual(recovered.status, "ready");
+            assert.strictEqual(recovered.auth.status, "authenticated");
+
+            const staleFiber = yield* checkClaudeProviderStatus(
+              defaultClaudeSettings,
+              claudeCapabilities(),
+              undefined,
+              undefined,
+              recovered,
+            ).pipe(Effect.provide(spawner), Effect.forkChild);
+            yield* Effect.yieldNow;
+            yield* TestClock.adjust("31 seconds");
+            const stale = yield* Fiber.join(staleFiber);
+            assert.strictEqual(stale.status, "ready");
+            assert.deepStrictEqual(stale.models, recovered.models);
+            assert.strictEqual(stale.auth.status, "authenticated");
+            assert.strictEqual(
+              stale.message,
+              "Claude Code status refresh timed out. Using the last verified account and model catalog.",
+            );
+            assert.strictEqual(yield* Ref.get(killCalls), 2);
+          }),
+      );
+
+      it.effect("retains a verified Claude catalog only for a typed capabilities timeout", () =>
+        Effect.gen(function* () {
+          const verified = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            claudeCapabilities({ email: "claude@example.com" }),
+          );
+          const stale = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            () => Effect.succeed(CLAUDE_CAPABILITIES_PROBE_TIMED_OUT),
+            undefined,
+            undefined,
+            verified,
+          );
+          assert.strictEqual(stale.status, "ready");
+          assert.deepStrictEqual(stale.models, verified.models);
+          assert.deepStrictEqual(stale.auth, verified.auth);
+
+          const unavailable = yield* checkClaudeProviderStatus(
+            defaultClaudeSettings,
+            noClaudeCapabilities,
+            undefined,
+            undefined,
+            verified,
+          );
+          assert.strictEqual(unavailable.status, "warning");
+          assert.strictEqual(unavailable.auth.status, "unknown");
+        }).pipe(
+          Effect.provide(
+            mockSpawnerLayer((args) => {
+              const joined = args.join(" ");
+              if (joined === "--version") {
+                return { stdout: "2.1.220\n", stderr: "", code: 0 };
+              }
+              throw new Error(`Unexpected args: ${joined}`);
+            }),
+          ),
+        ),
+      );
+
       it.effect("returns ready when claude is installed and authenticated", () =>
         Effect.gen(function* () {
           const status = yield* checkClaudeProviderStatus(

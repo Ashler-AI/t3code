@@ -256,6 +256,8 @@ function projectSetupScriptCompatibilityDetail(
       return legacySetupFailureDescription(error.cause);
     case "ProjectSetupScriptProjectNotFoundError":
       return "Project was not found for setup script execution.";
+    case "ProjectSetupScriptAmbiguousInvocationError":
+      return error.message;
     default:
       return unexpectedCompatibilityError(error);
   }
@@ -319,6 +321,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.ompAccountsRefresh, AuthOrchestrationReadScope],
   [WS_METHODS.ompAccountsBeginLogin, AuthOrchestrationOperateScope],
   [WS_METHODS.ompAccountsRespondLogin, AuthOrchestrationOperateScope],
+  [WS_METHODS.ompAccountsSubmitLogin, AuthOrchestrationOperateScope],
   [WS_METHODS.ompAccountsCancelLogin, AuthOrchestrationOperateScope],
   [WS_METHODS.ompAccountsRemove, AuthOrchestrationOperateScope],
   [WS_METHODS.scaffoldPause, AuthOrchestrationOperateScope],
@@ -576,6 +579,8 @@ const makeWsRpcLayer = (
 
       const appendSetupScriptActivity = (input: {
         readonly threadId: ThreadId;
+        readonly commandId?: CommandId;
+        readonly activityId?: EventId;
         readonly kind: "setup-script.requested" | "setup-script.started" | "setup-script.failed";
         readonly summary: string;
         readonly createdAt: string;
@@ -583,8 +588,10 @@ const makeWsRpcLayer = (
         readonly tone: "info" | "error";
       }) =>
         Effect.all({
-          commandId: serverCommandId("setup-script-activity"),
-          activityId: serverEventId,
+          commandId: input.commandId
+            ? Effect.succeed(input.commandId)
+            : serverCommandId("setup-script-activity"),
+          activityId: input.activityId ? Effect.succeed(input.activityId) : serverEventId,
         }).pipe(
           Effect.flatMap(({ commandId, activityId }) =>
             orchestrationEngine.dispatch({
@@ -880,38 +887,80 @@ const makeWsRpcLayer = (
         Effect.gen(function* () {
           const bootstrap = command.bootstrap;
           const { bootstrap: _bootstrap, ...finalTurnStartCommand } = command;
-          let createdThread = false;
+          const bootstrapCommandId = (phase: string) =>
+            CommandId.make(`${command.commandId}:bootstrap:${phase}`);
+          const bootstrapEventId = (phase: string) =>
+            EventId.make(`${command.commandId}:bootstrap:${phase}`);
+          const existingThread = Option.getOrUndefined(
+            yield* projectionSnapshotQuery
+              .getThreadShellById(command.threadId)
+              .pipe(
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(cause, "Failed to reconcile bootstrap thread state."),
+                ),
+              ),
+          );
+          if (
+            existingThread &&
+            bootstrap?.createThread &&
+            existingThread.projectId !== bootstrap.createThread.projectId
+          ) {
+            return yield* new OrchestrationDispatchCommandError({
+              message: `Bootstrap replay conflict: thread '${command.threadId}' belongs to a different project.`,
+            });
+          }
+          if (existingThread && bootstrap?.prepareWorktree) {
+            const initialBranch = bootstrap.createThread?.branch ?? null;
+            const targetBranch = bootstrap.prepareWorktree.branch;
+            const existingBranch = existingThread.branch;
+            if (
+              existingBranch !== null &&
+              existingBranch !== initialBranch &&
+              existingBranch !== targetBranch
+            ) {
+              return yield* new OrchestrationDispatchCommandError({
+                message: `Bootstrap replay conflict: thread '${command.threadId}' uses branch '${existingBranch}', not '${targetBranch}'.`,
+              });
+            }
+            if (existingThread.worktreePath !== null && existingBranch !== targetBranch) {
+              return yield* new OrchestrationDispatchCommandError({
+                message: `Bootstrap replay conflict: thread '${command.threadId}' has a worktree for a different branch.`,
+              });
+            }
+          }
+          if (
+            existingThread?.worktreePath !== null &&
+            existingThread?.worktreePath !== undefined &&
+            bootstrap?.createThread?.worktreePath !== null &&
+            bootstrap?.createThread?.worktreePath !== undefined &&
+            existingThread.worktreePath !== bootstrap.createThread.worktreePath
+          ) {
+            return yield* new OrchestrationDispatchCommandError({
+              message: `Bootstrap replay conflict: thread '${command.threadId}' uses a different worktree path.`,
+            });
+          }
           let targetProjectId = bootstrap?.createThread?.projectId;
           let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
-          let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
-
-          const cleanupCreatedThread = () =>
-            createdThread
-              ? serverCommandId("bootstrap-thread-delete").pipe(
-                  Effect.flatMap((commandId) =>
-                    orchestrationEngine.dispatch({
-                      type: "thread.delete",
-                      commandId,
-                      threadId: command.threadId,
-                    }),
-                  ),
-                  Effect.ignoreCause({ log: true }),
-                )
-              : Effect.void;
+          let targetWorktreePath =
+            existingThread?.worktreePath ?? bootstrap?.createThread?.worktreePath ?? null;
 
           const recordSetupScriptLaunchFailure = (input: {
             readonly error: ProjectSetupScriptRunner.ProjectSetupScriptRunnerError;
+            readonly invocationId: string;
             readonly requestedAt: string;
             readonly worktreePath: string;
           }) => {
             const detail = projectSetupScriptCompatibilityDetail(input.error);
             return appendSetupScriptActivity({
               threadId: command.threadId,
+              commandId: bootstrapCommandId("setup-failed"),
+              activityId: bootstrapEventId("setup-failed"),
               kind: "setup-script.failed",
               summary: "Setup script failed to start",
               createdAt: input.requestedAt,
               payload: {
                 detail,
+                invocationId: input.invocationId,
                 worktreePath: input.worktreePath,
               },
               tone: "error",
@@ -928,6 +977,7 @@ const makeWsRpcLayer = (
           };
 
           const recordSetupScriptStarted = (input: {
+            readonly invocationId: string;
             readonly requestedAt: string;
             readonly worktreePath: string;
             readonly scriptId: string;
@@ -937,29 +987,22 @@ const makeWsRpcLayer = (
             Effect.gen(function* () {
               const startedAt = yield* nowIso;
               const payload = {
+                invocationId: input.invocationId,
                 scriptId: input.scriptId,
                 scriptName: input.scriptName,
                 terminalId: input.terminalId,
                 worktreePath: input.worktreePath,
               };
-              yield* Effect.all([
-                appendSetupScriptActivity({
-                  threadId: command.threadId,
-                  kind: "setup-script.requested",
-                  summary: "Starting setup script",
-                  createdAt: input.requestedAt,
-                  payload,
-                  tone: "info",
-                }),
-                appendSetupScriptActivity({
-                  threadId: command.threadId,
-                  kind: "setup-script.started",
-                  summary: "Setup script started",
-                  createdAt: startedAt,
-                  payload,
-                  tone: "info",
-                }),
-              ]).pipe(
+              yield* appendSetupScriptActivity({
+                threadId: command.threadId,
+                commandId: bootstrapCommandId("setup-started"),
+                activityId: bootstrapEventId("setup-started"),
+                kind: "setup-script.started",
+                summary: "Setup command delivered",
+                createdAt: startedAt,
+                payload,
+                tone: "info",
+              }).pipe(
                 Effect.asVoid,
                 Effect.catch((error) =>
                   Effect.logWarning(
@@ -982,19 +1025,34 @@ const makeWsRpcLayer = (
                 return;
               }
               const worktreePath = targetWorktreePath;
-              const requestedAt = yield* nowIso;
+              const invocationId = `${command.commandId}:bootstrap:setup-launch`;
+              const requestedAt = command.createdAt;
+              const setupRequestedCommandId = bootstrapCommandId("setup-requested");
+              yield* appendSetupScriptActivity({
+                threadId: command.threadId,
+                commandId: setupRequestedCommandId,
+                activityId: bootstrapEventId("setup-requested"),
+                kind: "setup-script.requested",
+                summary: "Queueing setup command",
+                createdAt: requestedAt,
+                payload: { invocationId, worktreePath },
+                tone: "info",
+              });
               yield* projectSetupScriptRunner
                 .runForThread({
                   threadId: command.threadId,
                   ...(targetProjectId ? { projectId: targetProjectId } : {}),
                   ...(targetProjectCwd ? { projectCwd: targetProjectCwd } : {}),
                   worktreePath,
+                  invocationId,
+                  idempotencyStateDir: config.stateDir,
                 })
                 .pipe(
                   Effect.matchEffect({
                     onFailure: (error) =>
                       recordSetupScriptLaunchFailure({
                         error,
+                        invocationId,
                         requestedAt,
                         worktreePath,
                       }),
@@ -1003,6 +1061,7 @@ const makeWsRpcLayer = (
                         return Effect.void;
                       }
                       return recordSetupScriptStarted({
+                        invocationId,
                         requestedAt,
                         worktreePath,
                         scriptId: setupResult.scriptId,
@@ -1015,10 +1074,10 @@ const makeWsRpcLayer = (
             });
 
           const bootstrapProgram = Effect.gen(function* () {
-            if (bootstrap?.createThread) {
+            if (bootstrap?.createThread && !existingThread) {
               yield* orchestrationEngine.dispatch({
                 type: "thread.create",
-                commandId: yield* serverCommandId("bootstrap-thread-create"),
+                commandId: bootstrapCommandId("thread-create"),
                 threadId: command.threadId,
                 projectId: bootstrap.createThread.projectId,
                 title: bootstrap.createThread.title,
@@ -1029,10 +1088,14 @@ const makeWsRpcLayer = (
                 worktreePath: bootstrap.createThread.worktreePath,
                 createdAt: bootstrap.createThread.createdAt,
               });
-              createdThread = true;
             }
 
-            if (bootstrap?.prepareWorktree) {
+            const worktreeAlreadyCommitted =
+              bootstrap?.prepareWorktree !== undefined &&
+              existingThread !== undefined &&
+              existingThread.branch === bootstrap.prepareWorktree.branch &&
+              existingThread.worktreePath !== null;
+            if (bootstrap?.prepareWorktree && !worktreeAlreadyCommitted) {
               let worktreeBaseRef = bootstrap.prepareWorktree.baseBranch;
               if (bootstrap.prepareWorktree.startFromOrigin) {
                 yield* gitWorkflow.fetchRemote({
@@ -1051,12 +1114,13 @@ const makeWsRpcLayer = (
                 refName: worktreeBaseRef,
                 newRefName: bootstrap.prepareWorktree.branch,
                 baseRefName: bootstrap.prepareWorktree.baseBranch,
-                path: null,
+                path: targetWorktreePath,
+                reconcileExistingExactTarget: true,
               });
               targetWorktreePath = worktree.worktree.path;
               yield* orchestrationEngine.dispatch({
                 type: "thread.meta.update",
-                commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
+                commandId: bootstrapCommandId("thread-meta-update"),
                 threadId: command.threadId,
                 branch: worktree.worktree.refName,
                 worktreePath: targetWorktreePath,
@@ -1070,13 +1134,7 @@ const makeWsRpcLayer = (
           });
 
           return yield* bootstrapProgram.pipe(
-            Effect.catchCause((cause) => {
-              const dispatchError = toBootstrapDispatchCommandCauseError(cause);
-              if (Cause.hasInterruptsOnly(cause)) {
-                return Effect.fail(dispatchError);
-              }
-              return cleanupCreatedThread().pipe(Effect.flatMap(() => Effect.fail(dispatchError)));
-            }),
+            Effect.catchCause((cause) => Effect.fail(toBootstrapDispatchCommandCauseError(cause))),
           );
         });
 
@@ -1658,6 +1716,12 @@ const makeWsRpcLayer = (
             ompAccounts
               .respondLogin(provider, flowId, response)
               .pipe(Effect.mapError(mapOmpAccountError)),
+            { "rpc.aggregate": "omp-accounts" },
+          ),
+        [WS_METHODS.ompAccountsSubmitLogin]: ({ flowId, response }) =>
+          observeRpcEffect(
+            WS_METHODS.ompAccountsSubmitLogin,
+            ompAccounts.submitLogin(flowId, response).pipe(Effect.mapError(mapOmpAccountError)),
             { "rpc.aggregate": "omp-accounts" },
           ),
         [WS_METHODS.ompAccountsCancelLogin]: ({ flowId }) =>

@@ -27,19 +27,31 @@ import { PREFERRED_DEFAULT_CODEX_MODELS, ServerSettingsError } from "@t3tools/co
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
-import {
-  AUTH_PROBE_TIMEOUT_MS,
-  buildServerProvider,
-  type ServerProviderDraft,
-} from "../providerSnapshot.ts";
+import { buildServerProvider, type ServerProviderDraft } from "../providerSnapshot.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import packageJson from "../../../package.json" with { type: "json" };
 const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
+const isCodexAppServerProcessExitedError = Schema.is(CodexErrors.CodexAppServerProcessExitedError);
+
+const isCodexSqliteContentionExit = (
+  error: CodexErrors.CodexAppServerError,
+): error is CodexErrors.CodexAppServerProcessExitedError =>
+  isCodexAppServerProcessExitedError(error) && error.reason === "sqlite-contention";
 
 const CODEX_APP_SERVER_PROBE_FORCE_KILL_AFTER = "2 seconds" as const;
 
+/**
+ * A cold Codex app-server can spend more than ten seconds loading its config,
+ * account state, and model catalog on a busy developer machine. Keep the probe
+ * bounded, but give the complete initialize/account/catalog sequence enough
+ * time to finish before treating it as transiently unavailable.
+ */
+export const CODEX_PROVIDER_PROBE_TIMEOUT_MS = 30_000;
+export const CODEX_STALE_CATALOG_MESSAGE =
+  "Codex CLI status refresh could not complete. Using the last verified account and model catalog.";
+
 const CODEX_PRESENTATION = {
-  displayName: "Codex",
+  displayName: "Codex CLI",
   showInteractionModeToggle: true,
 } as const;
 
@@ -444,7 +456,7 @@ const makePendingCodexProvider = (
           version: null,
           status: "warning",
           auth: { status: "unknown" },
-          message: "Codex is disabled in T3 Code settings.",
+          message: "The optional Codex CLI harness is disabled in T3 Code settings.",
         },
       });
     }
@@ -460,7 +472,7 @@ const makePendingCodexProvider = (
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Codex provider status has not been checked in this session yet.",
+        message: "The optional Codex CLI harness has not been checked in this session yet.",
       },
     });
   });
@@ -509,6 +521,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     ChildProcessSpawner.ChildProcessSpawner | Scope.Scope
   > = probeCodexAppServerProvider,
   environment?: NodeJS.ProcessEnv,
+  previousSnapshot?: ServerProviderDraft,
 ): Effect.fn.Return<
   ServerProviderDraft,
   ServerSettingsError,
@@ -530,26 +543,55 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Codex is disabled in T3 Code settings.",
+        message: "The optional Codex CLI harness is disabled in T3 Code settings.",
       },
     });
   }
 
-  const probeResult = yield* probe({
+  const probeInput = {
     binaryPath: codexSettings.binaryPath,
     homePath: codexSettings.homePath,
     launchArgs: resolveCodexLaunchArgs(codexSettings.launchArgs, resolvedEnvironment),
     cwd: process.cwd(),
     customModels: codexSettings.customModels,
     environment: resolvedEnvironment,
-  }).pipe(
-    Effect.scoped,
-    Effect.timeoutOption(Duration.millis(AUTH_PROBE_TIMEOUT_MS)),
-    Effect.result,
-  );
+  } as const;
+  const runProbe = () =>
+    probe(probeInput).pipe(
+      Effect.scoped,
+      Effect.timeoutOption(Duration.millis(CODEX_PROVIDER_PROBE_TIMEOUT_MS)),
+      Effect.result,
+    );
+  let probeResult = yield* runProbe();
+
+  const hasVerifiedPreviousSnapshot =
+    previousSnapshot?.status === "ready" && previousSnapshot.models.length > 0;
+  if (
+    Result.isFailure(probeResult) &&
+    isCodexSqliteContentionExit(probeResult.failure) &&
+    !hasVerifiedPreviousSnapshot
+  ) {
+    // The desktop Codex app and optional native T3 rail share CODEX_HOME. A
+    // short-lived app-server can lose the shared SQLite startup race even
+    // though the binary and account are healthy. Retry one fresh scoped child
+    // before publishing an unavailable provider; later refreshes retain the
+    // verified catalog instead of repeatedly adding database pressure.
+    probeResult = yield* runProbe();
+  }
 
   if (Result.isFailure(probeResult)) {
     const error = probeResult.failure;
+    if (
+      isCodexSqliteContentionExit(error) &&
+      previousSnapshot?.status === "ready" &&
+      previousSnapshot.models.length > 0
+    ) {
+      return {
+        ...previousSnapshot,
+        checkedAt,
+        message: CODEX_STALE_CATALOG_MESSAGE,
+      } satisfies ServerProviderDraft;
+    }
     const installed = !isCodexAppServerSpawnError(error);
     return buildServerProvider({
       presentation: CODEX_PRESENTATION,
@@ -570,6 +612,13 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
   }
 
   if (Option.isNone(probeResult.success)) {
+    if (previousSnapshot?.status === "ready" && previousSnapshot.models.length > 0) {
+      return {
+        ...previousSnapshot,
+        checkedAt,
+        message: CODEX_STALE_CATALOG_MESSAGE,
+      } satisfies ServerProviderDraft;
+    }
     return buildServerProvider({
       presentation: CODEX_PRESENTATION,
       enabled: codexSettings.enabled,
@@ -581,7 +630,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: "Timed out while checking Codex app-server provider status.",
+        message: "Timed out while checking the optional Codex CLI harness.",
       },
     });
   }

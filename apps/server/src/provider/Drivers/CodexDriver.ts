@@ -27,6 +27,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -57,10 +58,17 @@ import {
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
 } from "./CodexHomeLayout.ts";
+import { loadVerifiedCachedProviderSnapshot } from "./cachedProviderSnapshot.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("codex");
-const SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
+/**
+ * A status probe starts a real Codex app-server child and reads its account,
+ * skills, and model catalog. Keep routine refreshes infrequent; the provider
+ * performs one bounded cold-start retry and retains a verified catalog across
+ * transient shared-CODEX_HOME startup failures.
+ */
+export const CODEX_SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
 const UPDATE = makePackageManagedProviderMaintenanceResolver({
   provider: DRIVER_KIND,
   npmPackageName: "@openai/codex",
@@ -108,7 +116,7 @@ const withInstanceIdentity =
 export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
   driverKind: DRIVER_KIND,
   metadata: {
-    displayName: "Codex",
+    displayName: "Codex CLI",
     supportsMultipleInstances: true,
   },
   configSchema: CodexSettings,
@@ -117,6 +125,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const httpClient = yield* HttpClient.HttpClient;
+      const { providerStatusCacheDir } = yield* ServerConfig;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
@@ -166,10 +175,29 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       // in as instance rebuilds from the registry rather than in-place
       // updates. Pre-provide `ChildProcessSpawner` so the check fits
       // `makeManagedServerProvider.checkProvider`'s `R = never`.
-      const checkProvider = checkCodexProviderStatus(effectiveConfig, undefined, processEnv).pipe(
+      const pendingSnapshot = yield* makePendingCodexProvider(effectiveConfig).pipe(
         Effect.map(stampIdentity),
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );
+      const cachedSnapshot = yield* loadVerifiedCachedProviderSnapshot({
+        cacheDir: providerStatusCacheDir,
+        instanceId,
+        fallbackProvider: pendingSnapshot,
+      });
+      const previousSnapshotRef = yield* Ref.make<ServerProviderDraft | undefined>(cachedSnapshot);
+      const checkProvider = Effect.gen(function* () {
+        const previousSnapshot = yield* Ref.get(previousSnapshotRef);
+        const nextSnapshot = yield* checkCodexProviderStatus(
+          effectiveConfig,
+          undefined,
+          processEnv,
+          previousSnapshot,
+        );
+        yield* Ref.set(
+          previousSnapshotRef,
+          nextSnapshot.status === "ready" ? nextSnapshot : undefined,
+        );
+        return stampIdentity(nextSnapshot);
+      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<CodexSettings>>({
         maintenanceCapabilities,
@@ -177,7 +205,9 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
-          makePendingCodexProvider(settings.provider).pipe(Effect.map(stampIdentity)),
+          cachedSnapshot
+            ? Effect.succeed(cachedSnapshot)
+            : makePendingCodexProvider(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
           enrichProviderSnapshotWithVersionAdvisory(snapshot, maintenanceCapabilities, {
@@ -186,7 +216,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
             Effect.provideService(HttpClient.HttpClient, httpClient),
             Effect.flatMap((enrichedSnapshot) => publishSnapshot(enrichedSnapshot)),
           ),
-        refreshInterval: SNAPSHOT_REFRESH_INTERVAL,
+        refreshInterval: CODEX_SNAPSHOT_REFRESH_INTERVAL,
       }).pipe(
         Effect.mapError(
           (cause) =>

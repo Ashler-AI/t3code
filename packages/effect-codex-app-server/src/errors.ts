@@ -142,11 +142,15 @@ export class CodexAppServerSpawnError extends Schema.TaggedErrorClass<CodexAppSe
   }
 }
 
+export const CodexAppServerProcessExitReason = Schema.Literals(["sqlite-contention"]);
+export type CodexAppServerProcessExitReason = typeof CodexAppServerProcessExitReason.Type;
+
 export class CodexAppServerProcessExitedError extends Schema.TaggedErrorClass<CodexAppServerProcessExitedError>()(
   "CodexAppServerProcessExitedError",
   {
     code: Schema.optional(Schema.Number),
     pid: Schema.optionalKey(Schema.Int),
+    reason: Schema.optionalKey(CodexAppServerProcessExitReason),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

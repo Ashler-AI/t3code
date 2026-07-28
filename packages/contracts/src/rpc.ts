@@ -66,6 +66,7 @@ import {
   OmpAccountOverview,
   OmpAccountRef,
   OmpLoginChallenge,
+  OmpLoginSubmitResult,
 } from "./ompAccounts.ts";
 import {
   ScaffoldEnvironmentBinding,
@@ -238,6 +239,7 @@ export const WS_METHODS = {
   ompAccountsRefresh: "ompAccounts.refresh",
   ompAccountsBeginLogin: "ompAccounts.beginLogin",
   ompAccountsRespondLogin: "ompAccounts.respondLogin",
+  ompAccountsSubmitLogin: "ompAccounts.submitLogin",
   ompAccountsCancelLogin: "ompAccounts.cancelLogin",
   ompAccountsRemove: "ompAccounts.remove",
 
@@ -391,6 +393,15 @@ export const WsOmpAccountsRespondLoginRpc = Rpc.make(WS_METHODS.ompAccountsRespo
     response: Schema.String,
   }),
   success: OmpLoginChallenge,
+  error: Schema.Union([OmpAccountOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsOmpAccountsSubmitLoginRpc = Rpc.make(WS_METHODS.ompAccountsSubmitLogin, {
+  payload: Schema.Struct({
+    flowId: Schema.String,
+    response: Schema.String,
+  }),
+  success: OmpLoginSubmitResult,
   error: Schema.Union([OmpAccountOperationError, EnvironmentAuthorizationError]),
 });
 
@@ -796,6 +807,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOmpAccountsRefreshRpc,
   WsOmpAccountsBeginLoginRpc,
   WsOmpAccountsRespondLoginRpc,
+  WsOmpAccountsSubmitLoginRpc,
   WsOmpAccountsCancelLoginRpc,
   WsOmpAccountsRemoveRpc,
   WsScaffoldPauseRpc,

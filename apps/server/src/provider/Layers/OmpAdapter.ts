@@ -69,6 +69,7 @@ import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import {
   applyOmpAcpSelection,
   applyOmpAdvisorSelection,
+  assertManagedScaffoldOmpModelAllowed,
   currentOmpAdvisorIdFromSessionSetup,
   currentOmpModelIdFromSessionSetup,
   currentOmpThinkingIdFromSessionSetup,
@@ -77,6 +78,7 @@ import {
   ompModelSlugsFromSessionSetup,
   ompQuestionsFromElicitation,
   expandOmpSkillReferences,
+  filterManagedScaffoldOmpModelSlugs,
   resolveOmpThinkingSelection,
 } from "../acp/OmpAcpSupport.ts";
 import { type OmpAdapterShape } from "../Services/OmpAdapter.ts";
@@ -383,6 +385,20 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
     const offeredEventIds = new Set<EventId>();
     const metrics = yield* makeOmpMetricRecorder;
+
+    const validateManagedModelSelection = (
+      operation: string,
+      model: string | undefined,
+    ): Effect.Effect<void, ProviderAdapterValidationError> =>
+      Effect.try({
+        try: () => assertManagedScaffoldOmpModelAllowed(options?.environment ?? process.env, model),
+        catch: (cause) =>
+          new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation,
+            issue: cause instanceof Error ? cause.message : String(cause),
+          }),
+      });
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = crypto.randomUUIDv4.pipe(
@@ -1133,7 +1149,15 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
 
           const requestedStartModelId = ompModelSelection?.model?.trim() || undefined;
           const requestedStartThinkingId = resolveOmpThinkingSelection(ompModelSelection?.options);
-          const availableModelSlugs = ompModelSlugsFromSessionSetup(started.sessionSetupResult);
+          const currentStartModelId = currentOmpModelIdFromSessionSetup(started.sessionSetupResult);
+          yield* validateManagedModelSelection(
+            "startSession/model-policy",
+            requestedStartModelId ?? currentStartModelId,
+          );
+          const availableModelSlugs = filterManagedScaffoldOmpModelSlugs(
+            options?.environment ?? process.env,
+            ompModelSlugsFromSessionSetup(started.sessionSetupResult),
+          );
           if (
             requestedStartModelId !== undefined &&
             !availableModelSlugs.includes(requestedStartModelId)
@@ -1146,7 +1170,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           }
           const boundModelId = yield* applyOmpAcpSelection({
             runtime: acp,
-            currentModelId: currentOmpModelIdFromSessionSetup(started.sessionSetupResult),
+            currentModelId: currentStartModelId,
             requestedModelId: requestedStartModelId,
             thinking: requestedStartThinkingId,
             mapError: ({ cause, configId }) =>
@@ -1322,6 +1346,9 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
                   ? input.modelSelection
                   : undefined;
               const requestedTurnModelId = turnModelSelection?.model?.trim() || undefined;
+              if (requestedTurnModelId !== undefined) {
+                yield* validateManagedModelSelection("sendTurn/model-policy", requestedTurnModelId);
+              }
               const requestedTurnThinkingId = resolveOmpThinkingSelection(
                 turnModelSelection?.options,
               );

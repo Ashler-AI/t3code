@@ -1,19 +1,33 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Duration from "effect/Duration";
 
 import { builtInDriversForEnvironment } from "./builtInDrivers.ts";
+import { CLAUDE_SNAPSHOT_REFRESH_INTERVAL } from "./Drivers/ClaudeDriver.ts";
+import { CODEX_SNAPSHOT_REFRESH_INTERVAL } from "./Drivers/CodexDriver.ts";
 
 describe("built-in provider driver profile", () => {
   it("retains native provider choices for local installs", () => {
-    expect(builtInDriversForEnvironment({}).map(({ driverKind }) => driverKind)).toEqual([
+    const localDrivers = builtInDriversForEnvironment({});
+    expect(localDrivers.map(({ driverKind }) => driverKind)).toEqual([
       "omp",
       "codex",
       "claudeAgent",
+    ]);
+    expect(localDrivers.map(({ metadata }) => metadata.displayName)).toEqual([
+      "OMP",
+      "Codex CLI",
+      "Claude Code",
     ]);
     expect(
       builtInDriversForEnvironment({ T3_PROVIDER_DRIVER_MODE: "all" }).map(
         ({ driverKind }) => driverKind,
       ),
     ).toEqual(["omp", "codex", "claudeAgent"]);
+  });
+
+  it("uses a prompt recovery interval for native harness status probes", () => {
+    expect(Duration.toMillis(CODEX_SNAPSHOT_REFRESH_INTERVAL)).toBe(300_000);
+    expect(Duration.toMillis(CLAUDE_SNAPSHOT_REFRESH_INTERVAL)).toBe(30_000);
   });
 
   it("registers only OMP when the managed driver mode is explicit", () => {

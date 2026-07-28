@@ -18,6 +18,8 @@ import { randomUUID } from "../lib/utils";
 const decodePrepared = Schema.decodeUnknownOption(ScaffoldPreparedConnection);
 const decodeLifecycleError = Schema.decodeUnknownOption(ScaffoldLifecycleError);
 const isLifecycleError = Schema.is(ScaffoldLifecycleError);
+/** Allows the server's 60-second readiness window to complete before transport cancellation. */
+export const DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS = 65_000;
 
 function operationId(): string {
   return randomUUID();
@@ -41,6 +43,7 @@ export async function requestScaffoldPreparedConnection(
   input: ScaffoldPrepareConnectionInput,
   fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
   lifecycleUrl: string = resolvePrimaryEnvironmentHttpUrl("/api/scaffold/connection"),
+  timeoutMs: number = DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS,
 ): Promise<ScaffoldPreparedConnection> {
   const bearerToken = await readDesktopPrimaryBearerToken();
   let response: Response;
@@ -53,6 +56,7 @@ export async function requestScaffoldPreparedConnection(
         ...(bearerToken ? { authorization: `Bearer ${bearerToken}` } : {}),
       },
       body: JSON.stringify(input),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     throw new ScaffoldLifecycleError({

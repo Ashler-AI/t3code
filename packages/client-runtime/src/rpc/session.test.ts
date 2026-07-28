@@ -271,14 +271,14 @@ describe("RpcSessionFactory", () => {
     }),
   );
 
-  it.effect("passes the ephemeral Scaffold attach grant as a websocket subprotocol", () =>
+  it.effect("passes the Scaffold attach grant alongside the application subprotocol", () =>
     Effect.gen(function* () {
       const { factory, sockets } = yield* makeFactory();
       yield* factory.connect({ ...PREPARED, scaffoldAttachCredential: "attach-secret" });
       const socket = yield* awaitSocket(sockets);
 
       expect(socket.url).toBe(PREPARED.socketUrl);
-      expect(socket.protocols).toEqual(["scaffold.attach.attach-secret"]);
+      expect(socket.protocols).toEqual(["scaffold.attach.attach-secret", "t3.app"]);
     }),
   );
 

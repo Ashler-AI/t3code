@@ -1,9 +1,15 @@
+// @effect-diagnostics nodeBuiltinImport:off -- These integration-style tests exercise the real filesystem and POSIX receiver boundary.
 import { describe, expect, it, vi } from "@effect/vitest";
 import { type OrchestrationProject, ProjectId } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
@@ -195,5 +201,253 @@ describe("ProjectSetupScriptRunner", () => {
         }),
       ),
     );
+  });
+
+  it.effect("redelivers a request-only invocation after terminal delivery is interrupted", () => {
+    const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-setup-request-"));
+    const project = makeProject([
+      {
+        id: "setup",
+        name: "Setup",
+        command: "printf setup",
+        icon: "configure",
+        runOnWorktreeCreate: true,
+      },
+    ]);
+    const input = {
+      threadId: "thread-1",
+      projectId: "project-1",
+      worktreePath: "/repo/worktrees/a",
+      invocationId: "invocation-request-only",
+      idempotencyStateDir: stateDir,
+    };
+    const snapshot = {
+      threadId: "thread-1",
+      terminalId: "setup-setup",
+      cwd: "/repo/worktrees/a",
+      worktreePath: "/repo/worktrees/a",
+      status: "running" as const,
+      pid: 123,
+      history: "",
+      exitCode: null,
+      exitSignal: null,
+      label: "setup-setup",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const interruptedWrite = vi.fn(() =>
+      Effect.fail(
+        new TerminalManager.TerminalWriteError({
+          threadId: "thread-1",
+          terminalId: "setup-setup",
+          terminalPid: 123,
+          cause: new Error("interrupted before receiver accepted bytes"),
+        }),
+      ),
+    );
+    const replayWrite = vi.fn(() => Effect.void);
+
+    return Effect.gen(function* () {
+      yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.flatMap((runner) => runner.runForThread(input)),
+        Effect.provide(
+          testLayer(project, { open: () => Effect.succeed(snapshot), write: interruptedWrite }),
+        ),
+        Effect.flip,
+      );
+      const replay = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.flatMap((runner) => runner.runForThread(input)),
+        Effect.provide(
+          testLayer(project, { open: () => Effect.succeed(snapshot), write: replayWrite }),
+        ),
+      );
+
+      expect(replay.status).toBe("started");
+      expect(interruptedWrite).toHaveBeenCalledTimes(1);
+      expect(replayWrite).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.ensuring(Effect.sync(() => NodeFS.rmSync(stateDir, { recursive: true }))));
+  });
+
+  it.effect("executes once in the live terminal shell across duplicate deliveries", () => {
+    const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-setup-receiver-"));
+    const outputPath = NodePath.join(stateDir, "executions.txt");
+    const command = 'live_setup "$LIVE_SETUP_VALUE"';
+    const project = makeProject([
+      {
+        id: "setup",
+        name: "Setup",
+        command,
+        icon: "configure",
+        runOnWorktreeCreate: true,
+      },
+    ]);
+    let delivered = "";
+    const terminal = {
+      open: () =>
+        Effect.succeed({
+          threadId: "thread-1",
+          terminalId: "setup-setup",
+          cwd: stateDir,
+          worktreePath: stateDir,
+          status: "running" as const,
+          pid: 123,
+          history: "",
+          exitCode: null,
+          exitSignal: null,
+          label: "setup-setup",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      write: (input: { readonly data: string }) =>
+        Effect.sync(() => {
+          delivered = input.data.trim();
+        }),
+    };
+    const input = {
+      threadId: "thread-1",
+      projectId: "project-1",
+      worktreePath: stateDir,
+      invocationId: "invocation-duplicate-delivery",
+      idempotencyStateDir: stateDir,
+    };
+
+    return Effect.gen(function* () {
+      yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.flatMap((runner) => runner.runForThread(input)),
+        Effect.provide(testLayer(project, terminal)),
+      );
+      NodeChildProcess.execFileSync(
+        "/bin/sh",
+        [
+          "-c",
+          [
+            'live_setup() { printf \'%s\\n\' "$1" >> "$LIVE_SETUP_OUTPUT"; }',
+            "LIVE_SETUP_VALUE=executed",
+            delivered,
+          ].join("\n"),
+        ],
+        {
+          env: { ...process.env, LIVE_SETUP_OUTPUT: outputPath },
+        },
+      );
+      NodeChildProcess.execFileSync("/bin/sh", ["-c", delivered]);
+
+      expect(NodeFS.readFileSync(outputPath, "utf8")).toBe("executed\n");
+      const [ledgerDir] = NodeFS.readdirSync(NodePath.join(stateDir, "setup-invocations"));
+      expect(ledgerDir).toBeDefined();
+      expect(
+        NodeFS.readFileSync(
+          NodePath.join(stateDir, "setup-invocations", ledgerDir!, "result.json"),
+          "utf8",
+        ),
+      ).toBe('{"status":0}');
+
+      const open = vi.fn(() => Effect.die("completed invocation must not reopen terminal"));
+      const write = vi.fn(() => Effect.die("completed invocation must not redeliver"));
+      const reconciled = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.flatMap((runner) => runner.runForThread(input)),
+        Effect.provide(testLayer(project, { open, write })),
+      );
+      expect(reconciled.status).toBe("started");
+      expect(open).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    }).pipe(Effect.ensuring(Effect.sync(() => NodeFS.rmSync(stateDir, { recursive: true }))));
+  });
+
+  it.effect("fails closed when an invocation was claimed without a result", () => {
+    const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-setup-ambiguous-"));
+    const project = makeProject([
+      {
+        id: "setup",
+        name: "Setup",
+        command: "printf setup",
+        icon: "configure",
+        runOnWorktreeCreate: true,
+      },
+    ]);
+    let delivered = "";
+    const snapshot = {
+      threadId: "thread-1",
+      terminalId: "setup-setup",
+      cwd: stateDir,
+      worktreePath: stateDir,
+      status: "running" as const,
+      pid: 123,
+      history: "",
+      exitCode: null,
+      exitSignal: null,
+      label: "setup-setup",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const input = {
+      threadId: "thread-1",
+      projectId: "project-1",
+      worktreePath: stateDir,
+      invocationId: "invocation-ambiguous",
+      idempotencyStateDir: stateDir,
+    };
+
+    return Effect.gen(function* () {
+      yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.flatMap((runner) => runner.runForThread(input)),
+        Effect.provide(
+          testLayer(project, {
+            open: () => Effect.succeed(snapshot),
+            write: ({ data }) => Effect.sync(() => void (delivered = data)),
+          }),
+        ),
+      );
+      expect(delivered).not.toBe("");
+      const [ledgerDir] = NodeFS.readdirSync(NodePath.join(stateDir, "setup-invocations"));
+      expect(ledgerDir).toBeDefined();
+      NodeFS.writeFileSync(NodePath.join(stateDir, "setup-invocations", ledgerDir!, "claim"), "");
+
+      const error = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.flatMap((runner) => runner.runForThread(input)),
+        Effect.provide(
+          testLayer(project, {
+            open: () => Effect.die("ambiguous invocation must not reopen terminal"),
+            write: () => Effect.die("ambiguous invocation must not redeliver"),
+          }),
+        ),
+        Effect.flip,
+      );
+      expect(error._tag).toBe("ProjectSetupScriptAmbiguousInvocationError");
+      expect(error.message).toBe("Setup was interrupted before completion. Run it manually.");
+    }).pipe(Effect.ensuring(Effect.sync(() => NodeFS.rmSync(stateDir, { recursive: true }))));
+  });
+
+  it.effect("fails closed for idempotent setup delivery on Windows", () => {
+    const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-setup-windows-"));
+    const project = makeProject([
+      {
+        id: "setup",
+        name: "Setup",
+        command: "npm install",
+        icon: "configure",
+        runOnWorktreeCreate: true,
+      },
+    ]);
+    const open = vi.fn(() => Effect.die("unsupported delivery must not open a terminal"));
+    const write = vi.fn(() => Effect.die("unsupported delivery must not write a command"));
+
+    return Effect.gen(function* () {
+      const error = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.flatMap((runner) =>
+          runner.runForThread({
+            threadId: "thread-1",
+            projectId: "project-1",
+            worktreePath: "C:\\repo\\worktree",
+            invocationId: "invocation-windows",
+            idempotencyStateDir: stateDir,
+          }),
+        ),
+        Effect.provide(testLayer(project, { open, write })),
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.flip,
+      );
+
+      expect(error._tag).toBe("ProjectSetupScriptOperationError");
+      expect(open).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    }).pipe(Effect.ensuring(Effect.sync(() => NodeFS.rmSync(stateDir, { recursive: true }))));
   });
 });

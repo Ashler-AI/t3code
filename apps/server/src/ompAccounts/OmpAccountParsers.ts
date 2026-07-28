@@ -9,6 +9,7 @@ import {
   type OmpUsageAmount,
   type OmpUsageLimit,
   type OmpUsageReport,
+  type OmpUsageResetCredits,
   type OmpUsageSnapshot,
   type OmpUsageStatus,
   type OmpUsageUnit,
@@ -227,6 +228,7 @@ function parseUsageReport(value: unknown): OmpUsageReport | undefined {
     asString(record.maskedAccount) ?? asString(record.email) ?? asString(metadata?.email);
   const maskedAccount =
     rawAccount?.includes("@") && !rawAccount.includes("***") ? maskEmail(rawAccount) : rawAccount;
+  const resetCredits = parseUsageResetCredits(record.resetCredits);
   const notes = stringArray(record.notes);
   return {
     provider,
@@ -234,7 +236,36 @@ function parseUsageReport(value: unknown): OmpUsageReport | undefined {
     ...(maskedAccount ? { maskedAccount } : {}),
     fetchedAt,
     limits,
+    ...(resetCredits ? { resetCredits } : {}),
     ...(notes ? { notes } : {}),
+  };
+}
+
+function parseUsageResetCredits(value: unknown): OmpUsageResetCredits | undefined {
+  const record = asRecord(value);
+  const availableCount = asFiniteNumber(record?.availableCount);
+  if (!record || availableCount === undefined) return undefined;
+
+  const credits = Array.isArray(record.credits)
+    ? record.credits.flatMap((entry) => {
+        const credit = asRecord(entry);
+        if (!credit) return [];
+        const grantedAt = asString(credit.grantedAt);
+        const expiresAt = asString(credit.expiresAt);
+        const status = asString(credit.status);
+        return [
+          {
+            ...(grantedAt ? { grantedAt } : {}),
+            ...(expiresAt ? { expiresAt } : {}),
+            ...(status ? { status } : {}),
+          },
+        ];
+      })
+    : undefined;
+
+  return {
+    availableCount,
+    ...(credits ? { credits } : {}),
   };
 }
 
@@ -297,9 +328,11 @@ export function parseOmpLoginChallenge(
   const flowId = asString(record.flowId);
   const rawKind = asString(record.kind) ?? asString(record.status);
   const kind =
-    rawKind === "browser" || rawKind === "code" || rawKind === "input" || rawKind === "complete"
-      ? rawKind
-      : undefined;
+    rawKind === "code"
+      ? "input"
+      : rawKind === "browser" || rawKind === "input" || rawKind === "complete"
+        ? rawKind
+        : undefined;
   if (!flowId || !kind) return undefined;
   const rawMaskedAccount = asString(record.maskedAccount) ?? asString(record.email);
   const maskedAccount =
@@ -309,16 +342,21 @@ export function parseOmpLoginChallenge(
   const url = asString(record.url);
   const message = asString(record.message);
   const prompt = asString(record.prompt);
+  const inputType =
+    kind === "input" && (rawKind === "code" || record.inputType === "code") ? "code" : undefined;
+  const expiresAt = asFiniteNumber(record.expiresAt);
   const outcome =
     record.outcome === "success" || record.outcome === "failure" ? record.outcome : undefined;
   return {
     flowId,
     provider,
     kind,
+    ...(inputType ? { inputType } : {}),
     ...(url ? { url } : {}),
     ...(message ? { message } : {}),
     ...(prompt ? { prompt } : {}),
     ...(maskedAccount ? { maskedAccount } : {}),
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
     ...(outcome ? { outcome } : {}),
   };
 }

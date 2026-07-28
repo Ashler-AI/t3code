@@ -33,6 +33,33 @@ describe("runtimeBasePath", () => {
     expect(resolveRuntimePathname("/")).toBe("/sessions/session-123/agent/");
   });
 
+  it("derives a Scaffold mount from the proxy-rewritten document base", () => {
+    vi.stubGlobal("window", {
+      location: new URL("https://scaffold.example.test/sessions/session-123/agent/thread/1"),
+    });
+    vi.stubGlobal("document", {
+      baseURI: "https://scaffold.example.test/sessions/session-123/agent/",
+    });
+
+    expect(readRuntimeBasePath()).toBe("/sessions/session-123/agent");
+    expect(resolveRuntimePathname("/api/auth/session")).toBe(
+      "/sessions/session-123/agent/api/auth/session",
+    );
+  });
+
+  it("rejects a cross-origin document base for runtime requests", () => {
+    vi.stubGlobal("window", {
+      location: new URL("https://scaffold.example.test/sessions/session-123/agent/"),
+    });
+    vi.stubGlobal("document", {
+      baseURI: "https://attacker.example.test/sessions/session-123/agent/",
+    });
+
+    expect(() => readRuntimeBasePath()).toThrow(
+      "The document base URL must use the current window origin.",
+    );
+  });
+
   it.each([
     [undefined, ""],
     ["", ""],

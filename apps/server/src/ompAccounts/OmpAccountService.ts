@@ -5,6 +5,7 @@ import type {
   OmpAccountOverview,
   OmpAccountsSnapshot,
   OmpLoginChallenge,
+  OmpLoginSubmitResult,
   OmpUsageSnapshot,
   ThreadId,
 } from "@t3tools/contracts";
@@ -26,6 +27,7 @@ export const OMP_ACCOUNT_METHODS = {
   list: "_omp/accounts/list",
   login: "_omp/accounts/login",
   loginRespond: "_omp/accounts/login/respond",
+  loginSubmit: "_omp/accounts/login/submit",
   loginCancel: "_omp/accounts/login/cancel",
   remove: "_omp/accounts/remove",
   assignment: "_omp/accounts/assignment",
@@ -59,6 +61,7 @@ export class OmpAccountTransportError extends Schema.TaggedErrorClass<OmpAccount
   "OmpAccountTransportError",
   {
     detail: Schema.String,
+    category: Schema.optional(Schema.Literal("runtime-restarted")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -66,6 +69,7 @@ export class OmpAccountTransportError extends Schema.TaggedErrorClass<OmpAccount
     return this.detail;
   }
 }
+export const isOmpAccountTransportError = Schema.is(OmpAccountTransportError);
 
 export interface OmpAccountExtensionTransport {
   readonly request: (
@@ -91,6 +95,10 @@ export interface OmpAccountServiceShape {
     flowId: string,
     response: string,
   ) => Effect.Effect<OmpLoginChallenge, OmpAccountServiceError>;
+  readonly submitLogin: (
+    flowId: string,
+    response: string,
+  ) => Effect.Effect<OmpLoginSubmitResult, OmpAccountServiceError>;
   readonly cancelLogin: (flowId: string) => Effect.Effect<void, OmpAccountServiceError>;
   readonly removeAccount: (
     accountRef: OmpAccountRef,
@@ -98,6 +106,7 @@ export interface OmpAccountServiceShape {
   readonly getAssignmentForSession: (
     nativeSessionId: string,
     threadId: ThreadId,
+    provider?: string,
   ) => Effect.Effect<OmpAccountAssignment, OmpAccountServiceError>;
 }
 
@@ -127,6 +136,14 @@ function readOmpNativeSessionId(resumeCursor: unknown): string | undefined {
   return cursor.sessionId.trim();
 }
 
+function readOmpAccountProvider(model: string | undefined): string | undefined {
+  const provider = model?.split("/", 1)[0]?.trim().toLowerCase();
+  if (!provider) return undefined;
+  // OMP's ChatGPT OAuth credentials are persisted under the canonical
+  // openai-codex provider even when a catalog alias uses openai/model.
+  return provider === "openai" ? "openai-codex" : provider;
+}
+
 /** Resolve a browser-visible T3 thread to its private OMP session server-side. */
 export const getOmpThreadAccountAssignment = Effect.fn("getOmpThreadAccountAssignment")(function* (
   providerService: Pick<ProviderServiceShape, "listSessions">,
@@ -153,7 +170,11 @@ export const getOmpThreadAccountAssignment = Effect.fn("getOmpThreadAccountAssig
   if (!nativeSessionId) {
     return yield* assignmentUnavailable("This OMP session has not started yet.");
   }
-  return yield* accounts.getAssignmentForSession(nativeSessionId, threadId);
+  return yield* accounts.getAssignmentForSession(
+    nativeSessionId,
+    threadId,
+    readOmpAccountProvider(session.model),
+  );
 });
 
 const ACCOUNT_REFRESH_WARNING =
@@ -199,6 +220,7 @@ function capabilityForOperation(operation: OmpAccountOperation): OmpAccountCapab
       return "accounts";
     case "login":
     case "loginRespond":
+    case "loginSubmit":
     case "loginCancel":
       return "login";
     case "remove":
@@ -257,14 +279,20 @@ export const makeOmpAccountService = Effect.fn("makeOmpAccountService")(function
       detail: "This Scaffold environment manages OpenAI and Anthropic accounts centrally.",
     });
 
-  const requestError = (operation: OmpAccountOperation, reason: "unavailable" | "request-failed") =>
+  const requestError = (
+    operation: OmpAccountOperation,
+    reason: "unavailable" | "request-failed",
+    cause?: unknown,
+  ) =>
     new OmpAccountServiceError({
       reason,
       operation,
       detail:
         reason === "unavailable"
           ? "This OMP runtime does not support the requested account operation."
-          : "OMP could not complete the requested account operation.",
+          : isOmpAccountTransportError(cause) && cause.category === "runtime-restarted"
+            ? "The OMP account connection restarted. Start sign-in again."
+            : "OMP could not complete the requested account operation.",
     });
 
   const invalidResponse = (operation: OmpAccountOperation) =>
@@ -335,7 +363,7 @@ export const makeOmpAccountService = Effect.fn("makeOmpAccountService")(function
   });
 
   const requireMutation = Effect.fn("OmpAccountService.requireMutation")(function* (
-    operation: "login" | "loginRespond" | "loginCancel" | "remove",
+    operation: "login" | "loginRespond" | "loginSubmit" | "loginCancel" | "remove",
     payload: unknown,
   ) {
     if (managed) return yield* rejectManaged(operation);
@@ -345,7 +373,9 @@ export const makeOmpAccountService = Effect.fn("makeOmpAccountService")(function
       yield* setCapability(capability, false);
       return yield* requestError(operation, "unavailable");
     }
-    if (result._tag === "Failure") return yield* requestError(operation, "request-failed");
+    if (result._tag === "Failure") {
+      return yield* requestError(operation, "request-failed", result.cause);
+    }
     yield* setCapability(capability, true);
     return result.value;
   });
@@ -368,6 +398,33 @@ export const makeOmpAccountService = Effect.fn("makeOmpAccountService")(function
     return challenge;
   });
 
+  const submitLogin = Effect.fn("OmpAccountService.submitLogin")(function* (
+    flowId: string,
+    response: string,
+  ) {
+    if (managed) return yield* rejectManaged("loginSubmit");
+    const result = yield* call("loginSubmit", { flowId, response });
+    // login/submit is an optional concurrency extension. Its absence says
+    // nothing about the baseline login/respond protocol.
+    if (result._tag === "Missing") return { supported: false, accepted: false };
+    if (result._tag === "Failure") {
+      return yield* requestError("loginSubmit", "request-failed", result.cause);
+    }
+    const value = result.value;
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      typeof (value as { readonly accepted?: unknown }).accepted !== "boolean"
+    ) {
+      return yield* invalidResponse("loginSubmit");
+    }
+    return {
+      supported: true,
+      accepted: (value as { readonly accepted: boolean }).accepted,
+    };
+  });
+
   const cancelLogin = Effect.fn("OmpAccountService.cancelLogin")(function* (flowId: string) {
     yield* requireMutation("loginCancel", { flowId });
   });
@@ -384,13 +441,19 @@ export const makeOmpAccountService = Effect.fn("makeOmpAccountService")(function
   const getAssignmentForSession = Effect.fn("OmpAccountService.getAssignmentForSession")(function* (
     nativeSessionId: string,
     threadId: ThreadId,
+    provider?: string,
   ) {
-    const result = yield* call("assignment", { sessionId: nativeSessionId });
+    const result = yield* call("assignment", {
+      sessionId: nativeSessionId,
+      ...(provider ? { provider } : {}),
+    });
     if (result._tag === "Missing") {
       yield* setCapability("assignment", false);
       return { threadId, account: null, automatic: true } satisfies OmpAccountAssignment;
     }
-    if (result._tag === "Failure") return yield* requestError("assignment", "request-failed");
+    if (result._tag === "Failure") {
+      return yield* requestError("assignment", "request-failed", result.cause);
+    }
     const assignment = parseOmpAccountAssignment(result.value, threadId, { managed });
     if (!assignment) return yield* invalidResponse("assignment");
     yield* setCapability("assignment", true);
@@ -403,6 +466,7 @@ export const makeOmpAccountService = Effect.fn("makeOmpAccountService")(function
     getUsage,
     beginLogin,
     respondLogin,
+    submitLogin,
     cancelLogin,
     removeAccount,
     getAssignmentForSession,

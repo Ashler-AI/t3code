@@ -29,17 +29,26 @@ describe("resolveCodexLaunchArgs", () => {
 });
 
 describe("codexAppServerArgs", () => {
-  it("returns the app-server command for empty launch args", () => {
-    NodeAssert.deepStrictEqual(codexAppServerArgs(""), ["app-server"]);
+  it("pins the app-server child transport to stdio for empty launch args", () => {
+    NodeAssert.deepStrictEqual(codexAppServerArgs(""), ["app-server", "--listen", "stdio://"]);
   });
 
-  it("appends parsed launch args after app-server", () => {
+  it("appends parsed launch args after the required stdio transport", () => {
     NodeAssert.deepStrictEqual(codexAppServerArgs("--strict-config --enable foo"), [
       "app-server",
+      "--listen",
+      "stdio://",
       "--strict-config",
       "--enable",
       "foo",
     ]);
+  });
+
+  it("replaces configured listener overrides instead of passing duplicate flags", () => {
+    NodeAssert.deepStrictEqual(
+      codexAppServerArgs("--listen off --strict-config --listen=ws://127.0.0.1:9999"),
+      ["app-server", "--listen", "stdio://", "--strict-config"],
+    );
   });
 });
 

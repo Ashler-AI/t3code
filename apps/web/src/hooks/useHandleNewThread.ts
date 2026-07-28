@@ -4,10 +4,17 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
-import { DEFAULT_RUNTIME_MODE, type ScopedProjectRef } from "@t3tools/contracts";
+import {
+  DEFAULT_RUNTIME_MODE,
+  type ModelSelection,
+  type ScopedProjectRef,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { useParams, useRouter } from "@tanstack/react-router";
+import { buildProviderOptionSelectionsFromDescriptors } from "@t3tools/shared/model";
 import { useCallback, useMemo } from "react";
 import {
+  type DraftId,
   markPromotedDraftThreadByRef,
   type DraftThreadEnvMode,
   type DraftThreadState,
@@ -26,7 +33,226 @@ import { primaryServerSettingsAtom } from "../state/server";
 import { resolveThreadRouteTarget } from "../threadRoutes";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
 import { selectDefaultNewThreadProject } from "../newThreadProject";
+import { getDefaultProviderInstanceModel } from "../providerInstances";
 import { useClientSettings } from "./useSettings";
+
+interface DraftNavigationRequest {
+  readonly draftId: DraftId;
+  readonly replace: boolean;
+}
+
+interface DraftNavigationIntent {
+  readonly generation: number;
+  readonly request: DraftNavigationRequest;
+}
+
+type DraftNavigationCoordinator = (request: DraftNavigationRequest) => Promise<void>;
+
+export interface LatestSingleFlightContext<T> {
+  readonly latest: () => T;
+  readonly observeLatest: (observer: (value: T) => void) => void;
+  readonly lockLatest: () => T;
+}
+
+/**
+ * Coalesces overlapping requests into one operation while allowing the caller
+ * to use the newest request until it crosses its durable side-effect boundary.
+ * Requests after that lock coalesce into one queued flight instead of being
+ * mistaken for updates to the already-durable operation.
+ */
+export function createLatestSingleFlightCoordinator<T>(
+  execute: (initial: T, context: LatestSingleFlightContext<T>) => Promise<void>,
+): (request: T) => Promise<void> {
+  interface Flight {
+    initial: T;
+    latest: T;
+    locked: boolean;
+    observer: ((value: T) => void) | null;
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  }
+
+  let active: Flight | null = null;
+  let queued: Flight | null = null;
+
+  const createFlight = (request: T): Flight => {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((complete, fail) => {
+      resolve = complete;
+      reject = fail;
+    });
+    return {
+      initial: request,
+      latest: request,
+      locked: false,
+      observer: null,
+      promise,
+      resolve,
+      reject,
+    };
+  };
+
+  const startFlight = (flight: Flight): void => {
+    active = flight;
+    const context: LatestSingleFlightContext<T> = {
+      latest: () => flight.latest,
+      observeLatest: (observer) => {
+        flight.observer = observer;
+        observer(flight.latest);
+      },
+      lockLatest: () => {
+        flight.locked = true;
+        return flight.latest;
+      },
+    };
+
+    void Promise.resolve()
+      .then(() => execute(flight.initial, context))
+      .then(
+        () => flight.resolve(),
+        (error: unknown) => flight.reject(error),
+      )
+      .finally(() => {
+        if (active !== flight) return;
+        const next = queued;
+        queued = null;
+        if (next) {
+          startFlight(next);
+        } else {
+          active = null;
+        }
+      });
+  };
+
+  return (request) => {
+    if (active) {
+      if (!active.locked) {
+        active.latest = request;
+        active.observer?.(request);
+        return active.promise;
+      }
+      if (queued) {
+        queued.latest = request;
+        queued.observer?.(request);
+        return queued.promise;
+      }
+      queued = createFlight(request);
+      return queued.promise;
+    }
+
+    const flight = createFlight(request);
+    startFlight(flight);
+    return flight.promise;
+  };
+}
+
+/** Scaffold images expose OMP only; local-only direct providers cannot cross the boundary. */
+export function resolveScaffoldDraftModelSelection(
+  providers: ReadonlyArray<ServerProvider>,
+  sourceSelection: ModelSelection | null | undefined,
+): ModelSelection | null {
+  const ompProvider = providers.find(
+    (provider) => provider.instanceId === "omp" && provider.driver === "omp",
+  );
+  if (!ompProvider) return null;
+  if (
+    sourceSelection?.instanceId === ompProvider.instanceId &&
+    ompProvider.models.some((model) => model.slug === sourceSelection.model)
+  ) {
+    return sourceSelection;
+  }
+
+  if (sourceSelection?.instanceId === ompProvider.instanceId) {
+    const routePayload = sourceSelection.model.split("/").slice(1).join("/");
+    if (routePayload.length > 0) {
+      const matchingModels = ompProvider.models.filter(
+        (model) => model.slug.split("/").slice(1).join("/") === routePayload,
+      );
+      if (matchingModels.length === 1) {
+        return {
+          ...sourceSelection,
+          instanceId: ompProvider.instanceId,
+          model: matchingModels[0]!.slug,
+        };
+      }
+    }
+  }
+
+  const model = getDefaultProviderInstanceModel([ompProvider], ompProvider.instanceId);
+  if (!model) return null;
+  const selectedModel = ompProvider.models.find((candidate) => candidate.slug === model);
+  const options = buildProviderOptionSelectionsFromDescriptors(
+    selectedModel?.capabilities?.optionDescriptors,
+  );
+  return {
+    instanceId: ompProvider.instanceId,
+    model,
+    ...(options ? { options } : {}),
+  };
+}
+
+/**
+ * Keeps overlapping draft navigations converged on the newest request.
+ *
+ * TanStack navigation promises may settle out of order while loaders prepare a
+ * draft. A stale completion must not leave the UI on an older draft after the
+ * user has already selected a newer session target.
+ */
+export function createLatestDraftNavigationCoordinator(
+  navigate: (request: DraftNavigationRequest) => Promise<void>,
+): DraftNavigationCoordinator {
+  let generation = 0;
+  let latest: DraftNavigationIntent | null = null;
+
+  const convergeOnLatest = async (completed: DraftNavigationIntent): Promise<void> => {
+    const repair: DraftNavigationIntent | null = latest;
+    if (repair === null || repair === completed) return;
+    await navigate({ ...repair.request, replace: true });
+    await convergeOnLatest(repair);
+  };
+
+  return async (request) => {
+    const intent = { generation: ++generation, request };
+    latest = intent;
+
+    let navigationFailed = false;
+    let navigationError: unknown;
+    try {
+      await navigate(request);
+    } catch (error) {
+      navigationFailed = true;
+      navigationError = error;
+    }
+
+    if (latest === intent) {
+      if (navigationFailed) throw navigationError;
+      return;
+    }
+
+    // The stale navigation may have committed after the newer one. Reassert
+    // the latest destination, and keep converging if another request arrives
+    // while that repair is in flight.
+    await convergeOnLatest(intent);
+  };
+}
+
+// The command palette unmounts as soon as an action runs. Keep the coordinator
+// on the router identity so reopening the palette cannot reset ordering while
+// an older navigation is still in flight.
+const latestDraftNavigationByRouter = new WeakMap<object, DraftNavigationCoordinator>();
+
+function getLatestDraftNavigationCoordinator(
+  router: object,
+  navigate: (request: DraftNavigationRequest) => Promise<void>,
+): DraftNavigationCoordinator {
+  const existing = latestDraftNavigationByRouter.get(router);
+  if (existing) return existing;
+  const created = createLatestDraftNavigationCoordinator(navigate);
+  latestDraftNavigationByRouter.set(router, created);
+  return created;
+}
 
 export function useNewThreadHandler() {
   const projects = useProjects();
@@ -38,6 +264,17 @@ export function useNewThreadHandler() {
   const primaryServerSettings = useAtomValue(primaryServerSettingsAtom);
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
   const router = useRouter();
+  const navigateToLatestDraft = useMemo(
+    () =>
+      getLatestDraftNavigationCoordinator(router, ({ draftId, replace }) =>
+        router.navigate({
+          to: "/draft/$draftId",
+          params: { draftId },
+          replace,
+        }),
+      ),
+    [router],
+  );
   const getCurrentRouteTarget = useCallback(() => {
     const currentRouteParams = router.state.matches[router.state.matches.length - 1]?.params ?? {};
     return resolveThreadRouteTarget(currentRouteParams);
@@ -54,6 +291,9 @@ export function useNewThreadHandler() {
         forceNew?: boolean;
         replace?: boolean;
         onDraftCreated?: (draftId: import("../composerDraftStore").DraftId) => void;
+        prepareDraftBeforeNavigation?: (
+          draftId: import("../composerDraftStore").DraftId,
+        ) => Promise<void>;
       },
     ): Promise<void> => {
       const {
@@ -195,7 +435,7 @@ export function useNewThreadHandler() {
             reusableStoredDraftThread.draftId,
             {
               threadId: reusableStoredDraftThread.threadId,
-              ...(workspaceContext ?? {}),
+              ...workspaceContext,
               ...(carryRuntimeMode ? { runtimeMode: carryRuntimeMode } : {}),
               ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
             },
@@ -206,9 +446,8 @@ export function useNewThreadHandler() {
           ) {
             return;
           }
-          await router.navigate({
-            to: "/draft/$draftId",
-            params: { draftId: reusableStoredDraftThread.draftId },
+          await navigateToLatestDraft({
+            draftId: reusableStoredDraftThread.draftId,
             replace: options?.replace ?? false,
           });
         })();
@@ -280,14 +519,21 @@ export function useNewThreadHandler() {
 
         options?.onDraftCreated?.(draftId);
 
-        await router.navigate({
-          to: "/draft/$draftId",
-          params: { draftId },
+        await options?.prepareDraftBeforeNavigation?.(draftId);
+
+        await navigateToLatestDraft({
+          draftId,
           replace: options?.replace ?? false,
         });
       })();
     },
-    [getCurrentRouteTarget, primaryServerSettings, projectGroupingSettings, projects, router],
+    [
+      getCurrentRouteTarget,
+      navigateToLatestDraft,
+      primaryServerSettings,
+      projectGroupingSettings,
+      projects,
+    ],
   );
 }
 

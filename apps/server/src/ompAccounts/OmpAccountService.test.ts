@@ -74,6 +74,18 @@ const usageResponse = {
         accountId: "raw-upstream-account-id",
         email: "zhenchristopher@gmail.com",
       },
+      resetCredits: {
+        availableCount: 2,
+        credits: [
+          {
+            id: "credential-private-reset-id",
+            grantedAt: "2026-07-24T20:00:00.000Z",
+            expiresAt: "2026-08-24T20:00:00.000Z",
+            status: "available",
+            providerPayload: { secret: "never-return-this" },
+          },
+        ],
+      },
       limits: [
         {
           id: "openai-codex:weekly:primary",
@@ -120,6 +132,43 @@ describe("OMP account parsers", () => {
     });
   });
 
+  it("preserves manual-code metadata and challenge expiry", () => {
+    expect(
+      parseOmpLoginChallenge(
+        {
+          flowId: "login_code",
+          kind: "input",
+          inputType: "code",
+          prompt: "Paste the authorization code or full redirect URL.",
+          expiresAt: 1_753_394_400_000,
+        },
+        "anthropic",
+      ),
+    ).toEqual({
+      flowId: "login_code",
+      provider: "anthropic",
+      kind: "input",
+      inputType: "code",
+      prompt: "Paste the authorization code or full redirect URL.",
+      expiresAt: 1_753_394_400_000,
+    });
+  });
+
+  it("normalizes the legacy code challenge to canonical input metadata", () => {
+    expect(
+      parseOmpLoginChallenge(
+        { flowId: "login_legacy", kind: "code", prompt: "Paste the code." },
+        "anthropic",
+      ),
+    ).toEqual({
+      flowId: "login_legacy",
+      provider: "anthropic",
+      kind: "input",
+      inputType: "code",
+      prompt: "Paste the code.",
+    });
+  });
+
   it("masks identities and strips raw credential and usage identifiers", () => {
     const accounts = parseOmpAccountsList(accountResponse);
     const usage = parseOmpUsageResponse(usageResponse);
@@ -143,11 +192,23 @@ describe("OMP account parsers", () => {
       provider: "openai-codex",
       tier: "pro",
     });
+    expect(usage?.reports[0]?.resetCredits).toEqual({
+      availableCount: 2,
+      credits: [
+        {
+          grantedAt: "2026-07-24T20:00:00.000Z",
+          expiresAt: "2026-08-24T20:00:00.000Z",
+          status: "available",
+        },
+      ],
+    });
     const serialized = JSON.stringify({ accounts, usage });
     expect(serialized).not.toContain("secret");
     expect(serialized).not.toContain("raw-upstream-account-id");
     expect(serialized).not.toContain("raw-project-id");
     expect(serialized).not.toContain("raw-org-id");
+    expect(serialized).not.toContain("credential-private-reset-id");
+    expect(serialized).not.toContain("providerPayload");
     expect(serialized).not.toContain("Spark");
   });
 
@@ -203,6 +264,73 @@ describe("OMP account parsers", () => {
 });
 
 describe("OmpAccountService", () => {
+  it.effect("probes the optional submit extension with an empty response", () =>
+    Effect.gen(function* () {
+      const requests: Array<{ method: string; payload: unknown }> = [];
+      const service = yield* makeOmpAccountService({
+        request: (method, payload) => {
+          requests.push({ method, payload });
+          return Effect.succeed({ accepted: false });
+        },
+      });
+
+      const result = yield* service.submitLogin("login_probe", "");
+
+      expect(result).toEqual({ supported: true, accepted: false });
+      expect(requests).toEqual([
+        {
+          method: OMP_ACCOUNT_METHODS.loginSubmit,
+          payload: { flowId: "login_probe", response: "" },
+        },
+      ]);
+    }),
+  );
+
+  it.effect("submits manual login input through the immediate idempotent extension", () =>
+    Effect.gen(function* () {
+      const requests: Array<{ method: string; payload: unknown }> = [];
+      const service = yield* makeOmpAccountService({
+        request: (method, payload) => {
+          requests.push({ method, payload });
+          return Effect.succeed({ accepted: requests.length === 1 });
+        },
+      });
+
+      const accepted = yield* service.submitLogin("login_manual", "callback-code");
+      const duplicate = yield* service.submitLogin("login_manual", "callback-code");
+
+      expect(accepted).toEqual({ supported: true, accepted: true });
+      expect(duplicate).toEqual({ supported: true, accepted: false });
+      expect(requests).toEqual([
+        {
+          method: OMP_ACCOUNT_METHODS.loginSubmit,
+          payload: { flowId: "login_manual", response: "callback-code" },
+        },
+        {
+          method: OMP_ACCOUNT_METHODS.loginSubmit,
+          payload: { flowId: "login_manual", response: "callback-code" },
+        },
+      ]);
+    }),
+  );
+
+  it.effect("falls back from a missing submit extension without disabling account login", () =>
+    Effect.gen(function* () {
+      const service = yield* makeOmpAccountService({
+        request: (method) =>
+          method === OMP_ACCOUNT_METHODS.loginSubmit
+            ? Effect.fail(transportFailure("JSON-RPC -32601: method not found"))
+            : Effect.succeed({}),
+      });
+
+      const result = yield* service.submitLogin("login_legacy", "callback-code");
+      const snapshot = yield* service.getSnapshot;
+
+      expect(result).toEqual({ supported: false, accepted: false });
+      expect(snapshot.accounts.capabilities.login).toBe(true);
+    }),
+  );
+
   it.effect("replaces cached availability with a successful unavailable refresh", () =>
     Effect.gen(function* () {
       let listCalls = 0;
@@ -327,6 +455,7 @@ describe("OmpAccountService", () => {
         providerServiceFor(
           providerSession({
             resumeCursor: { schemaVersion: 3, sessionId: "native-session-sticky" },
+            model: "anthropic/claude-fable-5",
           }),
         ),
         service,
@@ -340,9 +469,34 @@ describe("OmpAccountService", () => {
       expect(requests).toEqual([
         {
           method: OMP_ACCOUNT_METHODS.assignment,
-          payload: { sessionId: "native-session-sticky" },
+          payload: { sessionId: "native-session-sticky", provider: "anthropic" },
         },
       ]);
+    }),
+  );
+
+  it.effect("normalizes an OpenAI model alias for cross-process sticky lookup", () =>
+    Effect.gen(function* () {
+      const requests: unknown[] = [];
+      const service = yield* makeOmpAccountService({
+        request: (_method, payload) => {
+          requests.push(payload);
+          return Effect.succeed({ account: null });
+        },
+      });
+
+      yield* getOmpThreadAccountAssignment(
+        providerServiceFor(
+          providerSession({
+            resumeCursor: { schemaVersion: 3, sessionId: "native-openai-session" },
+            model: "openai/gpt-5.6-sol",
+          }),
+        ),
+        service,
+        THREAD_ID,
+      );
+
+      expect(requests).toEqual([{ sessionId: "native-openai-session", provider: "openai-codex" }]);
     }),
   );
 

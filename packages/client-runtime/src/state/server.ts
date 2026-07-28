@@ -322,6 +322,14 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => `${environmentId}:${input.flowId}`,
       },
     }),
+    submitOmpAccountLogin: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:omp-accounts:submit-login",
+      tag: WS_METHODS.ompAccountsSubmitLogin,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.flowId}`,
+      },
+    }),
     cancelOmpAccountLogin: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:omp-accounts:cancel-login",
       tag: WS_METHODS.ompAccountsCancelLogin,

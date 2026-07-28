@@ -1,14 +1,17 @@
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  ScaffoldLifecycleError,
   SessionFabricSessionId,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
 
 import {
   decodeSessionFabricCapabilityProxyBody,
   isLoopbackHostname,
   resolveDevRedirectUrl,
+  scaffoldLifecycleRequestEffect,
   scaffoldRuntimeTokenMatches,
   sessionFabricCapabilityProxyScope,
 } from "./http.ts";
@@ -20,6 +23,34 @@ describe("Scaffold supervisor authentication", () => {
     expect(scaffoldRuntimeTokenMatches("local-secret-extra", "local-secret")).toBe(false);
     expect(scaffoldRuntimeTokenMatches(undefined, "local-secret")).toBe(false);
     expect(scaffoldRuntimeTokenMatches("", "")).toBe(false);
+  });
+});
+
+describe("Scaffold lifecycle HTTP failures", () => {
+  it.effect("preserves typed lifecycle failures across the Promise boundary", () => {
+    const expected = new ScaffoldLifecycleError({
+      reason: "invalid_response",
+      message: "Scaffold returned an invalid T3 bootstrap response.",
+      status: 502,
+      code: "scaffold_invalid_transport",
+    });
+
+    return Effect.gen(function* () {
+      const observed = yield* Effect.flip(
+        scaffoldLifecycleRequestEffect(
+          () => Promise.reject(expected),
+          () =>
+            new ScaffoldLifecycleError({
+              reason: "unavailable",
+              message: "unexpected",
+              status: 503,
+              code: "scaffold_unexpected_error",
+            }),
+        ),
+      );
+
+      expect(observed).toBe(expected);
+    });
   });
 });
 

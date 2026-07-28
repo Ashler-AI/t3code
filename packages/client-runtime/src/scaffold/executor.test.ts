@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { makeScaffoldControlPlaneClient } from "./client.ts";
@@ -22,12 +22,22 @@ function createAction() {
   return makeScaffoldLifecycleAction({
     actionId: "stable-operation-1",
     kind: "create",
+    deployment: "staging",
+    draftId: "draft-session-1",
+    sourceEnvironmentId: EnvironmentId.make("source-environment-1"),
+    sourceProjectId: ProjectId.make("source-project-1"),
     environmentId: EnvironmentId.make("env-1"),
     connectionId: "connection-1",
     sessionId: "session-1",
     expectedLifecycleEpoch: 0,
     createdAt: "2026-07-24T19:00:00.000Z",
-    create: { sourceRef: "main", snapshotId: "snapshot-1", name: "Agent" },
+    create: {
+      sourceRef: "main",
+      snapshotId: "snapshot-1",
+      name: "Agent",
+      modelRouteId: "scaffold-openai/gpt-5.6-sol",
+      agentEffort: "high",
+    },
   });
 }
 
@@ -65,6 +75,8 @@ describe("executeScaffoldLifecycleAction", () => {
       sourceRef: "main",
       snapshotId: "snapshot-1",
       name: "Agent",
+      modelRouteId: "scaffold-openai/gpt-5.6-sol",
+      agentEffort: "high",
     });
     expect(posts[1]).toEqual(posts[0]);
   });

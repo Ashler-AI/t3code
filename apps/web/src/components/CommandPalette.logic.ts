@@ -56,6 +56,55 @@ export interface CommandPaletteView {
   readonly initialQuery?: string;
 }
 
+export interface ScaffoldNewSessionActionPresentation {
+  readonly disabled: boolean;
+  readonly description: string;
+}
+
+export async function runScaffoldDraftLaunch<TDraftId, TAction>(input: {
+  readonly createDraft: (
+    prepareBeforeNavigation: (draftId: TDraftId) => Promise<void>,
+  ) => Promise<void>;
+  readonly createAction: (draftId: TDraftId) => TAction;
+  readonly showCreating: (draftId: TDraftId, action: TAction) => void;
+  readonly persistAction: (action: TAction) => Promise<void>;
+  readonly showFailure: (draftId: TDraftId, error: unknown) => void;
+  readonly actionPersisted: (draftId: TDraftId) => void;
+  readonly requestDrain: (action: TAction) => void;
+}): Promise<void> {
+  let draftPrepared = false;
+  let preparationError: unknown = null;
+  let preparationFailed = false;
+
+  await input.createDraft(async (draftId) => {
+    const action = input.createAction(draftId);
+    draftPrepared = true;
+    input.showCreating(draftId, action);
+    try {
+      await input.persistAction(action);
+      input.actionPersisted(draftId);
+      input.requestDrain(action);
+    } catch (error) {
+      preparationFailed = true;
+      preparationError = error;
+      input.showFailure(draftId, error);
+    }
+  });
+
+  if (preparationFailed) throw preparationError;
+  if (!draftPrepared) {
+    throw new Error("Scaffold session preparation did not complete.");
+  }
+}
+
+export function getScaffoldNewSessionActionPresentation(input: {
+  readonly hasContextualProject: boolean;
+}): ScaffoldNewSessionActionPresentation {
+  return input.hasContextualProject
+    ? { disabled: false, description: "New Scaffold sandbox" }
+    : { disabled: true, description: "Add or open a local project first" };
+}
+
 export function enumerateCommandPaletteItems(
   items: ReadonlyArray<CommandPaletteActionItem>,
 ): CommandPaletteActionItem[] {

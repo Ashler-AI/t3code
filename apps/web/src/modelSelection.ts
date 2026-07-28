@@ -199,6 +199,12 @@ export function getAppModelOptionsForInstance(
   entry: ProviderInstanceEntry,
 ): AppModelOption[] {
   const options: AppModelOption[] = entry.models.map(toAppModelOption);
+  if (entry.snapshot.modelCatalogAuthoritative) {
+    return applyInstanceModelPreferences(
+      options,
+      readInstanceModelPreferences(settings, entry.instanceId),
+    );
+  }
   const seen = new Set(options.map((option) => option.slug));
   const builtInModelSlugs = new Set(
     Arr.filterMap(entry.models, (model) =>

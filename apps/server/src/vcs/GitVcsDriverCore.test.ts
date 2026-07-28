@@ -1046,6 +1046,36 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("reconciles an already registered exact clean worktree on replay", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const pathService = yield* Path.Path;
+        const worktreePath = pathService.join(
+          yield* makeTmpDir("git-worktrees-"),
+          "replayed-worktree",
+        );
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const input = {
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/replayed-worktree",
+          reconcileExistingExactTarget: true,
+        };
+
+        const created = yield* driver.createWorktree(input);
+        const replayed = yield* driver.createWorktree(input);
+
+        assert.deepEqual(replayed, created);
+        assert.equal(
+          yield* git(worktreePath, ["branch", "--show-current"]),
+          "feature/replayed-worktree",
+        );
+        assert.equal(yield* git(worktreePath, ["status", "--porcelain=v1"]), "");
+      }),
+    );
+
     it.effect("inherits the source branch PR base for session worktree reviews", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

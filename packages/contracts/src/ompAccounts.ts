@@ -71,12 +71,26 @@ export const OmpUsageLimit = Schema.Struct({
 });
 export type OmpUsageLimit = typeof OmpUsageLimit.Type;
 
+export const OmpUsageResetCredit = Schema.Struct({
+  grantedAt: Schema.optionalKey(TrimmedNonEmptyString),
+  expiresAt: Schema.optionalKey(TrimmedNonEmptyString),
+  status: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type OmpUsageResetCredit = typeof OmpUsageResetCredit.Type;
+
+export const OmpUsageResetCredits = Schema.Struct({
+  availableCount: Schema.Number,
+  credits: Schema.optionalKey(Schema.Array(OmpUsageResetCredit)),
+});
+export type OmpUsageResetCredits = typeof OmpUsageResetCredits.Type;
+
 export const OmpUsageReport = Schema.Struct({
   provider: OmpAccountProvider,
   accountRef: Schema.optionalKey(OmpAccountRef),
   maskedAccount: Schema.optionalKey(TrimmedNonEmptyString),
   fetchedAt: Schema.Number,
   limits: Schema.Array(OmpUsageLimit),
+  resetCredits: Schema.optionalKey(OmpUsageResetCredits),
   notes: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 export type OmpUsageReport = typeof OmpUsageReport.Type;
@@ -125,6 +139,12 @@ export const OmpAccountOverview = Schema.Struct({
 });
 export type OmpAccountOverview = typeof OmpAccountOverview.Type;
 
+export const OmpLoginSubmitResult = Schema.Struct({
+  supported: Schema.Boolean,
+  accepted: Schema.Boolean,
+});
+export type OmpLoginSubmitResult = typeof OmpLoginSubmitResult.Type;
+
 export class OmpAccountOperationError extends Schema.TaggedErrorClass<OmpAccountOperationError>()(
   "OmpAccountOperationError",
   {
@@ -169,7 +189,9 @@ export type OmpAccountAssignment = typeof OmpAccountAssignment.Type;
 export const OmpLoginChallenge = Schema.Struct({
   flowId: TrimmedNonEmptyString,
   provider: OmpAccountProvider,
-  kind: Schema.Literals(["browser", "code", "input", "complete"]),
+  kind: Schema.Literals(["browser", "input", "complete"]),
+  /** Optional presentation hint for a backwards-compatible input challenge. */
+  inputType: Schema.optionalKey(Schema.Literal("code")),
   url: Schema.optionalKey(TrimmedNonEmptyString),
   message: Schema.optionalKey(TrimmedNonEmptyString),
   prompt: Schema.optionalKey(TrimmedNonEmptyString),

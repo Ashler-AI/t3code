@@ -1,6 +1,15 @@
 import { useAtomValue } from "@effect/atom-react";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import type {
+  ScaffoldLifecycleAction,
+  ScaffoldLifecycleActionStore,
+} from "@t3tools/client-runtime/scaffold";
+import {
+  ConnectionBlockedError,
+  ConnectionTransientError,
+} from "@t3tools/client-runtime/connection";
 import * as Schema from "effect/Schema";
+import { Atom } from "effect/unstable/reactivity";
 import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 
@@ -8,7 +17,7 @@ import { isElectron } from "../env";
 import { getLocalStorageItem } from "../hooks/useLocalStorage";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import { cn, isMacPlatform } from "../lib/utils";
-import { primaryServerKeybindingsAtom } from "../state/server";
+import { primaryServerKeybindingsAtom, serverEnvironment } from "../state/server";
 import { useClientSettings } from "../hooks/useSettings";
 import ThreadSidebar from "./Sidebar";
 import ThreadSidebarV2 from "./SidebarV2";
@@ -31,33 +40,211 @@ import {
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { toastManager } from "./ui/toast";
 import { ThreadAttentionNotifications } from "./ThreadAttentionNotifications";
-import { useScaffoldSessionUiStore } from "../scaffoldSessionUiStore";
+import {
+  SCAFFOLD_DEPLOYMENT_MISMATCH_MESSAGE,
+  SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE,
+  scaffoldSessionUiEntryFromCreateAction,
+  scaffoldSessionUiEntryMatchesCreateAction,
+  scaffoldSessionUiEntryMatchesPendingCreateAction,
+  useScaffoldSessionUiStore,
+} from "../scaffoldSessionUiStore";
+import type { ScaffoldSessionUiEntry } from "../scaffoldSessionUiStore";
 import { useComposerDraftStore } from "../composerDraftStore";
-import { useProjects } from "../state/entities";
+import { readThreadShell, useProjects } from "../state/entities";
 import { useEnvironments } from "../state/environments";
 import { threadEnvironment } from "../state/threads";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import type { EnvironmentId, ServerProvider } from "@t3tools/contracts";
+import { environmentCatalog } from "../connection/catalog";
+import { environmentShell } from "../state/shell";
 import { useAtomCommand } from "../state/use-atom-command";
 import { connectScaffoldEnvironment } from "../connection/scaffoldOnboarding";
+import { appAtomRegistry } from "../rpc/atomRegistry";
 import {
   browserScaffoldLifecycleActionStore,
   drainScaffoldLifecycleActions,
+  LEGACY_CREATE_MISSING_AUTHORITY,
   subscribeScaffoldLifecycleDrain,
 } from "../connection/scaffoldLifecycleOutbox";
 import {
   browserPendingTurnOutbox,
+  createPendingTurnCoordinatorAdapter,
   discardPendingTurn,
   drainPendingTurnOutbox,
   retargetPendingTurnsForDraft,
   subscribePendingTurnDrain,
 } from "../connection/pendingTurnOutbox";
+import { resolveScaffoldDraftModelSelection } from "../hooks/useHandleNewThread";
 
 const MACOS_TRAFFIC_LIGHTS_LEFT_INSET = "90px";
 const notifiedTerminalPendingTurns = new Set<string>();
+const liveEnvironmentIdsAtom = Atom.make((get) =>
+  [...get(environmentCatalog.catalogValueAtom).entries.keys()].filter(
+    (environmentId) => get(environmentShell.stateValueAtom(environmentId)).status === "live",
+  ),
+).pipe(Atom.withLabel("web-pending-turn-live-environment-ids"));
+const environmentProviderCatalogsAtom = Atom.make(
+  (get): ReadonlyMap<EnvironmentId, ReadonlyArray<ServerProvider> | null> =>
+    new Map(
+      [...get(environmentCatalog.catalogValueAtom).entries.keys()].map((environmentId) => [
+        environmentId,
+        get(serverEnvironment.providersValueAtom(environmentId)),
+      ]),
+    ),
+).pipe(Atom.withLabel("web-environment-provider-catalogs"));
+
+const isConnectionBlockedError = Schema.is(ConnectionBlockedError);
+const isConnectionTransientError = Schema.is(ConnectionTransientError);
+
+export function classifyScaffoldCreateFailure(error: unknown): {
+  readonly result:
+    | { readonly _tag: "blocked"; readonly errorCode: string }
+    | { readonly _tag: "retry"; readonly retryAfterMs: number; readonly errorCode: string };
+  readonly detail?: string;
+} {
+  if (isConnectionBlockedError(error)) {
+    return {
+      result: { _tag: "blocked", errorCode: error.reason },
+      detail: error.detail,
+    };
+  }
+  if (isConnectionTransientError(error)) {
+    return {
+      result: { _tag: "retry", retryAfterMs: 1_000, errorCode: error.reason },
+      detail: error.detail,
+    };
+  }
+  return {
+    result: { _tag: "retry", retryAfterMs: 1_000, errorCode: "scaffold_create_failed" },
+  };
+}
+
+function blockedScaffoldCreateDetail(errorCode: string | null): string {
+  switch (errorCode) {
+    case "scaffold_create_deployment_mismatch":
+    case "scaffold_binding_deployment_mismatch":
+      return SCAFFOLD_DEPLOYMENT_MISMATCH_MESSAGE;
+    case "scaffold_create_missing_deployment":
+      return "This saved Scaffold session is missing its target. Start a new session.";
+    case "scaffold_create_projection_mismatch":
+      return "This Scaffold session request no longer matches its saved draft. Start a new session.";
+    case LEGACY_CREATE_MISSING_AUTHORITY:
+      return SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE;
+    case "missing_scaffold_create_action":
+      return "This Scaffold session request was not saved. Start a new session.";
+    case "authentication":
+      return "Scaffold authentication is required.";
+    case "configuration":
+      return "Scaffold is not configured for this environment.";
+    case "permission":
+      return "Scaffold access is not permitted.";
+    case "unsupported":
+      return "This Scaffold session cannot be prepared.";
+    default:
+      return "Scaffold session could not be created.";
+  }
+}
+
+export function shouldExecuteScaffoldCreate(
+  entry: ScaffoldSessionUiEntry | undefined,
+): entry is ScaffoldSessionUiEntry {
+  return entry?.phase === "creating";
+}
+
+export function scaffoldRetargetProvidersAreReady(
+  providers: ReadonlyArray<ServerProvider> | null,
+): providers is ReadonlyArray<ServerProvider> {
+  return providers !== null && resolveScaffoldDraftModelSelection(providers, null) !== null;
+}
+
+export function scaffoldCreateConnectionRequest(
+  action: ScaffoldLifecycleAction,
+  entry: ScaffoldSessionUiEntry,
+) {
+  if (action.kind !== "create") {
+    return { _tag: "blocked", errorCode: "unsupported_lifecycle_action" } as const;
+  }
+  if (action.deployment === undefined) {
+    return { _tag: "blocked", errorCode: "scaffold_create_missing_deployment" } as const;
+  }
+  if (action.deployment !== entry.deployment) {
+    return { _tag: "blocked", errorCode: "scaffold_create_deployment_mismatch" } as const;
+  }
+  if (!scaffoldSessionUiEntryMatchesPendingCreateAction(entry, action)) {
+    return { _tag: "blocked", errorCode: "scaffold_create_projection_mismatch" } as const;
+  }
+  return {
+    _tag: "ready",
+    input: {
+      deployment: action.deployment,
+      operationId: action.actionId,
+      sessionId: action.sessionId,
+      create: action.create,
+      label: `Scaffold ${action.deployment}`,
+    },
+  } as const;
+}
+
+export async function reconcileScaffoldLifecycleStartup(input: {
+  readonly store: ScaffoldLifecycleActionStore;
+  readonly entriesByDraftId: Readonly<Record<string, ScaffoldSessionUiEntry>>;
+  readonly recover: (entry: ScaffoldSessionUiEntry) => void;
+  readonly fail: (draftId: ScaffoldSessionUiEntry["draftId"], error: string) => void;
+}): Promise<void> {
+  const actions = await input.store.list();
+  const createActions = actions.filter((action) => action.kind === "create");
+  const entriesByDraftId = { ...input.entriesByDraftId };
+
+  for (const action of createActions) {
+    const matchingEntry = Object.values(entriesByDraftId).find(
+      (entry) => entry.actionId === action.actionId,
+    );
+    if (matchingEntry) {
+      if (!scaffoldSessionUiEntryMatchesCreateAction(matchingEntry, action)) {
+        input.fail(
+          matchingEntry.draftId,
+          blockedScaffoldCreateDetail(
+            action.lastErrorCode === LEGACY_CREATE_MISSING_AUTHORITY
+              ? LEGACY_CREATE_MISSING_AUTHORITY
+              : "scaffold_create_projection_mismatch",
+          ),
+        );
+      } else if (matchingEntry.environmentId !== null) {
+        // connected() persists the server-owned binding before the outbox
+        // action is removed. A reload in that crash window must retire the
+        // create by its immutable action identity; Scaffold may have minted a
+        // different session id than the provisional request used.
+        await input.store.remove(action.actionId);
+      }
+      continue;
+    }
+
+    const recovered = scaffoldSessionUiEntryFromCreateAction(action);
+    if (!recovered) continue;
+    const draftCollision = entriesByDraftId[recovered.draftId];
+    if (draftCollision) {
+      input.fail(
+        draftCollision.draftId,
+        blockedScaffoldCreateDetail("scaffold_create_projection_mismatch"),
+      );
+      continue;
+    }
+    input.recover(recovered);
+    entriesByDraftId[recovered.draftId] = recovered;
+  }
+
+  const actionIds = new Set(createActions.map((action) => action.actionId));
+  for (const entry of Object.values(entriesByDraftId)) {
+    if (entry.phase === "creating" && !actionIds.has(entry.actionId)) {
+      input.fail(entry.draftId, blockedScaffoldCreateDetail("missing_scaffold_create_action"));
+    }
+  }
+}
 
 function ScaffoldSessionCoordinator() {
   const entriesByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
   const projects = useProjects();
+  const providerCatalogs = useAtomValue(environmentProviderCatalogsAtom);
   const connectScaffold = useAtomCommand(connectScaffoldEnvironment, { reportFailure: false });
 
   useEffect(() => {
@@ -65,48 +252,67 @@ function ScaffoldSessionCoordinator() {
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let running: Promise<void> | null = null;
 
-    const drain = () => {
+    const drain = (actionId?: string) => {
       if (disposed || running !== null) return;
-      running = drainScaffoldLifecycleActions({
-        store: browserScaffoldLifecycleActionStore,
-        execute: async (action) => {
-          if (action.kind !== "create") {
-            return { _tag: "blocked", errorCode: "unsupported_lifecycle_action" };
-          }
-          const scaffoldUi = useScaffoldSessionUiStore.getState();
-          const entry = Object.values(scaffoldUi.entriesByDraftId).find(
-            (candidate) => candidate.actionId === action.actionId,
-          );
-          if (!entry) return { _tag: "blocked", errorCode: "missing_scaffold_draft" };
-          const result = await connectScaffold({
-            deployment: entry.deployment,
-            operationId: action.actionId,
-            sessionId: action.sessionId,
-            create: action.create,
-            label: `Scaffold ${entry.deployment}`,
-          });
-          if (result._tag === "Failure") {
-            const error = squashAtomCommandFailure(result);
-            return {
-              _tag: "retry",
-              retryAfterMs: 1_000,
-              errorCode:
-                error instanceof Error
-                  ? error.name || "scaffold_create_failed"
-                  : "scaffold_create_failed",
-            };
-          }
-          scaffoldUi.connected(entry.draftId, result.value.binding);
-          return { _tag: "acknowledged" };
-        },
-        onBlocked: (action) => {
-          const scaffoldUi = useScaffoldSessionUiStore.getState();
-          const entry = Object.values(scaffoldUi.entriesByDraftId).find(
-            (candidate) => candidate.actionId === action.actionId,
-          );
-          if (entry) scaffoldUi.fail(entry.draftId, "Scaffold session could not be created.");
-        },
-      })
+      running = (async () => {
+        const initialUi = useScaffoldSessionUiStore.getState();
+        await reconcileScaffoldLifecycleStartup({
+          store: browserScaffoldLifecycleActionStore,
+          entriesByDraftId: initialUi.entriesByDraftId,
+          recover: (entry) => {
+            initialUi.begin({
+              draftId: entry.draftId,
+              sourceEnvironmentId: entry.sourceEnvironmentId,
+              sourceProjectId: entry.sourceProjectId,
+              deployment: entry.deployment,
+              actionId: entry.actionId,
+              sessionId: entry.sessionId,
+              createdAt: entry.createdAt,
+            });
+          },
+          fail: initialUi.fail,
+        });
+        await drainScaffoldLifecycleActions({
+          store: browserScaffoldLifecycleActionStore,
+          ...(actionId ? { actionId } : {}),
+          execute: async (action) => {
+            if (action.kind !== "create") {
+              return { _tag: "blocked", errorCode: "unsupported_lifecycle_action" };
+            }
+            const scaffoldUi = useScaffoldSessionUiStore.getState();
+            const entry = Object.values(scaffoldUi.entriesByDraftId).find(
+              (candidate) => candidate.actionId === action.actionId,
+            );
+            if (!entry) return { _tag: "blocked", errorCode: "missing_scaffold_draft" };
+            if (!shouldExecuteScaffoldCreate(entry)) {
+              return { _tag: "blocked", errorCode: "scaffold_create_requires_explicit_retry" };
+            }
+            const request = scaffoldCreateConnectionRequest(action, entry);
+            if (request._tag === "blocked") return request;
+            const result = await connectScaffold(request.input);
+            if (result._tag === "Failure") {
+              const error = squashAtomCommandFailure(result);
+              const failure = classifyScaffoldCreateFailure(error);
+              if (failure.detail) scaffoldUi.fail(entry.draftId, failure.detail);
+              return failure.result;
+            }
+            scaffoldUi.connected(entry.draftId, result.value.binding);
+            if (result.value.binding.deployment !== request.input.deployment) {
+              return { _tag: "blocked", errorCode: "scaffold_binding_deployment_mismatch" };
+            }
+            return { _tag: "acknowledged" };
+          },
+          onBlocked: (action) => {
+            const scaffoldUi = useScaffoldSessionUiStore.getState();
+            const entry = Object.values(scaffoldUi.entriesByDraftId).find(
+              (candidate) => candidate.actionId === action.actionId,
+            );
+            if (entry?.phase === "creating") {
+              scaffoldUi.fail(entry.draftId, blockedScaffoldCreateDetail(action.lastErrorCode));
+            }
+          },
+        });
+      })()
         .catch((error: unknown) => {
           console.error("Could not drain the Scaffold lifecycle outbox.", error);
         })
@@ -157,11 +363,14 @@ function ScaffoldSessionCoordinator() {
         (project) => project.environmentId === entry.environmentId,
       );
       if (!remoteProject) continue;
+      const targetProviders = providerCatalogs.get(entry.environmentId) ?? null;
+      if (!scaffoldRetargetProvidersAreReady(targetProviders)) continue;
       void retargetPendingTurnsForDraft(
         browserPendingTurnOutbox,
         entry.draftId,
         remoteProject.environmentId,
         remoteProject.id,
+        targetProviders,
       )
         .then(() => {
           if (disposed) return;
@@ -178,7 +387,7 @@ function ScaffoldSessionCoordinator() {
     return () => {
       disposed = true;
     };
-  }, [entriesByDraftId, projects]);
+  }, [entriesByDraftId, projects, providerCatalogs]);
 
   return null;
 }
@@ -186,13 +395,32 @@ function ScaffoldSessionCoordinator() {
 /** Drains accepted chat commands independently of whichever thread is visible. */
 function PendingTurnCoordinator() {
   const { environments } = useEnvironments();
+  const liveEnvironmentIds = useAtomValue(liveEnvironmentIdsAtom);
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const liveEnvironmentIdSet = useMemo(() => new Set(liveEnvironmentIds), [liveEnvironmentIds]);
   const connectedEnvironmentIds = useMemo(
     () =>
       environments
-        .filter((environment) => environment.connection.phase === "connected")
+        .filter(
+          (environment) =>
+            environment.connection.phase === "connected" &&
+            liveEnvironmentIdSet.has(environment.environmentId),
+        )
         .map((environment) => environment.environmentId),
-    [environments],
+    [environments, liveEnvironmentIdSet],
+  );
+  const coordinator = useMemo(
+    () =>
+      createPendingTurnCoordinatorAdapter({
+        readEnvironmentShellStatus: (environmentId) =>
+          appAtomRegistry.get(environmentShell.stateValueAtom(environmentId)).status,
+        threadExists: (threadRef) => readThreadShell(threadRef) !== null,
+        dispatch: async ({ environmentId, turn }) => {
+          const result = await startThreadTurn({ environmentId, input: turn });
+          if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+        },
+      }),
+    [startThreadTurn],
   );
 
   useEffect(() => {
@@ -208,8 +436,9 @@ function PendingTurnCoordinator() {
             storage: browserPendingTurnOutbox,
             environmentId,
             dispatch: async (entry) => {
-              const result = await startThreadTurn({ environmentId, input: entry.input });
-              if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+              if (!(await coordinator.dispatch(entry))) {
+                throw new Error("Environment shell is not synchronized yet.");
+              }
             },
           });
           for (const result of results) {
@@ -275,7 +504,7 @@ function PendingTurnCoordinator() {
       if (retryTimer) clearTimeout(retryTimer);
       unsubscribe();
     };
-  }, [connectedEnvironmentIds, startThreadTurn]);
+  }, [connectedEnvironmentIds, coordinator]);
 
   return null;
 }

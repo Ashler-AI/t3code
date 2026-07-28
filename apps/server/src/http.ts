@@ -78,9 +78,23 @@ const SessionFabricCapabilityProxyRequest = Schema.Struct({
 const decodeSessionFabricCapabilityProxyRequest = Schema.decodeUnknownEffect(
   SessionFabricCapabilityProxyRequest,
 );
+const decodeSessionFabricCapabilityProxyRequestSync = Schema.decodeUnknownSync(
+  SessionFabricCapabilityProxyRequest,
+);
 
 export function decodeSessionFabricCapabilityProxyBody(value: unknown) {
-  return Schema.decodeUnknownSync(SessionFabricCapabilityProxyRequest)(value);
+  return decodeSessionFabricCapabilityProxyRequestSync(value);
+}
+
+/** Preserve domain failures from Promise-backed lifecycle services for HTTP mapping. */
+export function scaffoldLifecycleRequestEffect<A>(
+  operation: () => Promise<A>,
+  unexpected: () => ScaffoldLifecycleError,
+) {
+  return Effect.tryPromise({
+    try: operation,
+    catch: (error) => (isScaffoldLifecycleError(error) ? error : unexpected()),
+  });
 }
 
 export function scaffoldRuntimeTokenMatches(
@@ -244,22 +258,23 @@ export const scaffoldPrepareConnectionRouteLayer = HttpRouter.add(
     if (Option.isNone(input)) {
       return HttpServerResponse.jsonUnsafe({ error: "scaffold_invalid_request" }, { status: 400 });
     }
-    return yield* Effect.tryPromise(() => scaffoldLifecycle.prepare(input.value)).pipe(
+    return yield* scaffoldLifecycleRequestEffect(
+      () => scaffoldLifecycle.prepare(input.value),
+      () =>
+        new ScaffoldLifecycleError({
+          reason: "unavailable",
+          message: "Scaffold lifecycle request failed.",
+          status: 503,
+          code: "scaffold_unexpected_error",
+        }),
+    ).pipe(
       Effect.map((prepared) =>
         HttpServerResponse.jsonUnsafe(prepared, {
           status: 200,
           headers: { "cache-control": "no-store" },
         }),
       ),
-      Effect.catch((error) => {
-        const lifecycleError = isScaffoldLifecycleError(error)
-          ? error
-          : new ScaffoldLifecycleError({
-              reason: "unavailable",
-              message: "Scaffold lifecycle request failed.",
-              status: 503,
-              code: "scaffold_unexpected_error",
-            });
+      Effect.catch((lifecycleError) => {
         const status = lifecycleError.status >= 400 ? lifecycleError.status : 503;
         return Effect.succeed(
           HttpServerResponse.jsonUnsafe(lifecycleError, {
@@ -325,11 +340,19 @@ export const scaffoldSessionFabricCapabilityRouteLayer = HttpRouter.add(
             scaffoldSessionId: input.scaffoldSessionId!,
             scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch!,
           } as const);
-    return yield* Effect.tryPromise(() =>
-      scaffoldLifecycle.issueSessionFabricCapability({
-        ...(input.deployment === undefined ? {} : { deployment: input.deployment }),
-        capability,
-      }),
+    return yield* scaffoldLifecycleRequestEffect(
+      () =>
+        scaffoldLifecycle.issueSessionFabricCapability({
+          ...(input.deployment === undefined ? {} : { deployment: input.deployment }),
+          capability,
+        }),
+      () =>
+        new ScaffoldLifecycleError({
+          reason: "unavailable",
+          message: "Scaffold capability request failed.",
+          status: 503,
+          code: "scaffold_session_fabric_capability_failed",
+        }),
     ).pipe(
       Effect.map((grant) =>
         HttpServerResponse.jsonUnsafe(grant, {
@@ -337,15 +360,7 @@ export const scaffoldSessionFabricCapabilityRouteLayer = HttpRouter.add(
           headers: { "cache-control": "no-store" },
         }),
       ),
-      Effect.catch((error) => {
-        const lifecycleError = isScaffoldLifecycleError(error)
-          ? error
-          : new ScaffoldLifecycleError({
-              reason: "unavailable",
-              message: "Scaffold capability request failed.",
-              status: 503,
-              code: "scaffold_session_fabric_capability_failed",
-            });
+      Effect.catch((lifecycleError) => {
         return Effect.succeed(
           HttpServerResponse.jsonUnsafe(
             { error: lifecycleError.code },

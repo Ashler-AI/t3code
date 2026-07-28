@@ -1,5 +1,17 @@
 import type { StartThreadTurnInput } from "@t3tools/client-runtime/operations";
-import type { EnvironmentId, MessageId, ProjectId, ThreadId } from "@t3tools/contracts";
+import type { EnvironmentShellStatus } from "@t3tools/client-runtime/state/shell";
+import type {
+  EnvironmentId,
+  MessageId,
+  ModelSelection,
+  ProjectId,
+  ScopedThreadRef,
+  ServerProvider,
+  ThreadId,
+} from "@t3tools/contracts";
+
+import { openIndexedDatabase } from "./indexedDbOpen";
+import { resolveScaffoldDraftModelSelection } from "../hooks/useHandleNewThread";
 
 const DATABASE_NAME = "t3code:pending-turn-outbox";
 const DATABASE_VERSION = 1;
@@ -110,21 +122,19 @@ function isPendingTurnOutboxEntry(value: unknown): value is PendingTurnOutboxEnt
 }
 
 function openDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    if (typeof indexedDB === "undefined") {
-      reject(new Error("IndexedDB is unavailable in this browser context."));
-      return;
-    }
-    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.addEventListener("upgradeneeded", () => {
-      if (!request.result.objectStoreNames.contains(STORE_NAME)) {
-        request.result.createObjectStore(STORE_NAME, { keyPath: "idempotencyKey" });
+  return openIndexedDatabase({
+    databaseName: DATABASE_NAME,
+    databaseVersion: DATABASE_VERSION,
+    unavailableMessage: "IndexedDB is unavailable in this browser context.",
+    openErrorMessage: "Could not open the pending-turn outbox.",
+    blockedMessage:
+      "Message storage is blocked by another tab. Close other T3 Code tabs and retry.",
+    timeoutMessage: "Message storage did not open.",
+    upgrade: (database) => {
+      if (!database.objectStoreNames.contains(STORE_NAME)) {
+        database.createObjectStore(STORE_NAME, { keyPath: "idempotencyKey" });
       }
-    });
-    request.addEventListener("error", () => {
-      reject(request.error ?? new Error("Could not open the pending-turn outbox."));
-    });
-    request.addEventListener("success", () => resolve(request.result));
+    },
   });
 }
 
@@ -259,17 +269,30 @@ export async function enqueuePendingTurn(
 function retargetTurnInputForScaffold(
   input: StartThreadTurnInput,
   projectId: ProjectId,
+  targetProviders: ReadonlyArray<ServerProvider>,
 ): StartThreadTurnInput {
+  const resolveSelection = (selection: ModelSelection): ModelSelection => {
+    const resolved = resolveScaffoldDraftModelSelection(targetProviders, selection);
+    if (resolved === null) {
+      throw new Error("The target Scaffold OMP model catalog is not ready.");
+    }
+    return resolved;
+  };
   const { bootstrap: _bootstrap, ...turnInput } = input;
   const createThread = input.bootstrap?.createThread;
-  if (createThread === undefined) return turnInput;
+  const retargetedTurnInput = {
+    ...turnInput,
+    ...(input.modelSelection ? { modelSelection: resolveSelection(input.modelSelection) } : {}),
+  };
+  if (createThread === undefined) return retargetedTurnInput;
 
   return {
-    ...turnInput,
+    ...retargetedTurnInput,
     bootstrap: {
       createThread: {
         ...createThread,
         projectId,
+        modelSelection: resolveSelection(createThread.modelSelection),
       },
     },
   };
@@ -287,6 +310,7 @@ export async function retargetPendingTurnsForDraft(
   draftId: string,
   environmentId: EnvironmentId,
   projectId: ProjectId,
+  targetProviders: ReadonlyArray<ServerProvider>,
 ): Promise<void> {
   const entries = (await storage.list()).filter((entry) => entry.draftId === draftId);
   if (entries.length === 0) return;
@@ -294,7 +318,7 @@ export async function retargetPendingTurnsForDraft(
     entries.map((entry) => ({
       ...entry,
       environmentId,
-      input: retargetTurnInputForScaffold(entry.input, projectId),
+      input: retargetTurnInputForScaffold(entry.input, projectId, targetProviders),
     })),
   );
   announcePendingTurnDrain();
@@ -326,20 +350,48 @@ export async function listPendingTurnsForThread(
 }
 
 /**
- * A server restart can preserve the thread row while losing its in-memory
- * command receipt. Replaying the stable first-turn command must still deliver
- * the message, but must not repeat the already-committed thread.create step.
+ * Bootstrap reconciliation belongs to the server, where each orchestration
+ * phase has a durable idempotency identity. Keep this compatibility helper as
+ * an identity operation so every retry sends the exact durable payload.
  */
 export function reconcilePendingTurnForExistingThread(
   input: StartThreadTurnInput,
 ): StartThreadTurnInput {
-  if (input.bootstrap?.createThread === undefined) return input;
+  return input;
+}
 
-  const { createThread: _createThread, ...remainingBootstrap } = input.bootstrap;
-  const { bootstrap: _bootstrap, ...turnInput } = input;
-  return Object.keys(remainingBootstrap).length === 0
-    ? turnInput
-    : { ...turnInput, bootstrap: remainingBootstrap };
+export interface PendingTurnCoordinatorAdapter {
+  readonly environmentIsLive: (environmentId: EnvironmentId) => boolean;
+  readonly dispatch: (entry: PendingTurnOutboxEntry) => Promise<boolean>;
+}
+
+/**
+ * The background coordinator cannot safely infer thread existence from a
+ * cached shell during reconnect. Wait until the environment shell is live,
+ * then reconcile an ambiguously committed draft create against that
+ * authoritative projection before replaying the stable command.
+ */
+export function createPendingTurnCoordinatorAdapter(input: {
+  readonly readEnvironmentShellStatus: (environmentId: EnvironmentId) => EnvironmentShellStatus;
+  /** @deprecated Replay is server-idempotent; retained for caller compatibility. */
+  readonly threadExists?: (threadRef: ScopedThreadRef) => boolean;
+  readonly dispatch: (input: {
+    readonly environmentId: EnvironmentId;
+    readonly turn: StartThreadTurnInput;
+  }) => Promise<void>;
+}): PendingTurnCoordinatorAdapter {
+  const environmentIsLive = (environmentId: EnvironmentId) =>
+    input.readEnvironmentShellStatus(environmentId) === "live";
+
+  return {
+    environmentIsLive,
+    async dispatch(entry) {
+      if (!environmentIsLive(entry.environmentId)) return false;
+
+      await input.dispatch({ environmentId: entry.environmentId, turn: entry.input });
+      return true;
+    },
+  };
 }
 
 export async function acknowledgePendingTurn(
