@@ -48,4 +48,18 @@ describe("persistent sidebar New session control", () => {
       /value: "action:new-session:local",[\s\S]{0,400}disabled: projects\.length === 0/,
     );
   });
+
+  it("always starts a fresh local draft from the New Session chooser", () => {
+    const source = componentSources["CommandPalette.tsx"];
+
+    expect(source).toMatch(
+      /const newLocalSessionProjectItems = useMemo\([\s\S]*?handleNewThread\([\s\S]*?forceNew: true,[\s\S]*?\);/,
+    );
+    expect(source).toMatch(
+      /value: "action:new-session:local",[\s\S]*?items: newLocalSessionProjectItems/,
+    );
+    expect(source).toMatch(
+      /const projectThreadItems = useMemo\([\s\S]*?handleNewThread\(scopeProjectRef\(project\.environmentId, project\.id\)\);/,
+    );
+  });
 });
