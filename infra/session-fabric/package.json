@@ -6,6 +6,7 @@
     "deploy": "alchemy deploy",
     "destroy": "alchemy destroy",
     "dev": "alchemy dev",
+    "smoke:readiness": "node scripts/deployment-readiness.ts",
     "smoke:deployment": "node scripts/deployment-smoke.ts",
     "smoke:scaffold": "node scripts/scaffold-proof.ts",
     "test": "vp test run",
@@ -22,6 +23,7 @@
     "@effect/platform-node": "catalog:",
     "@effect/vitest": "catalog:",
     "vite": "catalog:",
-    "vite-plus": "catalog:"
+    "vite-plus": "catalog:",
+    "wrangler": "4.114.0"
   }
 }

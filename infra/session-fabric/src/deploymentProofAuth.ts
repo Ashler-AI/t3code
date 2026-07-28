@@ -10,6 +10,8 @@ export const DEPLOYMENT_PROOF_CAPABILITY_ISSUER = "https://session-fabric-proof.
 export const DEPLOYMENT_PROOF_CAPABILITY_AUDIENCE = "t3code-session-fabric-proof";
 export const DEPLOYMENT_PROOF_CAPABILITY_TYP = "ashler-session-fabric-capability+jwt";
 
+const normalizePem = (value: string): string => value.replace(/\\n/gu, "\n").trim();
+
 export function parseDeploymentProofAllowedOrigins(value: string): readonly string[] {
   const origins = value
     .split(",")
@@ -27,24 +29,96 @@ export function parseDeploymentProofAllowedOrigins(value: string): readonly stri
   return origins;
 }
 
-export function generateDeploymentProofKeyPair(input: {
-  readonly runId: string;
-  readonly runAttempt: string;
+export function prepareDeploymentProofVerifier(input: {
+  readonly privateKey: string;
+  readonly additionalPublicKeysJson?: string;
 }): {
   readonly keyId: string;
   readonly privateKey: string;
   readonly publicKeysJson: string;
 } {
-  const keyId = `proof-${input.runId}-${input.runAttempt}`;
-  const { publicKey, privateKey } = NodeCrypto.generateKeyPairSync("ed25519", {
-    publicKeyEncoding: { format: "pem", type: "spki" },
-    privateKeyEncoding: { format: "pem", type: "pkcs8" },
-  });
+  const privateKeyObject = parseEd25519PrivateKey(input.privateKey);
+  const privateKey = privateKeyObject.export({ format: "pem", type: "pkcs8" }).toString().trim();
+  const publicKeyObject = NodeCrypto.createPublicKey(privateKeyObject);
+  const publicKey = publicKeyObject.export({ format: "pem", type: "spki" }).toString().trim();
+  const publicKeyDer = publicKeyObject.export({ format: "der", type: "spki" });
+  const keyId = `proof-${NodeCrypto.createHash("sha256").update(publicKeyDer).digest("hex").slice(0, 24)}`;
+  const additionalPublicKeys = parseAdditionalPublicKeys(input.additionalPublicKeysJson);
+  const conflictingKey = additionalPublicKeys[keyId];
+  if (conflictingKey !== undefined && normalizePem(conflictingKey) !== publicKey) {
+    throw new Error(`Additional verifier key ${keyId} conflicts with the signing key.`);
+  }
   return {
     keyId,
     privateKey,
-    publicKeysJson: JSON.stringify({ [keyId]: publicKey }),
+    publicKeysJson: JSON.stringify({ ...additionalPublicKeys, [keyId]: publicKey }),
   };
+}
+
+function parseAdditionalPublicKeys(value: string | undefined): Record<string, string> {
+  if (value === undefined || value.trim().length === 0) return {};
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("SESSION_FABRIC_PROOF_ADDITIONAL_PUBLIC_KEYS_JSON must be a JSON object.");
+  }
+  const entries = Object.entries(parsed);
+  for (const [keyId, publicKey] of entries) {
+    if (keyId.length === 0 || typeof publicKey !== "string" || publicKey.trim().length === 0) {
+      throw new Error(
+        "SESSION_FABRIC_PROOF_ADDITIONAL_PUBLIC_KEYS_JSON must map key IDs to public keys.",
+      );
+    }
+  }
+  return Object.fromEntries(
+    entries.map(([keyId, publicKey]) => [
+      keyId,
+      parseEd25519PublicKey(publicKey as string)
+        .export({ format: "pem", type: "spki" })
+        .toString()
+        .trim(),
+    ]),
+  );
+}
+
+function parseEd25519PrivateKey(value: string): NodeCrypto.KeyObject {
+  let key: NodeCrypto.KeyObject;
+  try {
+    key = NodeCrypto.createPrivateKey(normalizePem(value));
+  } catch {
+    throw new Error(
+      "SESSION_FABRIC_PROOF_SIGNING_PRIVATE_KEY must be a valid Ed25519 private key.",
+    );
+  }
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw new Error("SESSION_FABRIC_PROOF_SIGNING_PRIVATE_KEY must be an Ed25519 private key.");
+  }
+  return key;
+}
+
+function parseEd25519PublicKey(value: string): NodeCrypto.KeyObject {
+  const normalized = normalizePem(value);
+  if (
+    !normalized.startsWith("-----BEGIN PUBLIC KEY-----\n") ||
+    !normalized.endsWith("\n-----END PUBLIC KEY-----")
+  ) {
+    throw new Error(
+      "SESSION_FABRIC_PROOF_ADDITIONAL_PUBLIC_KEYS_JSON must contain valid Ed25519 public keys.",
+    );
+  }
+  let key: NodeCrypto.KeyObject;
+  try {
+    key = NodeCrypto.createPublicKey(normalized);
+  } catch {
+    throw new Error(
+      "SESSION_FABRIC_PROOF_ADDITIONAL_PUBLIC_KEYS_JSON must contain valid Ed25519 public keys.",
+    );
+  }
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw new Error(
+      "SESSION_FABRIC_PROOF_ADDITIONAL_PUBLIC_KEYS_JSON must contain only Ed25519 public keys.",
+    );
+  }
+  return key;
 }
 
 const encodeJwtPart = (value: unknown): string =>

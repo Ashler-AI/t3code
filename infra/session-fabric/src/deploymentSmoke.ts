@@ -58,6 +58,15 @@ export interface DeploymentSmokeResult {
   readonly runnerId: string;
 }
 
+export interface WaitForDeploymentCoordinatorReadinessInput {
+  readonly relayUrl: URL;
+  readonly timeoutMs: number;
+  readonly fetch: typeof fetch;
+  readonly viewerCapability: string;
+  readonly pollIntervalMs?: number;
+  readonly allowMissingBootstrap?: boolean;
+}
+
 function sessionResourceUrl(
   relayUrl: URL,
   sessionId: typeof DEPLOYMENT_SMOKE_SESSION_ID,
@@ -309,6 +318,66 @@ async function waitForPoll(
   const delayMs = Math.min(pollIntervalMs, remainingMs(deadline));
   if (delayMs === 0) throw new Error(timeoutMessage);
   await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+export async function waitForDeploymentCoordinatorReadiness(
+  input: WaitForDeploymentCoordinatorReadinessInput,
+): Promise<void> {
+  if (!Number.isFinite(input.timeoutMs) || input.timeoutMs <= 0) {
+    throw new Error("The coordinator readiness timeout must be positive.");
+  }
+  if (input.viewerCapability.length === 0) {
+    throw new Error("The viewer capability is required for coordinator readiness.");
+  }
+  const pollIntervalMs = input.pollIntervalMs ?? 1_000;
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw new Error("The coordinator readiness poll interval must be positive.");
+  }
+  const deadline = Date.now() + input.timeoutMs;
+  const snapshotUrl = sessionResourceUrl(input.relayUrl, DEPLOYMENT_SMOKE_SESSION_ID, "snapshot");
+  const timeoutMessage =
+    "The session fabric coordinator did not accept the deployed verifier before the readiness deadline.";
+
+  while (true) {
+    let response: Response;
+    try {
+      response = await fetchBeforeDeadline(input.fetch, snapshotUrl, deadline, timeoutMessage, {
+        headers: { authorization: `Bearer ${input.viewerCapability}` },
+      });
+    } catch (error) {
+      if (
+        remainingMs(deadline) === 0 ||
+        (error instanceof Error && error.message === timeoutMessage)
+      ) {
+        throw new Error(timeoutMessage, { cause: error });
+      }
+      await waitForPoll(deadline, pollIntervalMs, timeoutMessage);
+      continue;
+    }
+    if (response.status === 200) {
+      const snapshot = decodeSnapshot(await response.json());
+      if (snapshot.session.sessionId !== DEPLOYMENT_SMOKE_SESSION_ID) {
+        throw new Error("The readiness coordinator returned the wrong session identity.");
+      }
+      return;
+    }
+    if (response.status === 404) {
+      if (input.allowMissingBootstrap === true) return;
+      throw new Error(
+        "The pre-existing deployment smoke coordinator is missing; bootstrap mode is required only for a fresh environment.",
+      );
+    }
+    if (
+      response.status !== 401 &&
+      response.status !== 429 &&
+      (response.status < 500 || response.status > 599)
+    ) {
+      throw new Error(
+        `The coordinator readiness probe returned unexpected status ${response.status}.`,
+      );
+    }
+    await waitForPoll(deadline, pollIntervalMs, timeoutMessage);
+  }
 }
 
 async function pollForDeploymentSnapshot(input: {

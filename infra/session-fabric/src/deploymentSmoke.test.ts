@@ -8,6 +8,7 @@ import {
   runDeploymentSmoke,
   type DeploymentSmokeSocket,
   verifyDeploymentSmokeSnapshot,
+  waitForDeploymentCoordinatorReadiness,
 } from "./deploymentSmoke.ts";
 
 const NOW = "2026-07-25T20:00:00.000Z";
@@ -82,6 +83,112 @@ class TestSocket implements DeploymentSmokeSocket {
 }
 
 describe("session fabric deployment smoke", () => {
+  it("waits for an existing coordinator instance to accept the deployed verifier", async () => {
+    const [, publication] = buildDeploymentSmokeFrames({ marker: "existing", now: NOW });
+    if (publication.type !== "session.publish-snapshot") throw new Error("unexpected frame");
+    const responses = [
+      new Response(null, { status: 401 }),
+      new Response(null, { status: 429 }),
+      new Response(null, { status: 503 }),
+      Response.json(publication.published.snapshot),
+    ];
+    const authorizations: string[] = [];
+    const paths: string[] = [];
+
+    await expect(
+      waitForDeploymentCoordinatorReadiness({
+        relayUrl: new URL("https://fabric.example"),
+        timeoutMs: 1_000,
+        pollIntervalMs: 1,
+        viewerCapability: VIEWER_CAPABILITY,
+        fetch: async (input, init) => {
+          paths.push(new URL(input instanceof Request ? input.url : input).pathname);
+          authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+          return responses.shift() ?? Response.json(publication.published.snapshot);
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(authorizations).toEqual([
+      `Bearer ${VIEWER_CAPABILITY}`,
+      `Bearer ${VIEWER_CAPABILITY}`,
+      `Bearer ${VIEWER_CAPABILITY}`,
+      `Bearer ${VIEWER_CAPABILITY}`,
+    ]);
+    expect(paths).toEqual(
+      Array.from(
+        { length: 4 },
+        () => "/v1/session-fabric/sessions/deployment-smoke-proof-v1/snapshot",
+      ),
+    );
+  });
+
+  it("retries bounded network failures under the same readiness deadline", async () => {
+    const [, publication] = buildDeploymentSmokeFrames({ marker: "existing", now: NOW });
+    if (publication.type !== "session.publish-snapshot") throw new Error("unexpected frame");
+    let attempts = 0;
+
+    await expect(
+      waitForDeploymentCoordinatorReadiness({
+        relayUrl: new URL("https://fabric.example"),
+        timeoutMs: 1_000,
+        pollIntervalMs: 1,
+        viewerCapability: VIEWER_CAPABILITY,
+        fetch: async () => {
+          attempts += 1;
+          if (attempts < 3) throw new TypeError("fetch failed");
+          return Response.json(publication.published.snapshot);
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(attempts).toBe(3);
+  });
+
+  it("fails fast on permanent readiness statuses and missing state", async () => {
+    await expect(
+      waitForDeploymentCoordinatorReadiness({
+        relayUrl: new URL("https://fabric.example"),
+        timeoutMs: 1_000,
+        viewerCapability: VIEWER_CAPABILITY,
+        fetch: async () => new Response(null, { status: 403 }),
+      }),
+    ).rejects.toThrow("unexpected status 403");
+
+    await expect(
+      waitForDeploymentCoordinatorReadiness({
+        relayUrl: new URL("https://fabric.example"),
+        timeoutMs: 1_000,
+        viewerCapability: VIEWER_CAPABILITY,
+        fetch: async () => new Response(null, { status: 404 }),
+      }),
+    ).rejects.toThrow("pre-existing deployment smoke coordinator is missing");
+  });
+
+  it("allows an explicitly gated missing coordinator only for fresh bootstrap", async () => {
+    await expect(
+      waitForDeploymentCoordinatorReadiness({
+        relayUrl: new URL("https://fabric.example"),
+        timeoutMs: 1_000,
+        viewerCapability: VIEWER_CAPABILITY,
+        allowMissingBootstrap: true,
+        fetch: async () => new Response(null, { status: 404 }),
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("bounds repeated transient readiness failures with one deadline", async () => {
+    await expect(
+      waitForDeploymentCoordinatorReadiness({
+        relayUrl: new URL("https://fabric.example"),
+        timeoutMs: 5,
+        pollIntervalMs: 1,
+        viewerCapability: VIEWER_CAPABILITY,
+        fetch: async () => new Response(null, { status: 502 }),
+      }),
+    ).rejects.toThrow("did not accept the deployed verifier before the readiness deadline");
+  });
+
   it("builds valid runner hello and snapshot publication frames with stable identity", () => {
     const [hello, publication] = buildDeploymentSmokeFrames({ marker: "run-42", now: NOW });
 
