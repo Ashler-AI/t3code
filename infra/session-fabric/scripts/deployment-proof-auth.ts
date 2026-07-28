@@ -4,9 +4,9 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import {
-  generateDeploymentProofKeyPair,
   mintDeploymentProofCapabilities,
   parseDeploymentProofAllowedOrigins,
+  prepareDeploymentProofVerifier,
 } from "../src/deploymentProofAuth.ts";
 
 const requiredEnv = (name: string): string => {
@@ -18,9 +18,10 @@ const requiredEnv = (name: string): string => {
 const command = process.argv[2];
 if (command === "verifier") {
   const origins = parseDeploymentProofAllowedOrigins(requiredEnv("SESSION_FABRIC_ALLOWED_ORIGINS"));
-  const keyPair = generateDeploymentProofKeyPair({
-    runId: requiredEnv("GITHUB_RUN_ID"),
-    runAttempt: requiredEnv("GITHUB_RUN_ATTEMPT"),
+  const additionalPublicKeysJson = process.env.SESSION_FABRIC_PROOF_ADDITIONAL_PUBLIC_KEYS_JSON;
+  const keyPair = prepareDeploymentProofVerifier({
+    privateKey: requiredEnv("SESSION_FABRIC_PROOF_SIGNING_PRIVATE_KEY"),
+    ...(additionalPublicKeysJson === undefined ? {} : { additionalPublicKeysJson }),
   });
   const privateKeyPath = NodePath.join(requiredEnv("RUNNER_TEMP"), "session-fabric-proof-key.pem");
   NodeFS.writeFileSync(privateKeyPath, keyPair.privateKey, { mode: 0o600 });

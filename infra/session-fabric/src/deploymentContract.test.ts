@@ -24,49 +24,24 @@ describe("session fabric proof deployment", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("binds required auth and only the credentials needed by the proof deployment", () =>
+  it.effect("leaves the shared proof Worker under the Platform controller's sole ownership", () =>
     Effect.gen(function* () {
-      const workflow = yield* readFile(
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workflowPath = yield* path.fromFileUrl(
         new URL("../../../.github/workflows/deploy-session-fabric-proof.yml", import.meta.url),
       );
+      const packageJson = yield* readFile(new URL("../package.json", import.meta.url));
+      const readme = yield* readFile(new URL("../README.md", import.meta.url));
 
-      expect(workflow).toContain("workflow_dispatch:");
-      expect(workflow).toContain("name: session-fabric-proof");
-      expect(workflow).toContain("contents: read");
-      expect(workflow).toContain("id-token: none");
-      expect(workflow).toContain("CLOUDFLARE_ACCOUNT_ID");
-      expect(workflow).toContain("CLOUDFLARE_API_TOKEN");
-      expect(workflow).toContain("BASETEN_API_KEY: ${{ secrets.BASETEN_API_KEY }}");
-      expect(workflow).toContain("BASETEN_EMBEDDING_URL: ${{ vars.BASETEN_EMBEDDING_URL }}");
-      expect(workflow).toContain(
-        "SESSION_FABRIC_ALLOWED_ORIGINS: ${{ vars.SESSION_FABRIC_ALLOWED_ORIGINS }}",
-      );
-      expect(workflow).toContain("SESSION_FABRIC_AUTH_MODE: required");
-      expect(workflow).toContain("SESSION_FABRIC_CAPABILITY_AUDIENCE: t3code-session-fabric-proof");
-      expect(workflow).toContain(
-        "SESSION_FABRIC_CAPABILITY_ISSUER: https://session-fabric-proof.t3.tools",
-      );
-      expect(workflow).toContain("deployment-proof-auth.ts verifier");
-      expect(workflow).toContain("deployment-proof-auth.ts capabilities");
-      expect(workflow).not.toContain("SESSION_FABRIC_AUTH_MODE: disabled");
-      expect(workflow).toContain("--stage proof --yes");
-      expect(workflow).toContain("ashler-session-fabric-proof");
-      expect(workflow).toContain("smoke:deployment");
-      expect(workflow).toContain('--marker "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"');
-      expect(workflow).toContain('--scaffold-origin "${SESSION_FABRIC_SMOKE_SCAFFOLD_ORIGIN}"');
-      expect(workflow).not.toContain("/health");
-
-      for (const unrelatedCredential of [
-        "PLANETSCALE",
-        "CLERK",
-        "APNS",
-        "AXIOM",
-        "RELAY_DOMAIN",
-        "RELAY_API_ZONE_NAME",
-        "RELAY_TUNNEL_ZONE_NAME",
-      ]) {
-        expect(workflow).not.toContain(unrelatedCredential);
-      }
+      expect(yield* fileSystem.exists(workflowPath)).toBe(false);
+      expect(packageJson).toContain('"deploy": "alchemy deploy"');
+      expect(packageJson).toContain('"destroy": "alchemy destroy"');
+      expect(packageJson).toContain('"wrangler": "4.114.0"');
+      expect(readme).toContain("sole CI deployment owner");
+      expect(readme).toContain("Do not run `pnpm --dir infra/session-fabric deploy`");
+      expect(readme).toMatch(/forcing\s+reconciliation/u);
+      expect(readme).toMatch(/fails closed instead of overwriting a newer external\s+deployment/u);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
