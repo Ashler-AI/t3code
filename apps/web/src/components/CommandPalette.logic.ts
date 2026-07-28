@@ -117,6 +117,54 @@ export interface ScaffoldNewSessionActionPresentation {
   readonly description: string;
 }
 
+function reportDetachedScaffoldDraftError(
+  reportError: ((error: unknown) => void) | undefined,
+  error: unknown,
+): void {
+  try {
+    if (reportError) {
+      reportError(error);
+      return;
+    }
+    console.error("Detached Scaffold draft persistence failed.", error);
+  } catch {
+    // Detached work must always terminate here, even when the reporting sink
+    // itself is unavailable or throws.
+  }
+}
+
+export async function persistScaffoldDraftAction<TDraftId, TAction>(input: {
+  readonly draftId: TDraftId;
+  readonly action: TAction;
+  readonly persistAction: (action: TAction) => Promise<void>;
+  readonly showFailure: (draftId: TDraftId, error: unknown) => void;
+  readonly actionPersisted: (draftId: TDraftId) => void;
+  readonly requestDrain: (action: TAction) => void;
+  readonly reportDetachedError?: (error: unknown) => void;
+}): Promise<void> {
+  try {
+    await input.persistAction(input.action);
+  } catch (error) {
+    try {
+      input.showFailure(input.draftId, error);
+    } catch (showFailureError) {
+      reportDetachedScaffoldDraftError(input.reportDetachedError, showFailureError);
+    }
+    return;
+  }
+
+  try {
+    input.actionPersisted(input.draftId);
+  } catch (error) {
+    reportDetachedScaffoldDraftError(input.reportDetachedError, error);
+  }
+  try {
+    input.requestDrain(input.action);
+  } catch (error) {
+    reportDetachedScaffoldDraftError(input.reportDetachedError, error);
+  }
+}
+
 export async function runScaffoldDraftLaunch<TDraftId, TAction>(input: {
   readonly createDraft: (
     prepareBeforeNavigation: (draftId: TDraftId) => Promise<void>,
@@ -127,27 +175,28 @@ export async function runScaffoldDraftLaunch<TDraftId, TAction>(input: {
   readonly showFailure: (draftId: TDraftId, error: unknown) => void;
   readonly actionPersisted: (draftId: TDraftId) => void;
   readonly requestDrain: (action: TAction) => void;
+  readonly reportDetachedError?: (error: unknown) => void;
 }): Promise<void> {
   let draftPrepared = false;
-  let preparationError: unknown = null;
-  let preparationFailed = false;
 
   await input.createDraft(async (draftId) => {
     const action = input.createAction(draftId);
     draftPrepared = true;
     input.showCreating(draftId, action);
-    try {
-      await input.persistAction(action);
-      input.actionPersisted(draftId);
-      input.requestDrain(action);
-    } catch (error) {
-      preparationFailed = true;
-      preparationError = error;
-      input.showFailure(draftId, error);
-    }
+    // The in-memory action is sufficient to render the target-labelled draft.
+    // Persist and drain in the background so IndexedDB cannot hold the command
+    // palette open while the user waits for Scaffold to start.
+    void persistScaffoldDraftAction({
+      draftId,
+      action,
+      persistAction: input.persistAction,
+      showFailure: input.showFailure,
+      actionPersisted: input.actionPersisted,
+      requestDrain: input.requestDrain,
+      ...(input.reportDetachedError ? { reportDetachedError: input.reportDetachedError } : {}),
+    });
   });
 
-  if (preparationFailed) throw preparationError;
   if (!draftPrepared) {
     throw new Error("Scaffold session preparation did not complete.");
   }

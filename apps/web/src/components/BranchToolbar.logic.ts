@@ -139,6 +139,40 @@ export function shouldPrepareWorktreeForFirstMessage(input: {
   );
 }
 
+export function shouldReleaseQueuedScaffoldDispatch(input: {
+  hasScaffoldDraft: boolean;
+  deliveryDeferred: boolean;
+}): boolean {
+  return input.hasScaffoldDraft && input.deliveryDeferred;
+}
+
+export type ScaffoldPendingTurnMode = "none" | "hydrate" | "drain";
+
+export function resolveScaffoldPendingTurnMode(input: {
+  hasScaffoldDraft: boolean;
+  boundToTarget: boolean;
+  targetConnected: boolean;
+}): ScaffoldPendingTurnMode {
+  if (!input.hasScaffoldDraft) return "none";
+  return input.boundToTarget && input.targetConnected ? "drain" : "hydrate";
+}
+
+export function mergeQueuedScaffoldMessages<
+  TMessage extends { readonly id: string; readonly createdAt: string },
+>(input: {
+  existing: ReadonlyArray<TMessage>;
+  hydrated: ReadonlyArray<TMessage>;
+  acknowledgedMessageIds: ReadonlySet<string>;
+}): TMessage[] {
+  const byId = new Map<string, TMessage>();
+  for (const message of [...input.existing, ...input.hydrated]) {
+    if (!input.acknowledgedMessageIds.has(message.id) && !byId.has(message.id)) {
+      byId.set(message.id, message);
+    }
+  }
+  return [...byId.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
 export function shouldIgnoreSourceEnvironmentForScaffoldDraft(input: {
   scaffoldEnvironmentId: EnvironmentId | null | undefined;
   scaffoldPhase: ScaffoldDraftPhase | null;

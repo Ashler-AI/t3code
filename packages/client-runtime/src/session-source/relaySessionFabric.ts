@@ -5,12 +5,14 @@ import {
   SessionFabricServerFrame,
   SessionFabricSessionId,
   SessionFabricSnapshot as SessionFabricSnapshotSchema,
+  type OrchestrationEvent,
   type OrchestrationShellStreamItem,
   type OrchestrationSubscribeShellInput,
   type OrchestrationSubscribeThreadInput,
   type OrchestrationThreadStreamItem,
   type SessionFabricClientId,
   type SessionFabricCommandReceipt,
+  type SessionFabricSessionRecord,
   type SessionFabricServerFrame as SessionFabricServerFrameType,
   type SessionFabricSnapshot,
   type ThreadId,
@@ -29,6 +31,7 @@ import * as Stream from "effect/Stream";
 import * as Socket from "effect/unstable/socket/Socket";
 
 import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
+import { latestTurnAfterSessionSet } from "../state/threadReducer.ts";
 import {
   SessionFabricAuthorizationError,
   type SessionFabricAuthorizationShape,
@@ -121,7 +124,87 @@ export function makeRelaySessionFabricUiSessionSource(
     options.webSocketConstructor ?? ((url, protocols) => new globalThis.WebSocket(url, protocols));
   const webSocketLayer = Layer.succeed(Socket.WebSocketConstructor, webSocketConstructor);
   const socketUrl = makeRelaySessionFabricWebSocketUrl(options.relayBaseUrl, options.sessionId);
-  let latestSnapshot: SessionFabricSnapshot | null = null;
+  let latestKnownSnapshot: SessionFabricSnapshot | null = null;
+
+  const sessionRecordDominates = (
+    candidate: SessionFabricSessionRecord,
+    current: SessionFabricSessionRecord,
+  ): boolean => {
+    const candidateEpoch = candidate.location.scaffoldLifecycleEpoch ?? -1;
+    const currentEpoch = current.location.scaffoldLifecycleEpoch ?? -1;
+    return (
+      candidate.cursor.eventSequence >= current.cursor.eventSequence &&
+      candidate.cursor.snapshotSequence >= current.cursor.snapshotSequence &&
+      candidateEpoch >= currentEpoch &&
+      candidate.updatedAt >= current.updatedAt
+    );
+  };
+
+  const rememberSnapshot = (candidate: SessionFabricSnapshot): SessionFabricSnapshot => {
+    const current = latestKnownSnapshot;
+    if (current === null) {
+      latestKnownSnapshot = candidate;
+      return candidate;
+    }
+
+    latestKnownSnapshot = {
+      session: sessionRecordDominates(candidate.session, current.session)
+        ? candidate.session
+        : current.session,
+      shell:
+        candidate.shell.snapshotSequence > current.shell.snapshotSequence
+          ? candidate.shell
+          : current.shell,
+      thread:
+        candidate.thread.snapshotSequence > current.thread.snapshotSequence
+          ? candidate.thread
+          : current.thread,
+      compactedThroughEventSequence: Math.max(
+        candidate.compactedThroughEventSequence,
+        current.compactedThroughEventSequence,
+      ),
+    };
+    return latestKnownSnapshot;
+  };
+
+  const rememberShell = (candidate: SessionFabricSnapshot["shell"]) => {
+    if (
+      latestKnownSnapshot === null ||
+      candidate.snapshotSequence <= latestKnownSnapshot.shell.snapshotSequence
+    ) {
+      return latestKnownSnapshot?.shell ?? candidate;
+    }
+    latestKnownSnapshot = { ...latestKnownSnapshot, shell: candidate };
+    return candidate;
+  };
+
+  const rememberSessionSet = (
+    event: Extract<OrchestrationEvent, { readonly type: "thread.session-set" }>,
+  ) => {
+    const current = latestKnownSnapshot;
+    if (current === null) return;
+
+    const cachedThread = current.thread.thread;
+    if (
+      cachedThread.id !== event.payload.threadId ||
+      event.sequence <= current.thread.snapshotSequence
+    ) {
+      return;
+    }
+
+    latestKnownSnapshot = {
+      ...current,
+      thread: {
+        snapshotSequence: event.sequence,
+        thread: {
+          ...cachedThread,
+          session: event.payload.session,
+          latestTurn: latestTurnAfterSessionSet(cachedThread.latestTurn, event.payload.session),
+          updatedAt: event.occurredAt,
+        },
+      },
+    };
+  };
 
   const unavailable = (message: string) =>
     new EnvironmentRpcUnavailableError({
@@ -167,12 +250,12 @@ export function makeRelaySessionFabricUiSessionSource(
       );
       if (Option.isNone(payload)) return Option.none<SessionFabricSnapshot>();
       const decoded = yield* decodeSnapshot(payload.value).pipe(Effect.option);
-      if (Option.isSome(decoded)) latestSnapshot = decoded.value;
-      return decoded;
+      if (Option.isNone(decoded)) return decoded;
+      return Option.some(rememberSnapshot(decoded.value));
     });
 
   const controllerBinding = Effect.fn("relay_session_fabric.controller_binding")(function* () {
-    const snapshot = latestSnapshot ?? Option.getOrNull(yield* loadSnapshot());
+    const snapshot = latestKnownSnapshot ?? Option.getOrNull(yield* loadSnapshot());
     const location = snapshot?.session.location;
     if (
       location?.environmentKind !== "scaffold" ||
@@ -208,7 +291,7 @@ export function makeRelaySessionFabricUiSessionSource(
       never,
       R
     >;
-    readonly project: (
+    readonly makeProject: () => (
       frame: SessionFabricServerFrameType,
       localSequence: Ref.Ref<number>,
       requestCompletionMarker: boolean,
@@ -221,6 +304,7 @@ export function makeRelaySessionFabricUiSessionSource(
         const fabricSequence = yield* Ref.make(0);
         const localSequence = yield* Ref.make(subscription.afterSequence ?? 0);
         const requestCompletionMarker = subscription.requestCompletionMarker === true;
+        const project = input.makeProject();
 
         if (socketUrl === null) return Stream.fromQueue(output);
 
@@ -267,7 +351,7 @@ export function makeRelaySessionFabricUiSessionSource(
                           )
                         : Effect.void;
                   return updateFabricSequence.pipe(
-                    Effect.andThen(input.project(frame, localSequence, requestCompletionMarker)),
+                    Effect.andThen(project(frame, localSequence, requestCompletionMarker)),
                     Effect.flatMap(
                       Option.match({
                         onNone: () => Effect.void,
@@ -315,59 +399,140 @@ export function makeRelaySessionFabricUiSessionSource(
       }),
     );
 
-  const projectShellFrame = (
-    frame: SessionFabricServerFrameType,
-    localSequence: Ref.Ref<number>,
-    requestCompletionMarker: boolean,
-  ): Effect.Effect<Option.Option<OrchestrationShellStreamItem>> => {
-    switch (frame.type) {
-      case "session.snapshot":
-        return Ref.set(localSequence, frame.snapshot.shell.snapshotSequence).pipe(
-          Effect.as(Option.some({ kind: "snapshot", snapshot: frame.snapshot.shell })),
-        );
-      case "session.synchronized":
-        return Effect.succeed(
-          requestCompletionMarker ? Option.some({ kind: "synchronized" as const }) : Option.none(),
-        );
-      default:
-        return Effect.succeed(Option.none());
-    }
+  const makeProjectShellFrame = () => {
+    let shellSnapshot = latestKnownSnapshot?.shell ?? null;
+
+    return (
+      frame: SessionFabricServerFrameType,
+      localSequence: Ref.Ref<number>,
+      requestCompletionMarker: boolean,
+    ): Effect.Effect<Option.Option<OrchestrationShellStreamItem>> => {
+      switch (frame.type) {
+        case "session.snapshot":
+          return Ref.modify(localSequence, (sequence) => {
+            const remembered = rememberSnapshot(frame.snapshot).shell;
+            const snapshotSequence = remembered.snapshotSequence;
+            if (snapshotSequence <= sequence) {
+              return [Option.none(), sequence];
+            }
+            shellSnapshot = remembered;
+            return [
+              Option.some({ kind: "snapshot" as const, snapshot: shellSnapshot }),
+              snapshotSequence,
+            ];
+          });
+        case "session.event": {
+          const event = frame.published.event;
+          // Relay live updates are committed orchestration events, not the
+          // preprojected shell events that direct environments receive.
+          if (
+            frame.published.sessionId !== options.sessionId ||
+            event.type !== "thread.session-set"
+          ) {
+            return Effect.succeed(Option.none());
+          }
+          return Ref.modify(localSequence, (sequence) => {
+            if (event.sequence <= sequence || shellSnapshot === null) {
+              return [Option.none(), sequence];
+            }
+            const thread = shellSnapshot.threads.find(
+              (candidate) => candidate.id === event.payload.threadId,
+            );
+            if (thread === undefined) return [Option.none(), sequence];
+
+            const updatedThread = {
+              ...thread,
+              session: event.payload.session,
+              latestTurn: latestTurnAfterSessionSet(thread.latestTurn, event.payload.session),
+              updatedAt: event.occurredAt,
+            };
+            shellSnapshot = {
+              ...shellSnapshot,
+              snapshotSequence: event.sequence,
+              threads: shellSnapshot.threads.map((candidate) =>
+                candidate.id === updatedThread.id ? updatedThread : candidate,
+              ),
+              updatedAt: event.occurredAt,
+            };
+            shellSnapshot = rememberShell(shellSnapshot);
+            rememberSessionSet(event);
+            return [
+              Option.some({
+                kind: "thread-upserted" as const,
+                sequence: event.sequence,
+                thread: updatedThread,
+              }),
+              event.sequence,
+            ];
+          });
+        }
+        case "session.synchronized":
+          return Effect.succeed(
+            requestCompletionMarker
+              ? Option.some({ kind: "synchronized" as const })
+              : Option.none(),
+          );
+        default:
+          return Effect.succeed(Option.none());
+      }
+    };
   };
 
-  const projectThreadFrame = (
-    threadId: ThreadId,
-    frame: SessionFabricServerFrameType,
-    localSequence: Ref.Ref<number>,
-    requestCompletionMarker: boolean,
-  ): Effect.Effect<Option.Option<OrchestrationThreadStreamItem>> => {
-    switch (frame.type) {
-      case "session.snapshot":
-        if (!isThreadSnapshot(frame.snapshot, threadId)) {
-          return Effect.succeed(Option.none());
+  const makeProjectThreadFrame = (threadId: ThreadId) => {
+    let threadSnapshot =
+      latestKnownSnapshot !== null && isThreadSnapshot(latestKnownSnapshot, threadId)
+        ? latestKnownSnapshot.thread
+        : null;
+
+    return (
+      frame: SessionFabricServerFrameType,
+      localSequence: Ref.Ref<number>,
+      requestCompletionMarker: boolean,
+    ): Effect.Effect<Option.Option<OrchestrationThreadStreamItem>> => {
+      switch (frame.type) {
+        case "session.snapshot": {
+          const remembered = rememberSnapshot(frame.snapshot);
+          if (!isThreadSnapshot(remembered, threadId)) {
+            return Effect.succeed(Option.none());
+          }
+          return Ref.modify(localSequence, (sequence) => {
+            const snapshotSequence = remembered.thread.snapshotSequence;
+            if (snapshotSequence <= sequence) {
+              return [Option.none(), sequence];
+            }
+            threadSnapshot = remembered.thread;
+            return [
+              Option.some({ kind: "snapshot" as const, snapshot: threadSnapshot }),
+              snapshotSequence,
+            ];
+          });
         }
-        return Ref.set(localSequence, frame.snapshot.thread.snapshotSequence).pipe(
-          Effect.as(Option.some({ kind: "snapshot", snapshot: frame.snapshot.thread })),
-        );
-      case "session.event":
-        if (frame.published.sessionId !== options.sessionId) {
+        case "session.event":
+          if (frame.published.sessionId !== options.sessionId) {
+            return Effect.succeed(Option.none());
+          }
+          if (frame.published.event.type === "thread.session-set") {
+            rememberSessionSet(frame.published.event);
+          }
+          return Ref.modify(localSequence, (sequence) => {
+            const eventSequence = frame.published.event.sequence;
+            return eventSequence <= sequence
+              ? [Option.none(), sequence]
+              : [
+                  Option.some({ kind: "event" as const, event: frame.published.event }),
+                  eventSequence,
+                ];
+          });
+        case "session.synchronized":
+          return Effect.succeed(
+            requestCompletionMarker
+              ? Option.some({ kind: "synchronized" as const })
+              : Option.none(),
+          );
+        default:
           return Effect.succeed(Option.none());
-        }
-        return Ref.modify(localSequence, (sequence) => {
-          const eventSequence = frame.published.event.sequence;
-          return eventSequence <= sequence
-            ? [Option.none(), sequence]
-            : [
-                Option.some({ kind: "event" as const, event: frame.published.event }),
-                eventSequence,
-              ];
-        });
-      case "session.synchronized":
-        return Effect.succeed(
-          requestCompletionMarker ? Option.some({ kind: "synchronized" as const }) : Option.none(),
-        );
-      default:
-        return Effect.succeed(Option.none());
-    }
+      }
+    };
   };
 
   const dispatch: UiSessionSourceShape["dispatch"] = (command) => {
@@ -510,7 +675,7 @@ export function makeRelaySessionFabricUiSessionSource(
     subscribeShell: (makeInput) =>
       subscribe({
         makeInput: makeInput(CAPABILITIES),
-        project: projectShellFrame,
+        makeProject: makeProjectShellFrame,
       }),
     subscribeThread: (makeInput) =>
       Stream.unwrap(
@@ -518,13 +683,7 @@ export function makeRelaySessionFabricUiSessionSource(
           Effect.map((threadInput) =>
             subscribe({
               makeInput: Effect.succeed(threadInput),
-              project: (frame, localSequence, requestCompletionMarker) =>
-                projectThreadFrame(
-                  threadInput.threadId,
-                  frame,
-                  localSequence,
-                  requestCompletionMarker,
-                ),
+              makeProject: () => makeProjectThreadFrame(threadInput.threadId),
             }),
           ),
         ),
