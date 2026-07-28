@@ -328,40 +328,7 @@ export function applyThreadDetailEvent(
 
     // ── Session ─────────────────────────────────────────────────────
     case "thread.session-set": {
-      // Leaving the "running" session status is the turn-end signal: settle a
-      // still-running latest turn so its duration reflects the whole turn.
-      const settledTurnState = settledTurnStateForSessionStatus(event.payload.session.status);
-      const latestTurn: OrchestrationLatestTurn | null =
-        event.payload.session.status === "running" && event.payload.session.activeTurnId !== null
-          ? {
-              turnId: event.payload.session.activeTurnId,
-              state: "running",
-              requestedAt:
-                thread.latestTurn?.turnId === event.payload.session.activeTurnId
-                  ? thread.latestTurn.requestedAt
-                  : event.payload.session.updatedAt,
-              startedAt:
-                thread.latestTurn?.turnId === event.payload.session.activeTurnId
-                  ? (thread.latestTurn.startedAt ?? event.payload.session.updatedAt)
-                  : event.payload.session.updatedAt,
-              completedAt: null,
-              assistantMessageId:
-                thread.latestTurn?.turnId === event.payload.session.activeTurnId
-                  ? thread.latestTurn.assistantMessageId
-                  : null,
-            }
-          : thread.latestTurn !== null &&
-              thread.latestTurn.state === "running" &&
-              settledTurnState !== null
-            ? {
-                ...thread.latestTurn,
-                state: settledTurnState,
-                // A running turn's completedAt can only hold a mid-turn
-                // placeholder checkpoint timestamp — the session leaving
-                // "running" is the authoritative turn end.
-                completedAt: event.payload.session.updatedAt,
-              }
-            : thread.latestTurn;
+      const latestTurn = latestTurnAfterSessionSet(thread.latestTurn, event.payload.session);
 
       return {
         kind: "updated",
@@ -534,6 +501,43 @@ export function applyThreadDetailEvent(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Project an authoritative session update into the latest-turn lifecycle.
+ * Shared by detail and shell projections so a running turn settles identically
+ * regardless of which client stream receives the session event.
+ */
+export function latestTurnAfterSessionSet(
+  latestTurn: OrchestrationLatestTurn | null,
+  session: OrchestrationSession,
+): OrchestrationLatestTurn | null {
+  if (session.status === "running" && session.activeTurnId !== null) {
+    return {
+      turnId: session.activeTurnId,
+      state: "running",
+      requestedAt:
+        latestTurn?.turnId === session.activeTurnId ? latestTurn.requestedAt : session.updatedAt,
+      startedAt:
+        latestTurn?.turnId === session.activeTurnId
+          ? (latestTurn.startedAt ?? session.updatedAt)
+          : session.updatedAt,
+      completedAt: null,
+      assistantMessageId:
+        latestTurn?.turnId === session.activeTurnId ? latestTurn.assistantMessageId : null,
+    };
+  }
+
+  const settledTurnState = settledTurnStateForSessionStatus(session.status);
+  return latestTurn !== null && latestTurn.state === "running" && settledTurnState !== null
+    ? {
+        ...latestTurn,
+        state: settledTurnState,
+        // A running turn's completedAt can only hold a mid-turn placeholder
+        // checkpoint timestamp; leaving running is the authoritative turn end.
+        completedAt: session.updatedAt,
+      }
+    : latestTurn;
+}
 
 /**
  * Turn state to settle a still-running latest turn with when its session

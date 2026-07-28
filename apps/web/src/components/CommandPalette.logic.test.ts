@@ -10,6 +10,7 @@ import {
   reduceCommandPaletteUiState,
   getCommandPaletteInputPlaceholder,
   getScaffoldNewSessionActionPresentation,
+  persistScaffoldDraftAction,
   runScaffoldDraftLaunch,
   shouldRefreshOmpOverviewOnOpen,
   type CommandPaletteActionItem,
@@ -218,8 +219,12 @@ describe("Ashler command palette root", () => {
 });
 
 describe("runScaffoldDraftLaunch", () => {
-  it("projects and persists the exact target before the draft becomes visible", async () => {
+  it("opens the target-labelled draft without waiting for lifecycle persistence", async () => {
     const events: string[] = [];
+    let releasePersistence: (() => void) | undefined;
+    const persistenceBlocked = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
     await runScaffoldDraftLaunch({
       createDraft: async (prepareBeforeNavigation) => {
         events.push("draft:created");
@@ -229,6 +234,8 @@ describe("runScaffoldDraftLaunch", () => {
       createAction: (draftId) => ({ draftId, deployment: "production" as const }),
       showCreating: (_draftId, action) => events.push(`ui:${action.deployment}:creating`),
       persistAction: async (action) => {
+        events.push(`outbox:${action.deployment}:persisting`);
+        await persistenceBlocked;
         events.push(`outbox:${action.deployment}:persisted`);
       },
       actionPersisted: () => events.push("ui:volatile-cleared"),
@@ -239,42 +246,109 @@ describe("runScaffoldDraftLaunch", () => {
     expect(events).toEqual([
       "draft:created",
       "ui:production:creating",
-      "outbox:production:persisted",
-      "ui:volatile-cleared",
-      "outbox:production:drain",
+      "outbox:production:persisting",
       "draft:navigated",
     ]);
+
+    releasePersistence?.();
+    await vi.waitFor(() => {
+      expect(events).toEqual([
+        "draft:created",
+        "ui:production:creating",
+        "outbox:production:persisting",
+        "draft:navigated",
+        "outbox:production:persisted",
+        "ui:volatile-cleared",
+        "outbox:production:drain",
+      ]);
+    });
   });
 
-  it("navigates to a target-labelled failed draft when the first durable write fails", async () => {
+  it("keeps the failed target visible when the first durable write fails", async () => {
     const events: string[] = [];
-    await expect(
-      runScaffoldDraftLaunch({
-        createDraft: async (prepareBeforeNavigation) => {
-          events.push("draft:created");
-          await prepareBeforeNavigation("draft-staging");
-          events.push("draft:navigated");
-        },
-        createAction: (draftId) => ({ draftId, deployment: "staging" as const }),
-        showCreating: (_draftId, action) => events.push(`ui:${action.deployment}:creating`),
-        persistAction: async () => {
-          events.push("outbox:write-failed");
-          throw new Error("IndexedDB unavailable");
-        },
-        actionPersisted: () => events.push("ui:volatile-cleared"),
-        showFailure: (_draftId, error) =>
-          events.push(`ui:staging:failed:${error instanceof Error ? error.message : "unknown"}`),
-        requestDrain: () => events.push("outbox:drain"),
-      }),
-    ).rejects.toThrow("IndexedDB unavailable");
+    await runScaffoldDraftLaunch({
+      createDraft: async (prepareBeforeNavigation) => {
+        events.push("draft:created");
+        await prepareBeforeNavigation("draft-staging");
+        events.push("draft:navigated");
+      },
+      createAction: (draftId) => ({ draftId, deployment: "staging" as const }),
+      showCreating: (_draftId, action) => events.push(`ui:${action.deployment}:creating`),
+      persistAction: async () => {
+        events.push("outbox:write-failed");
+        throw new Error("IndexedDB unavailable");
+      },
+      actionPersisted: () => events.push("ui:volatile-cleared"),
+      showFailure: (_draftId, error) =>
+        events.push(`ui:staging:failed:${error instanceof Error ? error.message : "unknown"}`),
+      requestDrain: () => events.push("outbox:drain"),
+    });
 
-    expect(events).toEqual([
-      "draft:created",
-      "ui:staging:creating",
-      "outbox:write-failed",
-      "ui:staging:failed:IndexedDB unavailable",
-      "draft:navigated",
-    ]);
+    await vi.waitFor(() => {
+      expect(events).toEqual([
+        "draft:created",
+        "ui:staging:creating",
+        "outbox:write-failed",
+        "ui:staging:failed:IndexedDB unavailable",
+        "draft:navigated",
+      ]);
+    });
+  });
+
+  it("terminates detached durable-write failure even when failure reporting throws", async () => {
+    const durableError = new Error("IndexedDB unavailable");
+    const reportingError = new Error("failure UI unavailable");
+    const terminalErrors: unknown[] = [];
+
+    await expect(
+      persistScaffoldDraftAction({
+        draftId: "draft-production",
+        action: { deployment: "production" as const },
+        persistAction: async () => Promise.reject(durableError),
+        showFailure: (_draftId, error) => {
+          expect(error).toBe(durableError);
+          throw reportingError;
+        },
+        actionPersisted: () => {
+          throw new Error("must not mark a failed write as persisted");
+        },
+        requestDrain: () => {
+          throw new Error("must not drain a failed write");
+        },
+        reportDetachedError: (error) => terminalErrors.push(error),
+      }),
+    ).resolves.toBeUndefined();
+    expect(terminalErrors).toEqual([reportingError]);
+  });
+
+  it("reports post-persist callback failures without misclassifying the durable write", async () => {
+    const persistedCallbackError = new Error("volatile UI cleanup failed");
+    const drainCallbackError = new Error("drain notification failed");
+    const terminalErrors: unknown[] = [];
+    let failureShown = false;
+
+    await expect(
+      persistScaffoldDraftAction({
+        draftId: "draft-staging",
+        action: { deployment: "staging" as const },
+        persistAction: async () => undefined,
+        showFailure: () => {
+          failureShown = true;
+        },
+        actionPersisted: () => {
+          throw persistedCallbackError;
+        },
+        requestDrain: () => {
+          throw drainCallbackError;
+        },
+        reportDetachedError: (error) => {
+          terminalErrors.push(error);
+          throw new Error("terminal sink failed");
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect(failureShown).toBe(false);
+    expect(terminalErrors).toEqual([persistedCallbackError, drainCallbackError]);
   });
 });
 

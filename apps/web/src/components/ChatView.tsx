@@ -236,11 +236,14 @@ import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayo
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
 import {
+  mergeQueuedScaffoldMessages,
   resolveEffectiveEnvMode,
   resolveLocalCheckoutBranchMismatch,
+  resolveScaffoldPendingTurnMode,
   shouldBlockComposerForConnection,
   shouldIgnoreSourceEnvironmentForScaffoldDraft,
   shouldPrepareWorktreeForFirstMessage,
+  shouldReleaseQueuedScaffoldDispatch,
   shouldShowComposerContextStrip,
 } from "./BranchToolbar.logic";
 import {
@@ -1667,9 +1670,13 @@ function ChatViewContent(props: ChatViewProps) {
   const handleNewThreadInActiveProject = useCallback(() => {
     startNewThreadForProject(activeProjectRef, handleNewThread);
   }, [activeProjectRef, handleNewThread]);
+  const activeScaffoldSession = activeThread
+    ? scaffoldSessionForEnvironment(scaffoldSessionsByDraftId, activeThread.environmentId)
+    : null;
+  const effectiveScaffoldSession = scaffoldSessionUi ?? activeScaffoldSession;
   const scaffoldDraftBoundToTarget = isScaffoldDraftBoundToTarget({
-    scaffoldDraftId: scaffoldSessionUi?.draftId ?? null,
-    scaffoldEnvironmentId: scaffoldSessionUi?.environmentId ?? null,
+    scaffoldDraftId: effectiveScaffoldSession?.draftId ?? null,
+    scaffoldEnvironmentId: effectiveScaffoldSession?.environmentId ?? null,
     routeEnvironmentId: environmentId,
     threadEnvironmentId: activeThread?.environmentId ?? null,
     projectEnvironmentId: activeProject?.environmentId ?? null,
@@ -1721,9 +1728,6 @@ function ChatViewContent(props: ChatViewProps) {
   const primaryEnvironmentId = primaryEnvironment?.environmentId ?? null;
   const activeEnvironment =
     activeThread == null ? null : (environmentById.get(activeThread.environmentId) ?? null);
-  const activeScaffoldSession = activeThread
-    ? scaffoldSessionForEnvironment(scaffoldSessionsByDraftId, activeThread.environmentId)
-    : null;
   const ignoreSourceEnvironmentForScaffoldDraft = shouldIgnoreSourceEnvironmentForScaffoldDraft({
     scaffoldEnvironmentId: scaffoldSessionUi?.environmentId,
     scaffoldPhase: scaffoldSessionUi?.phase ?? null,
@@ -2277,7 +2281,8 @@ function ChatViewContent(props: ChatViewProps) {
     activePendingUserInput: activePendingUserInput?.requestId ?? null,
     threadError,
   });
-  const isWorking = phase === "running" || isSendBusy || isConnecting || isRevertingCheckpoint;
+  const isWorking =
+    phase === "running" || isSendBusy || composerIsConnecting || isRevertingCheckpoint;
   const activeWorkStartedAt = deriveActiveWorkStartedAt(
     activeLatestTurn,
     activeThread?.session ?? null,
@@ -2806,33 +2811,41 @@ function ChatViewContent(props: ChatViewProps) {
   }, [activeThread?.id, retryingScaffoldActionId, scaffoldSessionUi, setThreadError]);
   const onReplaceScaffoldDraft = useCallback(() => openCommandPalette({ open: "new-session" }), []);
 
-  // A draft is visible before its worktree exists. Rehydrate its first prompt
-  // from the browser outbox and retry it once whenever this environment becomes
-  // connected. The persisted command id makes a retry after an ambiguous
-  // disconnect safe: the server applies the command at most once.
+  // A draft is visible before its worktree exists. Rehydrate all accepted
+  // prompts even while it is unbound so leaving and returning cannot hide or
+  // reorder them. Dispatch begins only after the route, thread, and project are
+  // bound to a connected target. Stable command ids keep remount retries safe.
+  const scaffoldPendingTurnMode = resolveScaffoldPendingTurnMode({
+    hasScaffoldDraft: effectiveScaffoldSession !== null,
+    boundToTarget: scaffoldDraftBoundToTarget,
+    targetConnected: activeEnvironmentConnectionPhase === "connected",
+  });
   useEffect(() => {
-    if (!scaffoldDraftBoundToTarget) {
+    if (scaffoldPendingTurnMode === "none") {
       pendingTurnDrainKeyRef.current = null;
       return;
     }
-    if (activeEnvironmentConnectionPhase !== "connected") {
+    const scaffoldDraftId = effectiveScaffoldSession?.draftId;
+    if (!scaffoldDraftId) return;
+    if (scaffoldPendingTurnMode === "hydrate") {
       pendingTurnDrainKeyRef.current = null;
-      return;
+    } else {
+      const drainKey = `${environmentId}:${threadId}`;
+      if (pendingTurnDrainKeyRef.current === drainKey) return;
+      pendingTurnDrainKeyRef.current = drainKey;
     }
-    const drainKey = `${environmentId}:${threadId}`;
-    if (pendingTurnDrainKeyRef.current === drainKey) return;
-    pendingTurnDrainKeyRef.current = drainKey;
 
     let cancelled = false;
     void (async () => {
-      const pending = await listPendingTurnsForThread(
-        browserPendingTurnOutbox,
-        environmentId,
-        threadId,
-      );
+      const pending =
+        scaffoldPendingTurnMode === "drain"
+          ? await listPendingTurnsForThread(browserPendingTurnOutbox, environmentId, threadId)
+          : (await browserPendingTurnOutbox.list()).filter(
+              (entry) => entry.draftId === scaffoldDraftId && entry.threadId === threadId,
+            );
       if (cancelled) return;
       if (pending.length === 0) {
-        pendingTurnDrainKeyRef.current = null;
+        if (scaffoldPendingTurnMode === "drain") pendingTurnDrainKeyRef.current = null;
         return;
       }
 
@@ -2840,31 +2853,36 @@ function ChatViewContent(props: ChatViewProps) {
         pendingTurnServerThreadRef.current?.messages.map((message) => message.id) ?? [],
       );
       setOptimisticUserMessages((existing) => {
-        const existingIds = new Set(existing.map((message) => message.id));
-        const hydrated = pending.flatMap((entry): ChatMessage[] => {
-          if (serverMessageIds.has(entry.messageId) || existingIds.has(entry.messageId)) return [];
-          return [
-            {
-              id: entry.messageId,
-              role: "user",
-              text: entry.input.message.text,
-              attachments: entry.input.message.attachments.map((attachment) => ({
-                type: attachment.type,
-                id: `${entry.messageId}:${attachment.name}`,
-                name: attachment.name,
-                mimeType: attachment.mimeType,
-                sizeBytes: attachment.sizeBytes,
-                previewUrl: attachment.dataUrl,
-              })),
-              turnId: null,
-              createdAt: entry.createdAt,
-              updatedAt: entry.updatedAt,
-              streaming: false,
-            },
-          ];
+        const hydrated = pending.map(
+          (entry): ChatMessage => ({
+            id: entry.messageId,
+            role: "user",
+            text: entry.input.message.text,
+            attachments: entry.input.message.attachments.map((attachment) => ({
+              type: attachment.type,
+              id: `${entry.messageId}:${attachment.name}`,
+              name: attachment.name,
+              mimeType: attachment.mimeType,
+              sizeBytes: attachment.sizeBytes,
+              previewUrl: attachment.dataUrl,
+            })),
+            turnId: null,
+            createdAt: entry.createdAt,
+            updatedAt: entry.updatedAt,
+            streaming: false,
+          }),
+        );
+        const merged = mergeQueuedScaffoldMessages({
+          existing,
+          hydrated,
+          acknowledgedMessageIds: serverMessageIds,
         });
-        return hydrated.length === 0 ? existing : [...existing, ...hydrated];
+        return merged.length === existing.length &&
+          merged.every((message, index) => message === existing[index])
+          ? existing
+          : merged;
       });
+      if (scaffoldPendingTurnMode !== "drain") return;
       beginLocalDispatch({
         preparingWorktree: pending.some(
           (entry) => entry.input.bootstrap?.prepareWorktree !== undefined,
@@ -2906,11 +2924,11 @@ function ChatViewContent(props: ChatViewProps) {
       cancelled = true;
     };
   }, [
-    activeEnvironmentConnectionPhase,
     beginLocalDispatch,
     environmentId,
     resetLocalDispatch,
-    scaffoldDraftBoundToTarget,
+    scaffoldPendingTurnMode,
+    effectiveScaffoldSession?.draftId,
     setThreadError,
     startThreadTurn,
     threadId,
@@ -4985,7 +5003,7 @@ function ChatViewContent(props: ChatViewProps) {
       isFirstMessage,
       requestedEnvMode: sendEnvMode,
       hasWorktreePath: activeThread.worktreePath !== null,
-      isScaffoldBacked: scaffoldSessionUi !== null || activeScaffoldSession !== null,
+      isScaffoldBacked: effectiveScaffoldSession !== null,
     });
     const baseBranchForWorktree = shouldCreateWorktree ? activeThreadBranch : null;
 
@@ -5222,8 +5240,8 @@ function ChatViewContent(props: ChatViewProps) {
         createdAt: messageCreatedAt,
       };
       const outboxEnvironmentId =
-        scaffoldSessionUi !== null && !scaffoldDraftBoundToTarget
-          ? EnvironmentId.make(`scaffold-pending:${scaffoldSessionUi.draftId}`)
+        effectiveScaffoldSession !== null && !scaffoldDraftBoundToTarget
+          ? EnvironmentId.make(`scaffold-pending:${effectiveScaffoldSession.draftId}`)
           : environmentId;
       try {
         await enqueuePendingTurn(browserPendingTurnOutbox, {
@@ -5231,7 +5249,7 @@ function ChatViewContent(props: ChatViewProps) {
           environmentId: outboxEnvironmentId,
           threadId: threadIdForSend,
           messageId: messageIdForSend,
-          draftId,
+          draftId: effectiveScaffoldSession?.draftId ?? draftId,
           input: turnStartInput,
           createdAt: messageCreatedAt,
         });
@@ -5248,6 +5266,14 @@ function ChatViewContent(props: ChatViewProps) {
       if (pendingTurnPersistenceError === null && messagePersistedToOutbox) {
         if (scaffoldDeliveryDeferred || activeEnvironmentConnectionPhase !== "connected") {
           turnStartSucceeded = true;
+          if (
+            shouldReleaseQueuedScaffoldDispatch({
+              hasScaffoldDraft: effectiveScaffoldSession !== null,
+              deliveryDeferred: scaffoldDeliveryDeferred,
+            })
+          ) {
+            resetLocalDispatch();
+          }
         } else {
           const results = await drainPendingTurnOutbox({
             storage: browserPendingTurnOutbox,
