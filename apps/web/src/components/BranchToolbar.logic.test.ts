@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   dedupeRemoteBranchesWithLocalMatches,
   deriveLocalBranchNameFromRemoteRef,
+  mergeQueuedScaffoldMessages,
   resolveEnvironmentOptionLabel,
   resolveBranchSelectionTarget,
   resolveCurrentWorkspaceLabel,
@@ -16,10 +17,12 @@ import {
   resolvePreviousWorktreeLabel,
   resolvePreviousWorktreeSeed,
   resolveScaffoldDraftTargetPresentation,
+  resolveScaffoldPendingTurnMode,
   shouldBlockComposerForConnection,
   shouldIgnoreSourceEnvironmentForScaffoldDraft,
   shouldIncludeBranchPickerItem,
   shouldRenderBranchToolbar,
+  shouldReleaseQueuedScaffoldDispatch,
   shouldShowComposerContextStrip,
   shouldShowEnvironmentIndicator,
 } from "./BranchToolbar.logic";
@@ -61,6 +64,61 @@ describe("Scaffold draft presentation", () => {
         scaffoldPhase: "creating",
       }),
     ).toBe(true);
+  });
+
+  it("releases the composer after a Scaffold message is durably queued", () => {
+    expect(
+      shouldReleaseQueuedScaffoldDispatch({
+        hasScaffoldDraft: true,
+        deliveryDeferred: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldReleaseQueuedScaffoldDispatch({
+        hasScaffoldDraft: false,
+        deliveryDeferred: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("rehydrates queued prompts in send order without dispatching before target binding", () => {
+    expect(
+      resolveScaffoldPendingTurnMode({
+        hasScaffoldDraft: true,
+        boundToTarget: false,
+        targetConnected: false,
+      }),
+    ).toBe("hydrate");
+
+    const messages = mergeQueuedScaffoldMessages({
+      // The later prompt remained optimistic when the user returned. The first
+      // prompt and a durable copy of the second are rehydrated from the outbox.
+      existing: [{ id: "message-2", createdAt: "2026-07-28T12:00:02.000Z" }],
+      hydrated: [
+        { id: "message-1", createdAt: "2026-07-28T12:00:01.000Z" },
+        { id: "message-2", createdAt: "2026-07-28T12:00:02.000Z" },
+      ],
+      acknowledgedMessageIds: new Set<string>(),
+    });
+
+    expect(messages.map((message) => message.id)).toEqual(["message-1", "message-2"]);
+    expect(
+      resolveScaffoldPendingTurnMode({
+        hasScaffoldDraft: true,
+        boundToTarget: true,
+        targetConnected: true,
+      }),
+    ).toBe("drain");
+  });
+
+  it("does not rehydrate a prompt already acknowledged by the server", () => {
+    expect(
+      mergeQueuedScaffoldMessages({
+        existing: [{ id: "message-1", createdAt: "2026-07-28T12:00:01.000Z" }],
+        hydrated: [{ id: "message-1", createdAt: "2026-07-28T12:00:01.000Z" }],
+        acknowledgedMessageIds: new Set(["message-1"]),
+      }),
+    ).toEqual([]);
   });
 
   it("ignores the source device connection only while an unbound Scaffold draft starts", () => {

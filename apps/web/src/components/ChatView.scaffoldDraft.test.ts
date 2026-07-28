@@ -10,7 +10,14 @@ import {
 describe("Scaffold draft controls", () => {
   it("keeps the composer independent from sandbox startup", () => {
     expect(chatViewSource).toContain("isConnecting={composerIsConnecting}");
+    expect(chatViewSource).toContain("isSendBusy || composerIsConnecting || isRevertingCheckpoint");
     expect(chatViewSource).not.toContain("isConnecting={isConnecting || scaffoldSendPending}");
+  });
+
+  it("releases the send control after the prompt is durably queued for Scaffold", () => {
+    expect(chatViewSource).toMatch(
+      /shouldReleaseQueuedScaffoldDispatch\(\{[\s\S]*?hasScaffoldDraft:[\s\S]*?deliveryDeferred: scaffoldDeliveryDeferred,[\s\S]*?resetLocalDispatch\(\)/,
+    );
   });
 
   it("queues the first prompt without showing the source device reconnect state", () => {
@@ -36,13 +43,24 @@ describe("Scaffold draft controls", () => {
     expect(chatViewSource).toMatch(
       /function isScaffoldDraftBoundToTarget[\s\S]*?routeEnvironmentId === targetEnvironmentId[\s\S]*?threadEnvironmentId === targetEnvironmentId[\s\S]*?projectEnvironmentId === targetEnvironmentId/,
     );
-    expect(chatViewSource).toMatch(
-      /if \(!scaffoldDraftBoundToTarget\)[\s\S]*?pendingTurnDrainKeyRef\.current = null;[\s\S]*?return;/,
-    );
+    expect(chatViewSource).toContain("boundToTarget: scaffoldDraftBoundToTarget");
     expect(chatViewSource).toContain("!scaffoldDraftBoundToTarget ||");
     expect(chatViewSource).toMatch(
-      /scaffoldSessionUi !== null && !scaffoldDraftBoundToTarget[\s\S]*?scaffold-pending:/,
+      /effectiveScaffoldSession !== null && !scaffoldDraftBoundToTarget[\s\S]*?scaffold-pending:/,
     );
+  });
+
+  it("rehydrates a draft-scoped queue before binding and gates all dispatch behind drain mode", () => {
+    expect(chatViewSource).toContain(
+      "const effectiveScaffoldSession = scaffoldSessionUi ?? activeScaffoldSession",
+    );
+    expect(chatViewSource).toMatch(
+      /hasScaffoldDraft: effectiveScaffoldSession !== null[\s\S]*?scaffoldPendingTurnMode === "drain"[\s\S]*?listPendingTurnsForThread[\s\S]*?: \(await browserPendingTurnOutbox\.list\(\)\)\.filter\([\s\S]*?entry\.draftId === scaffoldDraftId/,
+    );
+    expect(chatViewSource).toMatch(
+      /mergeQueuedScaffoldMessages\(\{[\s\S]*?acknowledgedMessageIds: serverMessageIds[\s\S]*?if \(scaffoldPendingTurnMode !== "drain"\) return;[\s\S]*?drainPendingTurnOutbox/,
+    );
+    expect(chatViewSource).toContain("draftId: effectiveScaffoldSession?.draftId ?? draftId");
   });
 
   it("never prepares a local worktree for a Scaffold-backed first turn", () => {
