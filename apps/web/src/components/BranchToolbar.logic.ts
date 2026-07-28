@@ -1,4 +1,4 @@
-import type { EnvironmentId, VcsRef, ProjectId } from "@t3tools/contracts";
+import type { EnvironmentId, ProjectId, ScaffoldDeployment, VcsRef } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { toSortableTimestamp } from "../lib/threadSort";
 export {
@@ -56,6 +56,95 @@ export function shouldShowEnvironmentIndicator(input: {
 
 export function resolveEnvModeLabel(mode: EnvMode): string {
   return mode === "worktree" ? "New worktree" : "Current checkout";
+}
+
+export type ScaffoldDraftPhase = "creating" | "ready" | "resuming" | "paused" | "failed";
+
+export function resolveScaffoldDraftTargetPresentation(input: {
+  deployment: ScaffoldDeployment;
+  phase: ScaffoldDraftPhase;
+  replacementRequired?: boolean;
+}): { targetLabel: string; statusLabel: string; actionLabel: string | null } {
+  if (input.replacementRequired) {
+    return {
+      targetLabel: "Scaffold",
+      statusLabel: "Target not recorded",
+      actionLabel: "New session",
+    };
+  }
+  const targetLabel = input.deployment === "staging" ? "Scaffold staging" : "Scaffold production";
+  const statusLabel =
+    input.phase === "creating"
+      ? "Starting"
+      : input.phase === "resuming"
+        ? "Resuming"
+        : input.phase === "paused"
+          ? "Paused"
+          : input.phase === "failed"
+            ? "Failed"
+            : "Ready";
+  return {
+    targetLabel,
+    statusLabel,
+    actionLabel: input.phase === "failed" ? "Retry" : null,
+  };
+}
+
+export function shouldShowComposerContextStrip(input: {
+  isGitRepo: boolean;
+  hasActiveProject: boolean;
+  hasScaffoldDraft: boolean;
+}): boolean {
+  return input.hasScaffoldDraft || (input.isGitRepo && input.hasActiveProject);
+}
+
+export function shouldRenderBranchToolbar(input: {
+  hasActiveThread: boolean;
+  hasActiveProject: boolean;
+  hasScaffoldDraftTarget: boolean;
+}): boolean {
+  return input.hasActiveThread && (input.hasActiveProject || input.hasScaffoldDraftTarget);
+}
+
+export function shouldBlockComposerForConnection(input: {
+  transportConnecting: boolean;
+  scaffoldPhase: ScaffoldDraftPhase | null;
+}): boolean {
+  if (input.transportConnecting) return true;
+
+  // Scaffold lifecycle work is durable in the browser outbox. It must not
+  // prevent the first prompt from being queued while the sandbox starts.
+  switch (input.scaffoldPhase) {
+    case "creating":
+    case "ready":
+    case "resuming":
+    case "paused":
+    case "failed":
+    case null:
+      return false;
+  }
+}
+
+export function shouldPrepareWorktreeForFirstMessage(input: {
+  isFirstMessage: boolean;
+  requestedEnvMode: EnvMode;
+  hasWorktreePath: boolean;
+  isScaffoldBacked: boolean;
+}): boolean {
+  return (
+    input.isFirstMessage &&
+    input.requestedEnvMode === "worktree" &&
+    !input.hasWorktreePath &&
+    !input.isScaffoldBacked
+  );
+}
+
+export function shouldIgnoreSourceEnvironmentForScaffoldDraft(input: {
+  scaffoldEnvironmentId: EnvironmentId | null | undefined;
+  scaffoldPhase: ScaffoldDraftPhase | null;
+}): boolean {
+  if (input.scaffoldEnvironmentId !== null) return false;
+  return input.scaffoldPhase === "creating" || input.scaffoldPhase === "resuming";
 }
 
 export function resolveCurrentWorkspaceLabel(activeWorktreePath: string | null): string {

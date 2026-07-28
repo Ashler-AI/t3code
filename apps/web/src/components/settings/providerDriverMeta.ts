@@ -45,13 +45,13 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
   },
   {
     value: ProviderDriverKind.make("codex"),
-    label: "Codex",
+    label: "Codex CLI",
     icon: OpenAI,
     settingsSchema: CodexSettings,
   },
   {
     value: ProviderDriverKind.make("claudeAgent"),
-    label: "Claude",
+    label: "Claude Code",
     icon: ClaudeAI,
     settingsSchema: ClaudeSettings,
   },

@@ -41,7 +41,13 @@ describe("ScaffoldControlPlaneClient", () => {
       },
     });
     await expect(
-      client.createSession({ sessionId: "ses_1", operationId: "op_1", sourceRef: "main" }),
+      client.createSession({
+        sessionId: "ses_1",
+        operationId: "op_1",
+        sourceRef: "main",
+        modelRouteId: "scaffold-openai/gpt-5.6-sol",
+        agentEffort: "high",
+      }),
     ).resolves.toMatchObject({ sessionId: "ses_1" });
     expect(request?.url).toBe("https://scaffold-staging.example.com/api/sessions");
     expect(new Headers(request?.init?.headers).get("authorization")).toBe("Bearer server-only");
@@ -50,35 +56,98 @@ describe("ScaffoldControlPlaneClient", () => {
       id: "ses_1",
       runtimeProfile: "agent_t3_omp",
       sourceRef: "main",
+      modelRouteId: "scaffold-openai/gpt-5.6-sol",
+      agentEffort: "high",
     });
     expect(JSON.stringify(body)).not.toContain("server-only");
   });
 
-  it("uses the OAuth agent collection and accepts a server-minted sandbox id", async () => {
-    let requestUrl: string | undefined;
+  it("uses the exact OAuth agent create contract and accepts a server-minted sandbox id", async () => {
+    let request: { readonly url: string; readonly init?: RequestInit } | undefined;
     const client = makeScaffoldControlPlaneClient({
       target: {
         ...target,
         authMode: "oauth",
         collectionPath: "/api/code-sandboxes/agent-sessions",
       },
-      fetch: async (input) => {
-        requestUrl = String(input);
+      fetch: async (input, init) => {
+        request = { url: String(input), ...(init ? { init } : {}) };
         return json({ sandbox: { id: "ses_server_minted", status: "starting" } }, 202);
       },
     });
-    await expect(client.createSession({ operationId: "op_1" })).resolves.toMatchObject({
-      sessionId: "ses_server_minted",
-    });
-    expect(requestUrl).toBe(
+    await expect(
+      client.createSession({
+        sessionId: "ses_client_proposed",
+        operationId: "op_1",
+        sourceRef: "main",
+        snapshotId: "snapshot_1",
+        name: "OAuth T3 session",
+        modelRouteId: "scaffold-openai/gpt-5.6-sol",
+        agentEffort: "high",
+      }),
+    ).resolves.toMatchObject({ sessionId: "ses_server_minted" });
+    expect(request?.url).toBe(
       "https://scaffold-staging.example.com/api/code-sandboxes/agent-sessions",
     );
+    expect(JSON.parse(String(request?.init?.body))).toEqual({
+      harness: "t3_omp",
+      name: "OAuth T3 session",
+      modelRouteId: "scaffold-openai/gpt-5.6-sol",
+      agentEffort: "high",
+    });
+    expect(String(request?.init?.body)).not.toContain("ses_client_proposed");
+    expect(String(request?.init?.body)).not.toContain("runtimeProfile");
+    expect(String(request?.init?.body)).not.toContain("origin");
+    expect(String(request?.init?.body)).not.toContain("sourceRef");
+    expect(String(request?.init?.body)).not.toContain("snapshotId");
+  });
+
+  it("replays an ambiguous OAuth create with the same idempotency key", async () => {
+    const requests: RequestInit[] = [];
+    const client = makeScaffoldControlPlaneClient({
+      target: {
+        ...target,
+        authMode: "oauth",
+        collectionPath: "/api/code-sandboxes/agent-sessions",
+      },
+      fetch: async (_input, init) => {
+        requests.push(init ?? {});
+        if (requests.length === 1) throw new TypeError("response lost");
+        return json({ sandbox: { id: "ses_server_minted", status: "starting" } }, 202);
+      },
+    });
+
+    await expect(
+      client.createSession({ operationId: "op_stable", name: "OAuth T3 session" }),
+    ).resolves.toMatchObject({ sessionId: "ses_server_minted" });
+    expect(requests).toHaveLength(2);
+    expect(new Headers(requests[0]?.headers).get("idempotency-key")).toBe("op_stable");
+    expect(new Headers(requests[1]?.headers).get("idempotency-key")).toBe("op_stable");
+    expect(requests[1]?.body).toBe(requests[0]?.body);
+  });
+
+  it("aborts a hung lifecycle request at the configured deadline", async () => {
+    const client = makeScaffoldControlPlaneClient({
+      target,
+      timeoutMs: 5,
+      fetch: async (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
+            once: true,
+          });
+        }),
+    });
+
+    await expect(client.getSession("ses_hung")).rejects.toMatchObject({
+      reason: "network",
+      code: "scaffold_network_error",
+    });
   });
 
   it("validates a future one-time bootstrap without reflecting it in errors", async () => {
     const environmentId = EnvironmentId.make("env_scaffold_1");
     const valid = {
-      id: "ses_1",
+      id: "pairing-t3-transport",
       environmentId,
       lifecycleEpoch: 2,
       transport: {
@@ -97,6 +166,7 @@ describe("ScaffoldControlPlaneClient", () => {
     await expect(
       client.issueT3Transport({ environmentId, sessionId: "ses_1", lifecycleEpoch: 2 }),
     ).resolves.toMatchObject({
+      pairingId: "pairing-t3-transport",
       bootstrapCredential: "one-time-secret",
       attachCredential: "attach-secret",
     });
@@ -120,14 +190,15 @@ describe("ScaffoldControlPlaneClient", () => {
       ).rejects.toMatchObject({ code: "scaffold_invalid_transport" });
     }
 
-    const invalid = makeScaffoldControlPlaneClient({
+    const missingPairing = makeScaffoldControlPlaneClient({
       target,
       now: () => Date.parse("2026-07-24T20:00:00.000Z"),
-      fetch: async () => json({ ...valid, id: "ses_other" }),
+      fetch: async () => json({ ...valid, id: undefined }),
     });
-    const error = await invalid
+    const error = await missingPairing
       .issueT3Transport({ environmentId, sessionId: "ses_1", lifecycleEpoch: 2 })
       .catch((cause: unknown) => cause);
+    expect(error).toMatchObject({ code: "scaffold_invalid_transport" });
     expect(String(error)).not.toContain("one-time-secret");
 
     const missingEnvironment = makeScaffoldControlPlaneClient({

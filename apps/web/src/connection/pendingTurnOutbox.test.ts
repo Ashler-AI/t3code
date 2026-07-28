@@ -1,8 +1,19 @@
-import { CommandId, EnvironmentId, MessageId, ProjectId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  MessageId,
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ThreadId,
+  type ServerProvider,
+} from "@t3tools/contracts";
+import type { EnvironmentShellStatus } from "@t3tools/client-runtime/state/shell";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   createMemoryPendingTurnOutboxStorage,
+  createPendingTurnCoordinatorAdapter,
   discardPendingTurn,
   drainPendingTurnOutbox,
   enqueuePendingTurn,
@@ -19,6 +30,29 @@ const environmentId = EnvironmentId.make("local");
 const threadId = ThreadId.make("thread-1");
 const messageId = MessageId.make("message-1");
 const commandId = CommandId.make("command-1");
+const targetProviders: ReadonlyArray<ServerProvider> = [
+  {
+    instanceId: ProviderInstanceId.make("omp"),
+    driver: ProviderDriverKind.make("omp"),
+    enabled: true,
+    installed: true,
+    version: null,
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: "2026-07-27T00:00:00.000Z",
+    models: [
+      {
+        slug: "openai/gpt-5.6-sol",
+        name: "GPT-5.6-Sol",
+        isCustom: false,
+        isDefault: true,
+        capabilities: {},
+      },
+    ],
+    slashCommands: [],
+    skills: [],
+  },
+];
 
 function pendingInput(): Parameters<typeof enqueuePendingTurn>[1] {
   return {
@@ -127,7 +161,7 @@ describe("pending turn outbox", () => {
         ...pending.input,
         modelSelection: {
           instanceId: "omp" as never,
-          model: "openai/gpt-5.6-sol",
+          model: "openai-codex/gpt-5.6-sol",
           options: [{ id: "reasoning_effort", value: "high" }],
         },
         bootstrap: {
@@ -136,7 +170,7 @@ describe("pending turn outbox", () => {
             title: "Build the feature",
             modelSelection: {
               instanceId: "omp" as never,
-              model: "openai/gpt-5.6-sol",
+              model: "openai-codex/gpt-5.6-sol",
               options: [{ id: "reasoning_effort", value: "high" }],
             },
             runtimeMode: "full-access",
@@ -156,7 +190,13 @@ describe("pending turn outbox", () => {
     });
     const targetEnvironmentId = EnvironmentId.make("scaffold-session");
 
-    await retargetPendingTurnsForDraft(storage, "draft-1", targetEnvironmentId, targetProjectId);
+    await retargetPendingTurnsForDraft(
+      storage,
+      "draft-1",
+      targetEnvironmentId,
+      targetProjectId,
+      targetProviders,
+    );
 
     const [retargeted] = await storage.list();
     expect(retargeted?.environmentId).toBe(targetEnvironmentId);
@@ -166,16 +206,71 @@ describe("pending turn outbox", () => {
       commandId,
       threadId,
       message: accepted.input.message,
-      modelSelection: accepted.input.modelSelection,
+      modelSelection: {
+        instanceId: "omp",
+        model: "openai/gpt-5.6-sol",
+        options: [{ id: "reasoning_effort", value: "high" }],
+      },
       bootstrap: {
         createThread: {
           ...accepted.input.bootstrap?.createThread,
           projectId: targetProjectId,
+          modelSelection: {
+            instanceId: "omp",
+            model: "openai/gpt-5.6-sol",
+            options: [{ id: "reasoning_effort", value: "high" }],
+          },
         },
       },
     });
     expect(retargeted?.input.bootstrap).not.toHaveProperty("prepareWorktree");
     expect(retargeted?.input.bootstrap).not.toHaveProperty("runSetupScript");
+  });
+
+  it("does not dispatch a ready Scaffold draft locally before retargeting, then sends once remotely", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    const sourceEnvironmentId = EnvironmentId.make("environment-source");
+    const provisionalEnvironmentId = EnvironmentId.make("scaffold-pending:draft-1");
+    const targetEnvironmentId = EnvironmentId.make("environment-scaffold");
+    const targetProjectId = ProjectId.make("project-scaffold");
+    const pending = pendingInput();
+    await enqueuePendingTurn(storage, {
+      ...pending,
+      environmentId: provisionalEnvironmentId,
+    });
+
+    const localDispatch = vi.fn(async () => undefined);
+    await drainPendingTurnOutbox({
+      storage,
+      environmentId: sourceEnvironmentId,
+      threadId,
+      dispatch: localDispatch,
+    });
+    expect(localDispatch).not.toHaveBeenCalled();
+
+    await retargetPendingTurnsForDraft(
+      storage,
+      "draft-1",
+      targetEnvironmentId,
+      targetProjectId,
+      targetProviders,
+    );
+    const remoteDispatch = vi.fn(async () => undefined);
+    await drainPendingTurnOutbox({
+      storage,
+      environmentId: targetEnvironmentId,
+      threadId,
+      dispatch: remoteDispatch,
+    });
+
+    expect(remoteDispatch).toHaveBeenCalledTimes(1);
+    expect(remoteDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        environmentId: targetEnvironmentId,
+        idempotencyKey: commandId,
+      }),
+    );
+    expect(await storage.list()).toEqual([]);
   });
 
   it("atomically retargets every draft turn before one drain announcement", async () => {
@@ -237,6 +332,7 @@ describe("pending turn outbox", () => {
       "draft-1",
       EnvironmentId.make("scaffold-session"),
       ProjectId.make("target-project"),
+      targetProviders,
     );
 
     expect(writeCompletionOrder).toEqual([laterCommandId, commandId]);
@@ -497,7 +593,7 @@ describe("pending turn outbox", () => {
     expect(await storage.list()).toEqual([]);
   });
 
-  it("replays a committed draft create exactly once without changing first-turn identities", async () => {
+  it("replays the byte-equivalent bootstrap after the live shell hydrates the existing thread", async () => {
     const base = pendingInput();
     const input = {
       ...base.input,
@@ -530,38 +626,91 @@ describe("pending turn outbox", () => {
       commandId,
       threadId,
       message: { messageId },
-      bootstrap: {
-        prepareWorktree: input.bootstrap.prepareWorktree,
-        runSetupScript: true,
-      },
     });
-    expect(reconciled.bootstrap).not.toHaveProperty("createThread");
+    expect(reconciled).toBe(input);
 
     const storage = createMemoryPendingTurnOutboxStorage();
     await enqueuePendingTurn(storage, { ...base, input });
-    const dispatched: PendingTurnOutboxEntry[] = [];
-    await drainPendingTurnOutbox({
+    const threadCreatedEvents: string[] = [];
+    const firstAttempt = await drainPendingTurnOutbox({
       storage,
       dispatch: async (entry) => {
-        dispatched.push(entry);
+        threadCreatedEvents.push(entry.threadId);
         throw new Error("connection lost after thread.create committed");
       },
     });
-    await drainPendingTurnOutbox({
+    expect(firstAttempt).toMatchObject([{ outcome: "failed" }]);
+
+    let shellStatus: EnvironmentShellStatus = "cached";
+    const coordinatorDispatches: Array<{
+      readonly environmentId: EnvironmentId;
+      readonly turn: PendingTurnOutboxEntry["input"];
+    }> = [];
+    const coordinator = createPendingTurnCoordinatorAdapter({
+      readEnvironmentShellStatus: () => shellStatus,
+      dispatch: async (dispatchInput) => {
+        coordinatorDispatches.push(dispatchInput);
+      },
+    });
+    const [waitingEntry] = await storage.list();
+    expect(waitingEntry).toBeDefined();
+    expect(await coordinator.dispatch(waitingEntry!)).toBe(false);
+    expect(coordinatorDispatches).toEqual([]);
+
+    shellStatus = "live";
+    const retry = await drainPendingTurnOutbox({
       storage,
       dispatch: async (entry) => {
-        dispatched.push({
-          ...entry,
-          input: reconcilePendingTurnForExistingThread(entry.input),
-        });
+        expect(await coordinator.dispatch(entry)).toBe(true);
       },
     });
 
-    expect(dispatched).toHaveLength(2);
-    expect(dispatched[0]?.input.bootstrap).toHaveProperty("createThread");
-    expect(dispatched[1]?.input.bootstrap).not.toHaveProperty("createThread");
-    expect(dispatched.map((entry) => entry.input.commandId)).toEqual([commandId, commandId]);
-    expect(dispatched.map((entry) => entry.messageId)).toEqual([messageId, messageId]);
+    expect(retry).toMatchObject([{ outcome: "sent" }]);
+    expect(coordinatorDispatches).toHaveLength(1);
+    expect(coordinatorDispatches[0]).toMatchObject({
+      environmentId,
+      turn: {
+        commandId,
+        message: { messageId },
+      },
+    });
+    expect(coordinatorDispatches[0]?.turn).toBe(input);
+    expect(coordinatorDispatches[0]?.turn.bootstrap).toEqual(input.bootstrap);
+    expect(threadCreatedEvents).toEqual([threadId]);
     expect(await storage.list()).toEqual([]);
+  });
+
+  it("keeps a first-turn bootstrap unchanged when the live shell has no thread", async () => {
+    const pending = pendingInput();
+    const input = {
+      ...pending.input,
+      bootstrap: {
+        createThread: {
+          projectId: "project-1" as never,
+          title: "Build the feature",
+          modelSelection: {
+            instanceId: "codex" as never,
+            model: "gpt-5.4",
+          },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          branch: "main",
+          worktreePath: null,
+          createdAt: pending.createdAt,
+        },
+      },
+    };
+    const entry = await enqueuePendingTurn(createMemoryPendingTurnOutboxStorage(), {
+      ...pending,
+      input,
+    });
+    const dispatch = vi.fn(async () => undefined);
+    const coordinator = createPendingTurnCoordinatorAdapter({
+      readEnvironmentShellStatus: () => "live",
+      dispatch,
+    });
+
+    expect(await coordinator.dispatch(entry)).toBe(true);
+    expect(dispatch).toHaveBeenCalledWith({ environmentId, turn: input });
   });
 });

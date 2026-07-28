@@ -56,9 +56,23 @@ export function normalizeRuntimeBasePath(value: string | undefined): string {
 }
 
 export function readRuntimeBasePath(): string {
-  return normalizeRuntimeBasePath(
-    typeof window === "undefined" ? undefined : window.__T3CODE_BASE_PATH__,
-  );
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  if (window.__T3CODE_BASE_PATH__ !== undefined) {
+    return normalizeRuntimeBasePath(window.__T3CODE_BASE_PATH__);
+  }
+
+  if (typeof document === "undefined" || !document.baseURI) {
+    return "";
+  }
+
+  const documentBase = new URL(document.baseURI);
+  if (documentBase.origin !== window.location.origin) {
+    throw new Error("The document base URL must use the current window origin.");
+  }
+  return normalizeRuntimeBasePath(documentBase.pathname);
 }
 
 export function resolveRuntimePathname(pathname: string): string {

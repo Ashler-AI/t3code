@@ -12,6 +12,7 @@ function provider(input: {
   provider?: ProviderDriverKind;
   instanceId: string;
   models?: ReadonlyArray<string>;
+  modelCatalogAuthoritative?: boolean;
 }): ServerProvider {
   const driver =
     input.provider ??
@@ -27,6 +28,7 @@ function provider(input: {
     status: "ready",
     auth: { status: "authenticated" },
     checkedAt: "2026-01-01T00:00:00.000Z",
+    ...(input.modelCatalogAuthoritative ? { modelCatalogAuthoritative: true } : {}),
     models: (input.models ?? []).map((slug) => ({
       slug,
       name: slug,
@@ -55,6 +57,32 @@ function settingsWithProviderInstances(): UnifiedSettings {
 }
 
 describe("instance-scoped model selection", () => {
+  it("does not append configured models to an authoritative Scaffold catalog", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("omp"),
+        instanceId: "omp",
+        models: ["openai/gpt-5.6-sol"],
+        modelCatalogAuthoritative: true,
+      }),
+    ];
+    const settings: UnifiedSettings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerInstances: {
+        [ProviderInstanceId.make("omp")]: {
+          driver: ProviderDriverKind.make("omp"),
+          config: { customModels: ["anthropic/claude-sonnet-5"] },
+        },
+      },
+    };
+
+    expect(
+      getAppModelOptionsForInstance(settings, deriveProviderInstanceEntries(providers)[0]!).map(
+        (option) => option.slug,
+      ),
+    ).toEqual(["openai/gpt-5.6-sol"]);
+  });
+
   it("keeps custom models on the provider instance that declared them", () => {
     const providers = [
       provider({

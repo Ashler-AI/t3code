@@ -5,6 +5,7 @@ import { EnvironmentId, ThreadId } from "./baseSchemas.ts";
 import {
   SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1,
   SCAFFOLD_WORKSPACE_MIGRATION_UNSUPPORTED_FILESYSTEM_CASES_V1,
+  ScaffoldCreateParameters,
   ScaffoldSessionTransferDescriptor,
   ScaffoldRetentionCloneImportInput,
   ScaffoldWorkspaceMigrationImportInput,
@@ -17,6 +18,21 @@ const decodeWorkspaceMigrationImport = Schema.decodeUnknownSync(
 );
 const decodeSessionTransferDescriptor = Schema.decodeUnknownSync(ScaffoldSessionTransferDescriptor);
 const decodeRetentionCloneImport = Schema.decodeUnknownSync(ScaffoldRetentionCloneImportInput);
+const decodeCreateParameters = Schema.decodeUnknownSync(ScaffoldCreateParameters);
+
+describe("Scaffold create parameters", () => {
+  it("accepts a credential-free model route and bounded agent effort", () => {
+    expect(
+      decodeCreateParameters({
+        modelRouteId: "scaffold-openai/gpt-5.6-sol",
+        agentEffort: "high",
+      }),
+    ).toEqual({ modelRouteId: "scaffold-openai/gpt-5.6-sol", agentEffort: "high" });
+    expect(() =>
+      decodeCreateParameters({ modelRouteId: "scaffold-openai/gpt-5.6-sol", agentEffort: "ultra" }),
+    ).toThrow();
+  });
+});
 
 function workspaceMigrationImport(baseSha: string) {
   const digest = "a".repeat(64);
@@ -180,12 +196,38 @@ describe("Scaffold retention clone contract", () => {
 });
 
 describe("Scaffold workspace migration credential exclusions", () => {
+  it("accepts the canonical Ashler T3 metadata credential exclusions", () => {
+    const t3MetadataCredentialExclusions = [
+      "v1:t3-metadata:auth",
+      "v1:t3-metadata:browser-session",
+      "v1:t3-metadata:capability",
+      "v1:t3-metadata:cookies",
+      "v1:t3-metadata:pairing",
+    ];
+
+    expect(
+      SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1.filter((entry) =>
+        entry.startsWith("v1:t3-metadata:"),
+      ),
+    ).toEqual(t3MetadataCredentialExclusions);
+    expect(
+      decodeWorkspaceMigrationImport(workspaceMigrationImport("b".repeat(40))).payload
+        .credentialExclusions,
+    ).toEqual(SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1);
+  });
+
   it("declares complete portable roots and common machine credential paths", () => {
     expect(SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1).toContain(
       "v1:portable-root:auth",
     );
     expect(SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1).toContain(
       "v1:path-basename:.npmrc",
+    );
+    expect(SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1).toContain(
+      "v1:path-basename:.dev.vars",
+    );
+    expect(SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1).toContain(
+      "v1:path-basename:.envrc",
     );
     expect(SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1).toContain(
       "v1:workspace-tree:.ssh",

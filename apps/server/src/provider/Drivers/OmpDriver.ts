@@ -28,6 +28,7 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import { isManagedScaffoldOmpEnvironment } from "../acp/OmpAcpSupport.ts";
 import {
   makeManualOnlyProviderMaintenanceCapabilities,
   makeStaticProviderMaintenanceResolver,
@@ -103,6 +104,10 @@ export const OmpDriver: ProviderDriver<OmpSettings, OmpDriverEnv> = {
         accentColor,
         continuationGroupKey: continuationIdentity.continuationKey,
       });
+      const stampModelCatalogPolicy = (snapshot: ServerProvider): ServerProvider =>
+        isManagedScaffoldOmpEnvironment(processEnv)
+          ? { ...snapshot, modelCatalogAuthoritative: true }
+          : snapshot;
       const effectiveConfig = { ...config, enabled } satisfies OmpSettings;
       const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
         binaryPath: effectiveConfig.binaryPath,
@@ -118,6 +123,7 @@ export const OmpDriver: ProviderDriver<OmpSettings, OmpDriverEnv> = {
 
       const checkProvider = checkOmpProviderStatus(effectiveConfig, processEnv).pipe(
         Effect.map(stampIdentity),
+        Effect.map(stampModelCatalogPolicy),
         Effect.provideService(Crypto.Crypto, crypto),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );
@@ -129,7 +135,10 @@ export const OmpDriver: ProviderDriver<OmpSettings, OmpDriverEnv> = {
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
-          buildInitialOmpProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
+          buildInitialOmpProviderSnapshot(settings.provider).pipe(
+            Effect.map(stampIdentity),
+            Effect.map(stampModelCatalogPolicy),
+          ),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
           enrichOmpSnapshot({

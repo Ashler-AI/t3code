@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ScaffoldLifecycleAction } from "./model.ts";
@@ -9,15 +9,24 @@ import {
 } from "./outbox.ts";
 
 function action(actionId: string, kind: "create" | "resume" | "pause" = "resume") {
-  return makeScaffoldLifecycleAction({
+  const base = {
     actionId,
-    kind,
     environmentId: EnvironmentId.make("env-1"),
     connectionId: "connection-1",
     sessionId: `session-${actionId}`,
     expectedLifecycleEpoch: 1,
     createdAt: `2026-07-24T19:00:0${actionId.at(-1) ?? "0"}.000Z`,
-  });
+  } as const;
+  return kind === "create"
+    ? makeScaffoldLifecycleAction({
+        ...base,
+        kind,
+        deployment: "staging",
+        draftId: `draft-${actionId}`,
+        sourceEnvironmentId: EnvironmentId.make("source-environment-1"),
+        sourceProjectId: ProjectId.make("source-project-1"),
+      })
+    : makeScaffoldLifecycleAction({ ...base, kind });
 }
 
 function memoryStore(initial: ReadonlyArray<ScaffoldLifecycleAction> = []) {
@@ -77,16 +86,19 @@ describe("Scaffold lifecycle outbox", () => {
     const terminal = { ...blocked, blocked: true } as ScaffoldLifecycleAction;
     const { store } = memoryStore([terminal]);
     let executions = 0;
+    const reflected: string[] = [];
     const outbox = makeScaffoldLifecycleOutbox({
       store,
       execute: async () => {
         executions += 1;
         return { _tag: "acknowledged" };
       },
+      onBlocked: (item) => reflected.push(item.actionId),
     });
 
     await outbox.drain();
     expect(executions).toBe(0);
+    expect(reflected).toEqual(["blocked"]);
   });
 
   it("serializes enqueue and drain store mutations", async () => {

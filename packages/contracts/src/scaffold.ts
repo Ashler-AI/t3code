@@ -16,6 +16,8 @@ export const SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1 = [
   "v1:omp-export:auth",
   "v1:omp-export:settings",
   "v1:path-basename:.claude.json",
+  "v1:path-basename:.dev.vars",
+  "v1:path-basename:.envrc",
   "v1:path-basename:.git-credentials",
   "v1:path-basename:.netrc",
   "v1:path-basename:.npmrc",
@@ -33,6 +35,11 @@ export const SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1 = [
   "v1:portable-root:credentials",
   "v1:portable-root:oauth",
   "v1:portable-root:settings",
+  "v1:t3-metadata:auth",
+  "v1:t3-metadata:browser-session",
+  "v1:t3-metadata:capability",
+  "v1:t3-metadata:cookies",
+  "v1:t3-metadata:pairing",
   "v1:workspace-env:.env",
   "v1:workspace-env:.env.*:except=.env.example,.env.sample,.env.template",
   "v1:workspace-tree:.anthropic",
@@ -100,6 +107,18 @@ const ScaffoldWorkspaceMigrationUnsupportedFilesystemCases = Schema.Array(
 
 export const ScaffoldDeployment = Schema.Literals(["staging", "production"]);
 export type ScaffoldDeployment = typeof ScaffoldDeployment.Type;
+
+export const ScaffoldAgentEffort = Schema.Literals([
+  "off",
+  "auto",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+export type ScaffoldAgentEffort = typeof ScaffoldAgentEffort.Type;
 
 /**
  * Stable source-owned idempotency key for copying one local thread into one
@@ -185,6 +204,8 @@ export class ScaffoldCreateParameters extends Schema.Class<ScaffoldCreateParamet
   sourceRef: Schema.optionalKey(TrimmedNonEmptyString),
   snapshotId: Schema.optionalKey(TrimmedNonEmptyString),
   name: Schema.optionalKey(TrimmedNonEmptyString),
+  modelRouteId: Schema.optionalKey(TrimmedNonEmptyString),
+  agentEffort: Schema.optionalKey(ScaffoldAgentEffort),
 }) {}
 
 export class ScaffoldCreateAndPrepareInput extends Schema.TaggedClass<ScaffoldCreateAndPrepareInput>()(

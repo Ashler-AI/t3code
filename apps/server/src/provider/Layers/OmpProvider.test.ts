@@ -6,14 +6,19 @@ import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import { OmpSettings } from "@t3tools/contracts";
 
 import {
   buildInitialOmpProviderSnapshot,
   buildOmpDiscoveredModelsFromConfigOptions,
   checkOmpProviderStatus,
+  OMP_ACP_MODEL_DISCOVERY_TIMEOUT_MS,
 } from "./OmpProvider.ts";
 
 const decodeOmpSettings = Schema.decodeSync(OmpSettings);
@@ -116,6 +121,83 @@ describe("OmpProvider", () => {
     ]);
   });
 
+  it("advertises only active Scaffold launch-time models without fallback", () => {
+    const models = buildOmpDiscoveredModelsFromConfigOptions(
+      [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          type: "select",
+          currentValue: "x-ai/grok-4.5",
+          options: [
+            { value: "x-ai/grok-4.5", name: "Grok 4.5" },
+            { value: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol" },
+          ],
+        },
+      ],
+      {
+        SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+        OMP_AGENT_MODEL: "openai/gpt-5.6-sol",
+        OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol",
+      },
+    );
+
+    expect(models.map((model) => ({ slug: model.slug, isDefault: model.isDefault }))).toEqual([
+      { slug: "openai/gpt-5.6-sol", isDefault: true },
+    ]);
+  });
+
+  it("does not advertise curated but ungranted Scaffold models", () => {
+    const models = buildOmpDiscoveredModelsFromConfigOptions(
+      [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          type: "select",
+          currentValue: "openai/gpt-5.6-sol",
+          options: [
+            { value: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol" },
+            { value: "anthropic/claude-sonnet-5", name: "Sonnet 5" },
+          ],
+        },
+      ],
+      {
+        SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+        OMP_AGENT_MODEL: "openai/gpt-5.6-sol",
+        OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol,anthropic/claude-sonnet-5",
+      },
+    );
+
+    expect(models.map((model) => model.slug)).toEqual(["openai/gpt-5.6-sol"]);
+  });
+
+  it("keeps an exact managed Scaffold grant that is newer than the local model policy", () => {
+    const configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select" as const,
+        currentValue: "openai/gpt-5.7-sol",
+        options: [{ value: "openai/gpt-5.7-sol", name: "GPT-5.7 Sol" }],
+      },
+    ];
+
+    const managedModels = buildOmpDiscoveredModelsFromConfigOptions(configOptions, {
+      SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
+      OMP_AGENT_MODEL: "openai/gpt-5.7-sol",
+      OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.7-sol",
+    });
+    const localModels = buildOmpDiscoveredModelsFromConfigOptions(configOptions);
+
+    expect(
+      managedModels.map((model) => ({ slug: model.slug, isDefault: model.isDefault })),
+    ).toEqual([{ slug: "openai/gpt-5.7-sol", isDefault: true }]);
+    expect(localModels).toEqual([]);
+  });
+
   it.effect("publishes standard ACP commands as pathless OMP skills", () =>
     Effect.gen(function* () {
       const binaryPath = yield* Effect.promise(() => makeMockOmpProviderWrapper());
@@ -155,6 +237,33 @@ describe("OmpProvider", () => {
       expect(snapshot.status).toBe("ready");
       expect(snapshot.version).toBe("17.1.2");
       expect(snapshot.models.length).toBeGreaterThan(0);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("bounds hanging ACP discovery and closes its child scope", () =>
+    Effect.gen(function* () {
+      const binaryPath = yield* Effect.promise(() => makeMockOmpProviderWrapper());
+      const discoveryStarted = yield* Deferred.make<void>();
+      const childCleanupCalls = yield* Ref.make(0);
+      const hangingDiscovery = () =>
+        Effect.acquireRelease(Deferred.succeed(discoveryStarted, undefined), () =>
+          Ref.update(childCleanupCalls, (count) => count + 1),
+        ).pipe(Effect.flatMap(() => Effect.never));
+
+      const probeFiber = yield* checkOmpProviderStatus(
+        decodeOmpSettings({ binaryPath }),
+        process.env,
+        hangingDiscovery,
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(discoveryStarted);
+      yield* TestClock.adjust(`${OMP_ACP_MODEL_DISCOVERY_TIMEOUT_MS + 1} millis`);
+      const snapshot = yield* Fiber.join(probeFiber);
+
+      expect(snapshot.status).toBe("error");
+      expect(snapshot.message).toBe(
+        `OMP CLI is installed but ACP startup timed out after ${OMP_ACP_MODEL_DISCOVERY_TIMEOUT_MS}ms.`,
+      );
+      expect(yield* Ref.get(childCleanupCalls)).toBe(1);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

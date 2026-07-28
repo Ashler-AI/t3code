@@ -114,7 +114,7 @@ import {
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
 import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
-import { isCommandPaletteOpen } from "../commandPaletteBus";
+import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
@@ -235,7 +235,14 @@ import { ChatHeader } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
-import { resolveEffectiveEnvMode, resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
+import {
+  resolveEffectiveEnvMode,
+  resolveLocalCheckoutBranchMismatch,
+  shouldBlockComposerForConnection,
+  shouldIgnoreSourceEnvironmentForScaffoldDraft,
+  shouldPrepareWorktreeForFirstMessage,
+  shouldShowComposerContextStrip,
+} from "./BranchToolbar.logic";
 import {
   getProviderStatusBannerKey,
   ProviderStatusBanner,
@@ -296,6 +303,12 @@ import {
   reconcilePendingTurnForExistingThread,
 } from "../connection/pendingTurnOutbox";
 import {
+  browserScaffoldLifecycleActionStore,
+  requestScaffoldLifecycleDrain,
+  retryScaffoldLifecycleAction,
+} from "../connection/scaffoldLifecycleOutbox";
+import {
+  SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE,
   scaffoldSessionForEnvironment,
   useScaffoldSessionUiStore,
 } from "../scaffoldSessionUiStore";
@@ -1154,6 +1167,23 @@ function chatActionErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "An error occurred.";
 }
 
+function isScaffoldDraftBoundToTarget(input: {
+  readonly scaffoldDraftId: string | null;
+  readonly scaffoldEnvironmentId: EnvironmentId | null;
+  readonly routeEnvironmentId: EnvironmentId;
+  readonly threadEnvironmentId: EnvironmentId | null;
+  readonly projectEnvironmentId: EnvironmentId | null;
+}): boolean {
+  if (input.scaffoldDraftId === null) return true;
+  const targetEnvironmentId = input.scaffoldEnvironmentId;
+  return (
+    targetEnvironmentId !== null &&
+    input.routeEnvironmentId === targetEnvironmentId &&
+    input.threadEnvironmentId === targetEnvironmentId &&
+    input.projectEnvironmentId === targetEnvironmentId
+  );
+}
+
 function ChatViewContent(props: ChatViewProps) {
   const {
     environmentId,
@@ -1299,6 +1329,7 @@ function ChatViewContent(props: ChatViewProps) {
     Record<string, LocalThreadErrorEntry>
   >({});
   const [isConnecting, _setIsConnecting] = useState(false);
+  const [retryingScaffoldActionId, setRetryingScaffoldActionId] = useState<string | null>(null);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
@@ -1636,6 +1667,13 @@ function ChatViewContent(props: ChatViewProps) {
   const handleNewThreadInActiveProject = useCallback(() => {
     startNewThreadForProject(activeProjectRef, handleNewThread);
   }, [activeProjectRef, handleNewThread]);
+  const scaffoldDraftBoundToTarget = isScaffoldDraftBoundToTarget({
+    scaffoldDraftId: scaffoldSessionUi?.draftId ?? null,
+    scaffoldEnvironmentId: scaffoldSessionUi?.environmentId ?? null,
+    routeEnvironmentId: environmentId,
+    threadEnvironmentId: activeThread?.environmentId ?? null,
+    projectEnvironmentId: activeProject?.environmentId ?? null,
+  });
   const activeEnvironmentShell = useEnvironmentQuery(
     activeThread ? environmentShell.stateAtom(activeThread.environmentId) : null,
   );
@@ -1686,12 +1724,18 @@ function ChatViewContent(props: ChatViewProps) {
   const activeScaffoldSession = activeThread
     ? scaffoldSessionForEnvironment(scaffoldSessionsByDraftId, activeThread.environmentId)
     : null;
-  const scaffoldSendPending =
-    (scaffoldSessionUi ?? activeScaffoldSession)?.phase === "creating" ||
-    (scaffoldSessionUi ?? activeScaffoldSession)?.phase === "resuming";
+  const ignoreSourceEnvironmentForScaffoldDraft = shouldIgnoreSourceEnvironmentForScaffoldDraft({
+    scaffoldEnvironmentId: scaffoldSessionUi?.environmentId,
+    scaffoldPhase: scaffoldSessionUi?.phase ?? null,
+  });
+  const composerIsConnecting = shouldBlockComposerForConnection({
+    transportConnecting: isConnecting && !ignoreSourceEnvironmentForScaffoldDraft,
+    scaffoldPhase: (scaffoldSessionUi ?? activeScaffoldSession)?.phase ?? null,
+  });
   const activeEnvironmentConnectionPhase = activeEnvironment?.connection.phase ?? "available";
   const activeEnvironmentUnavailable =
     activeEnvironment !== null &&
+    !ignoreSourceEnvironmentForScaffoldDraft &&
     activeEnvironmentConnectionPhase !== "connected" &&
     activeScaffoldSession?.phase !== "paused";
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
@@ -2599,7 +2643,11 @@ function ChatViewContent(props: ChatViewProps) {
     terminalUiLaunchContext?.threadId === activeThreadId ? terminalUiLaunchContext : null;
   // Default true while loading to avoid toolbar flicker.
   const isGitRepo = gitStatusQuery.data?.isRepo ?? true;
-  const showComposerContextStrip = isGitRepo && activeProject !== null;
+  const showComposerContextStrip = shouldShowComposerContextStrip({
+    isGitRepo,
+    hasActiveProject: activeProject !== null,
+    hasScaffoldDraft: scaffoldSessionUi !== null,
+  });
   const initialDiffPanelGitScope =
     gitStatusQuery.data?.hasWorkingTreeChanges === true ? "unstaged" : "branch";
   const diffPanelGitStatusResolutionKey = gitStatusQuery.data ? "resolved" : "pending";
@@ -2711,11 +2759,62 @@ function ChatViewContent(props: ChatViewProps) {
     [activeServerThread, draftId, routeThreadKey, routeThreadRef],
   );
 
+  const onRetryScaffoldDraft = useCallback(async () => {
+    const entry = scaffoldSessionUi;
+    if (!entry || entry.phase !== "failed" || retryingScaffoldActionId !== null) return;
+
+    setRetryingScaffoldActionId(entry.actionId);
+    let retryPersistenceFailureHandled = false;
+    try {
+      const scaffoldUi = useScaffoldSessionUiStore.getState();
+      const volatileCreateAction = scaffoldUi.volatileCreateActionsByDraftId[entry.draftId];
+      const retried = await retryScaffoldLifecycleAction({
+        store: browserScaffoldLifecycleActionStore,
+        actionId: entry.actionId,
+        expectedDeployment: entry.deployment,
+        expectedDraftId: entry.draftId,
+        expectedSourceEnvironmentId: entry.sourceEnvironmentId,
+        expectedSourceProjectId: entry.sourceProjectId,
+        expectedSessionId: entry.sessionId,
+        ...(volatileCreateAction ? { volatileCreateAction } : {}),
+        onCreating: () => {
+          useScaffoldSessionUiStore.getState().setPhase(entry.draftId, "creating");
+        },
+        onPersistenceFailure: () => {
+          retryPersistenceFailureHandled = true;
+          useScaffoldSessionUiStore
+            .getState()
+            .fail(entry.draftId, "Scaffold retry could not be saved. Try again.");
+        },
+      });
+      if (!retried) {
+        useScaffoldSessionUiStore
+          .getState()
+          .fail(entry.draftId, "This Scaffold session can no longer be retried.");
+        return;
+      }
+      scaffoldUi.forgetVolatileCreateAction(entry.draftId);
+      setThreadError(activeThread?.id ?? null, null);
+      requestScaffoldLifecycleDrain(retried.actionId);
+    } catch (error) {
+      if (!retryPersistenceFailureHandled) {
+        useScaffoldSessionUiStore.getState().fail(entry.draftId, chatActionErrorMessage(error));
+      }
+    } finally {
+      setRetryingScaffoldActionId(null);
+    }
+  }, [activeThread?.id, retryingScaffoldActionId, scaffoldSessionUi, setThreadError]);
+  const onReplaceScaffoldDraft = useCallback(() => openCommandPalette({ open: "new-session" }), []);
+
   // A draft is visible before its worktree exists. Rehydrate its first prompt
   // from the browser outbox and retry it once whenever this environment becomes
   // connected. The persisted command id makes a retry after an ambiguous
   // disconnect safe: the server applies the command at most once.
   useEffect(() => {
+    if (!scaffoldDraftBoundToTarget) {
+      pendingTurnDrainKeyRef.current = null;
+      return;
+    }
     if (activeEnvironmentConnectionPhase !== "connected") {
       pendingTurnDrainKeyRef.current = null;
       return;
@@ -2811,6 +2910,7 @@ function ChatViewContent(props: ChatViewProps) {
     beginLocalDispatch,
     environmentId,
     resetLocalDispatch,
+    scaffoldDraftBoundToTarget,
     setThreadError,
     startThreadTurn,
     threadId,
@@ -4764,7 +4864,7 @@ function ChatViewContent(props: ChatViewProps) {
     if (
       !activeThread ||
       isSendBusy ||
-      isConnecting ||
+      (isConnecting && !ignoreSourceEnvironmentForScaffoldDraft) ||
       threadDetailLoading ||
       activeEnvironmentUnavailable ||
       sendInFlightRef.current
@@ -4859,6 +4959,7 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     const scaffoldDeliveryDeferred =
+      !scaffoldDraftBoundToTarget ||
       scaffoldSessionBusy ||
       activeScaffoldSession?.phase === "paused" ||
       activeScaffoldSession?.phase === "resuming" ||
@@ -4880,15 +4981,16 @@ function ChatViewContent(props: ChatViewProps) {
     }
     const threadIdForSend = activeThread.id;
     const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
-    const baseBranchForWorktree =
-      isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath
-        ? activeThreadBranch
-        : null;
+    const shouldCreateWorktree = shouldPrepareWorktreeForFirstMessage({
+      isFirstMessage,
+      requestedEnvMode: sendEnvMode,
+      hasWorktreePath: activeThread.worktreePath !== null,
+      isScaffoldBacked: scaffoldSessionUi !== null || activeScaffoldSession !== null,
+    });
+    const baseBranchForWorktree = shouldCreateWorktree ? activeThreadBranch : null;
 
     // In worktree mode, require an explicit base branch so we don't silently
     // fall back to local execution when branch selection is missing.
-    const shouldCreateWorktree =
-      isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath;
     if (shouldCreateWorktree && !activeThreadBranch) {
       setThreadError(threadIdForSend, "Select a base branch before sending in New worktree mode.");
       return;
@@ -5120,7 +5222,7 @@ function ChatViewContent(props: ChatViewProps) {
         createdAt: messageCreatedAt,
       };
       const outboxEnvironmentId =
-        scaffoldSessionUi?.environmentId === null
+        scaffoldSessionUi !== null && !scaffoldDraftBoundToTarget
           ? EnvironmentId.make(`scaffold-pending:${scaffoldSessionUi.draftId}`)
           : environmentId;
       try {
@@ -6186,7 +6288,7 @@ function ChatViewContent(props: ChatViewProps) {
                             forceExpandedOnMobile={forceExpandedMobileComposer && isDraftHeroState}
                             projectSelectionRequired={isLocalDraftThread && activeProject === null}
                             phase={phase}
-                            isConnecting={isConnecting || scaffoldSendPending}
+                            isConnecting={composerIsConnecting}
                             isSendBusy={isSendBusy}
                             sendDisabledReason={threadDetailLoading ? "Messages loading" : null}
                             isPreparingWorktree={isPreparingWorktree}
@@ -6282,6 +6384,23 @@ function ChatViewContent(props: ChatViewProps) {
                                   : {})}
                                 {...(hasMultipleEnvironments ? { onEnvironmentChange } : {})}
                                 availableEnvironments={logicalProjectEnvironments}
+                                {...(scaffoldSessionUi
+                                  ? {
+                                      scaffoldDraftTarget: {
+                                        deployment: scaffoldSessionUi.deployment,
+                                        phase: scaffoldSessionUi.phase,
+                                        replacementRequired:
+                                          scaffoldSessionUi.error ===
+                                          SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE,
+                                      },
+                                      scaffoldDraftRetrying:
+                                        retryingScaffoldActionId === scaffoldSessionUi.actionId,
+                                      ...(scaffoldSessionUi.error ===
+                                      SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE
+                                        ? { onReplaceScaffoldDraft }
+                                        : { onRetryScaffoldDraft }),
+                                    }
+                                  : {})}
                               />
                             </div>
                           )}

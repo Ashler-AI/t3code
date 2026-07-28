@@ -340,8 +340,17 @@ describe("AcpSessionRuntime", () => {
       });
       expect(promptResult).toMatchObject({ stopReason: "end_turn" });
 
-      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 8)));
-      expect(notes.map((note) => note._tag)).toEqual([
+      const notes = Array.from(yield* Stream.runCollect(Stream.take(runtime.getEvents(), 9)));
+      const configUpdates = notes.filter((note) => note._tag === "ConfigOptionsUpdated");
+      expect(configUpdates).toHaveLength(1);
+      expect(configUpdates[0]).toMatchObject({
+        configOptions: expect.arrayContaining([
+          expect.objectContaining({ id: "thinking", currentValue: "high" }),
+        ]),
+      });
+
+      const promptNotes = notes.filter((note) => note._tag !== "ConfigOptionsUpdated");
+      expect(promptNotes.map((note) => note._tag)).toEqual([
         "AssistantItemStarted",
         "ContentDelta",
         "AssistantItemCompleted",
@@ -351,13 +360,13 @@ describe("AcpSessionRuntime", () => {
         "SessionInfoUpdated",
         "AssistantItemCompleted",
       ]);
-      expect(notes[0]).toMatchObject({ itemType: "reasoning" });
-      expect(notes[1]).toMatchObject({ streamKind: "reasoning_text" });
-      expect(notes[2]).toMatchObject({ itemType: "reasoning" });
-      expect(notes[3]).toMatchObject({ itemType: "assistant_message" });
-      expect(notes[4]).toMatchObject({ streamKind: "assistant_text" });
-      expect(notes[5]).toMatchObject({ usage: { usedTokens: 1200, maxTokens: 200_000 } });
-      expect(notes[6]).toMatchObject({ title: "OMP workspace check" });
+      expect(promptNotes[0]).toMatchObject({ itemType: "reasoning" });
+      expect(promptNotes[1]).toMatchObject({ streamKind: "reasoning_text" });
+      expect(promptNotes[2]).toMatchObject({ itemType: "reasoning" });
+      expect(promptNotes[3]).toMatchObject({ itemType: "assistant_message" });
+      expect(promptNotes[4]).toMatchObject({ streamKind: "assistant_text" });
+      expect(promptNotes[5]).toMatchObject({ usage: { usedTokens: 1200, maxTokens: 200_000 } });
+      expect(promptNotes[6]).toMatchObject({ title: "OMP workspace check" });
 
       const configOptions = yield* runtime.getConfigOptions;
       expect(configOptions.find((option) => option.id === "thinking")).toMatchObject({
@@ -369,7 +378,11 @@ describe("AcpSessionRuntime", () => {
           spawn: {
             command: mockAgentCommand,
             args: mockAgentArgs,
-            env: { T3_ACP_EMIT_OMP_SESSION_UPDATES: "1" },
+            env: {
+              T3_ACP_EMIT_OMP_SESSION_UPDATES: "1",
+              T3_ACP_OMP_CONFIG_OPTIONS: "1",
+              T3_ACP_OMP_RUNTIME_THINKING: "high",
+            },
           },
           cwd: process.cwd(),
           clientInfo: { name: "t3-test", version: "0.0.0" },
