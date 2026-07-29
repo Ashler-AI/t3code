@@ -18,7 +18,6 @@ const invocation: McpInvocationContext.McpInvocationScope = {
   providerInstanceId: ProviderInstanceId.make("omp-primary"),
   capabilities: new Set(["session_reference_read"]),
   issuedAt: 1,
-  expiresAt: Number.MAX_SAFE_INTEGER,
 };
 const authority = SessionReferenceAuthority.SessionReferenceAuthority.of({
   resolve: (_scope, threadId) =>

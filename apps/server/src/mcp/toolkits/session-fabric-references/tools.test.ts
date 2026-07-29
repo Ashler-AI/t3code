@@ -21,7 +21,6 @@ const invocation: McpInvocationContext.McpInvocationScope = {
   providerInstanceId: ProviderInstanceId.make("omp-primary"),
   capabilities: new Set(["session_fabric_read"]),
   issuedAt: 1,
-  expiresAt: Number.MAX_SAFE_INTEGER,
 };
 const authority = SessionFabricReferenceAuthority.SessionFabricReferenceAuthority.of({
   search: () =>
