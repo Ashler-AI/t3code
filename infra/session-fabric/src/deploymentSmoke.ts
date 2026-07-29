@@ -228,6 +228,10 @@ function matchesDeploymentSmokeSnapshot(
 
 const remainingMs = (deadline: number): number => Math.max(0, deadline - Date.now());
 
+const viewerCapabilityHeaders = (viewerCapability: string): HeadersInit => ({
+  authorization: `Bearer ${viewerCapability}`,
+});
+
 async function fetchBeforeDeadline(
   fetchClient: typeof fetch,
   url: URL,
@@ -342,7 +346,7 @@ export async function waitForDeploymentCoordinatorReadiness(
     let response: Response;
     try {
       response = await fetchBeforeDeadline(input.fetch, snapshotUrl, deadline, timeoutMessage, {
-        headers: { authorization: `Bearer ${input.viewerCapability}` },
+        headers: viewerCapabilityHeaders(input.viewerCapability),
       });
     } catch (error) {
       if (
@@ -389,7 +393,7 @@ async function pollForDeploymentSnapshot(input: {
   readonly runnerState: "online" | "offline";
   readonly timeoutMessage: string;
   readonly requireOpenSocket?: DeploymentSmokeSocket;
-  readonly capability?: string;
+  readonly viewerCapability: string;
 }): Promise<void> {
   while (true) {
     const response = await fetchBeforeDeadline(
@@ -397,9 +401,7 @@ async function pollForDeploymentSnapshot(input: {
       input.snapshotUrl,
       input.deadline,
       input.timeoutMessage,
-      input.capability === undefined
-        ? undefined
-        : { headers: { authorization: `Bearer ${input.capability}` } },
+      { headers: viewerCapabilityHeaders(input.viewerCapability) },
     );
     if (response.status === 200) {
       const snapshot = decodeSnapshot(await response.json());
@@ -500,7 +502,7 @@ export async function runDeploymentSmoke(
     emptySnapshotUrl,
     deadline,
     undefined,
-    { headers: { authorization: `Bearer ${input.viewerCapability}` } },
+    { headers: viewerCapabilityHeaders(input.viewerCapability) },
   );
   if (emptyResponse.status !== 404) {
     throw new Error(
@@ -532,7 +534,7 @@ export async function runDeploymentSmoke(
       requireOpenSocket: socket,
       timeoutMessage:
         "The session fabric deployment smoke timed out waiting for the published online snapshot.",
-      capability: input.viewerCapability,
+      viewerCapability: input.viewerCapability,
     });
 
     socketCloseRequested = true;
@@ -546,7 +548,7 @@ export async function runDeploymentSmoke(
       runnerState: "offline",
       timeoutMessage:
         "The session fabric deployment smoke timed out waiting for the post-disconnect offline snapshot.",
-      capability: input.viewerCapability,
+      viewerCapability: input.viewerCapability,
     });
 
     return {

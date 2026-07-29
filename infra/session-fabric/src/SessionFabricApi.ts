@@ -48,6 +48,22 @@ export const resolveSessionFabricRequestAuthorization = (input: {
   return websocketToken === null ? input.authorization : `Bearer ${websocketToken}`;
 };
 
+export const forwardSessionFabricRequest = (input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly rawRequest: globalThis.Request;
+  readonly resolvedAuthorization: string | undefined;
+}): HttpServerRequest.HttpServerRequest => {
+  if (input.request.headers.upgrade?.toLowerCase() === "websocket") return input.request;
+
+  const headers = new Headers(input.rawRequest.headers);
+  if (input.resolvedAuthorization === undefined) {
+    headers.delete("authorization");
+  } else {
+    headers.set("authorization", input.resolvedAuthorization);
+  }
+  return HttpServerRequest.fromWeb(new Request(input.rawRequest, { headers }));
+};
+
 export const finalizeSessionFabricSessionResponse = <Response>(input: {
   readonly upgrade: string | undefined;
   readonly response: Response;
@@ -122,14 +138,11 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
 
     const authorize = Effect.fn("session_fabric_api.authorize")(function* (
       request: HttpServerRequest.HttpServerRequest,
+      resolvedAuthorization: string | undefined,
     ) {
       return yield* authorizeSessionFabricCapability({
         config: verifierConfig,
-        authorization: resolveSessionFabricRequestAuthorization({
-          authorization: request.headers.authorization,
-          upgrade: request.headers.upgrade,
-          websocketProtocol: request.headers["sec-websocket-protocol"],
-        }),
+        authorization: resolvedAuthorization,
         requestUrl: normalizeSessionFabricAuthorizationRequestUrl(request.url),
         nowEpochSeconds: Math.floor((yield* Clock.currentTimeMillis) / 1_000),
       });
@@ -176,7 +189,14 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
               });
         }
 
-        const capabilityResult = yield* authorize(request).pipe(Effect.result);
+        const resolvedAuthorization = resolveSessionFabricRequestAuthorization({
+          authorization: request.headers.authorization,
+          upgrade: request.headers.upgrade,
+          websocketProtocol: request.headers["sec-websocket-protocol"],
+        });
+        const capabilityResult = yield* authorize(request, resolvedAuthorization).pipe(
+          Effect.result,
+        );
         if (capabilityResult._tag === "Failure") {
           return withCors(
             request,
@@ -266,7 +286,10 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
             );
           }
           case "session": {
-            const response = yield* sessionStreams.getByName(route.sessionId).fetch(request);
+            const rawRequest = yield* Cloudflare.Request;
+            const response = yield* sessionStreams
+              .getByName(route.sessionId)
+              .fetch(forwardSessionFabricRequest({ request, rawRequest, resolvedAuthorization }));
             // A 101 response owns immutable upgrade headers in workerd. WebSocket
             // clients do not use CORS response headers, so forward the upgrade
             // untouched and decorate only ordinary HTTP reads.
