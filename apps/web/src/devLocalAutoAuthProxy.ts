@@ -19,7 +19,7 @@ export interface LocalDevAutoAuthResponse {
 export interface LocalDevAutoAuthConfig {
   readonly backendUrl: URL;
   readonly bootstrapToken: string;
-  readonly sessionCookieName: string;
+  readonly sessionCookieNamePrefix: string;
   readonly webPort: string;
 }
 
@@ -50,7 +50,17 @@ export function resolveLocalDevAutoAuthConfig(
   env: Readonly<Record<string, string | undefined>>,
 ): LocalDevAutoAuthConfig | null {
   const bootstrapToken = env.T3CODE_LOCAL_DEV_BOOTSTRAP_TOKEN?.trim();
-  const backendValue = env.VITE_HTTP_URL?.trim();
+  const backendPortValue = env.T3CODE_PORT?.trim();
+  const backendPort =
+    backendPortValue && /^\d+$/.test(backendPortValue) ? Number(backendPortValue) : 0;
+  const backendHost = env.T3CODE_HOST?.trim() || "127.0.0.1";
+  const backendAuthority = backendHost.includes(":") ? `[${backendHost}]` : backendHost;
+  const backendValue =
+    env.T3CODE_SINGLE_ORIGIN_DEV === "1" && backendPort > 0 && backendPort <= 65_535
+      ? `http://${backendAuthority}:${backendPort}`
+      : env.T3CODE_SINGLE_ORIGIN_DEV === "1"
+        ? undefined
+        : env.VITE_HTTP_URL?.trim();
   const webValue = env.VITE_DEV_SERVER_URL?.trim();
   const webPort = env.PORT?.trim();
   if (
@@ -87,7 +97,7 @@ export function resolveLocalDevAutoAuthConfig(
     return {
       backendUrl,
       bootstrapToken,
-      sessionCookieName: `t3_session_${backendPort}`,
+      sessionCookieNamePrefix: `t3_session_${backendPort}`,
       webPort,
     };
   } catch {
@@ -110,6 +120,13 @@ function setCookieName(cookie: string): string | undefined {
   const separator = pair.indexOf("=");
   if (separator <= 0) return undefined;
   return pair.slice(0, separator).trim();
+}
+
+function isExpectedSessionCookieName(name: string | undefined, prefix: string): boolean {
+  if (name === prefix) return true;
+  return (
+    name?.startsWith(`${prefix}_`) === true && /^[a-f0-9]{12}$/.test(name.slice(prefix.length + 1))
+  );
 }
 
 function cookieRequestHeader(cookie: string): string | undefined {
@@ -173,8 +190,8 @@ export function createLocalDevAutoAuthMiddleware(input: {
       body: JSON.stringify({ credential: input.config.bootstrapToken }),
       redirect: "error",
     });
-    const sessionCookies = readSetCookies(backendResponse.headers).filter(
-      (cookie) => setCookieName(cookie) === input.config.sessionCookieName,
+    const sessionCookies = readSetCookies(backendResponse.headers).filter((cookie) =>
+      isExpectedSessionCookieName(setCookieName(cookie), input.config.sessionCookieNamePrefix),
     );
     if (!backendResponse.ok || sessionCookies.length !== 1) {
       return undefined;
