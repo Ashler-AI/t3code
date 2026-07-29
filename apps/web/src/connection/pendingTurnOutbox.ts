@@ -311,17 +311,23 @@ export async function retargetPendingTurnsForDraft(
   environmentId: EnvironmentId,
   projectId: ProjectId,
   targetProviders: ReadonlyArray<ServerProvider>,
-): Promise<void> {
+): Promise<ModelSelection | null> {
   const entries = (await storage.list()).filter((entry) => entry.draftId === draftId);
-  if (entries.length === 0) return;
-  await storage.putMany(
-    entries.map((entry) => ({
-      ...entry,
-      environmentId,
-      input: retargetTurnInputForScaffold(entry.input, projectId, targetProviders),
-    })),
-  );
+  if (entries.length === 0) return null;
+  const retargetedEntries = entries.map((entry) => ({
+    ...entry,
+    environmentId,
+    input: retargetTurnInputForScaffold(entry.input, projectId, targetProviders),
+  }));
+  await storage.putMany(retargetedEntries);
   announcePendingTurnDrain();
+
+  const latestAcceptedTurn = retargetedEntries.at(-1)?.input;
+  return (
+    latestAcceptedTurn?.modelSelection ??
+    latestAcceptedTurn?.bootstrap?.createThread?.modelSelection ??
+    null
+  );
 }
 
 export function subscribePendingTurnDrain(listener: () => void): () => void {
