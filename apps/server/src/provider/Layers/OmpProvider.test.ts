@@ -121,7 +121,7 @@ describe("OmpProvider", () => {
     ]);
   });
 
-  it("advertises only active Scaffold launch-time models without fallback", () => {
+  it("advertises every allowed Scaffold model with the bootstrap model as default", () => {
     const models = buildOmpDiscoveredModelsFromConfigOptions(
       [
         {
@@ -129,26 +129,45 @@ describe("OmpProvider", () => {
           name: "Model",
           category: "model",
           type: "select",
-          currentValue: "x-ai/grok-4.5",
+          currentValue: "anthropic/claude-fable-5",
           options: [
-            { value: "x-ai/grok-4.5", name: "Grok 4.5" },
+            { value: "anthropic/claude-fable-5", name: "Claude Fable 5" },
             { value: "openai/gpt-5.6-sol", name: "GPT-5.6 Sol" },
+            { value: "openai/gpt-5.6-terra", name: "GPT-5.6 Terra" },
+            { value: "x-ai/grok-4.5", name: "Grok 4.5" },
+          ],
+        },
+        {
+          id: "thinking",
+          name: "Thinking",
+          category: "thought_level",
+          type: "select",
+          currentValue: "high",
+          options: [
+            { value: "off", name: "Off" },
+            { value: "high", name: "High" },
           ],
         },
       ],
       {
         SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
-        OMP_AGENT_MODEL: "openai/gpt-5.6-sol",
-        OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol",
+        OMP_AGENT_MODEL: "anthropic/claude-fable-5",
+        OMP_AGENT_ALLOWED_MODELS:
+          "anthropic/claude-fable-5,openai/gpt-5.6-sol,openai/gpt-5.6-terra",
       },
     );
 
     expect(models.map((model) => ({ slug: model.slug, isDefault: model.isDefault }))).toEqual([
-      { slug: "openai/gpt-5.6-sol", isDefault: true },
+      { slug: "anthropic/claude-fable-5", isDefault: true },
+      { slug: "openai/gpt-5.6-sol", isDefault: undefined },
+      { slug: "openai/gpt-5.6-terra", isDefault: undefined },
     ]);
+    expect(
+      models.every((model) => model.capabilities?.optionDescriptors?.[0]?.currentValue === "high"),
+    ).toBe(true);
   });
 
-  it("does not advertise curated but ungranted Scaffold models", () => {
+  it("does not advertise models outside the managed Scaffold allowlist", () => {
     const models = buildOmpDiscoveredModelsFromConfigOptions(
       [
         {
@@ -166,7 +185,7 @@ describe("OmpProvider", () => {
       {
         SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
         OMP_AGENT_MODEL: "openai/gpt-5.6-sol",
-        OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol,anthropic/claude-sonnet-5",
+        OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6-sol",
       },
     );
 

@@ -183,11 +183,10 @@ export function configuredManagedScaffoldOmpModels(environment: NodeJS.ProcessEn
   if (!allowedModels.includes(model)) {
     throw new Error(`${OMP_AGENT_MODEL_ENV} must be included in ${OMP_AGENT_ALLOWED_MODELS_ENV}.`);
   }
-  // Scaffold currently grants exactly OMP_AGENT_MODEL. The broader
-  // OMP_AGENT_ALLOWED_MODELS value is a curated image catalog, not proof that
-  // this session holds grants for every entry. Keep selection single-model
-  // until a durable grant-generation reconfiguration protocol exists.
-  return { model, allowedModels: [model] };
+  // OMP_AGENT_MODEL selects the bootstrap/default route. The separately
+  // validated allowlist is the complete set of routes granted to this managed
+  // session and must remain selectable after startup.
+  return { model, allowedModels };
 }
 
 export function assertManagedScaffoldOmpModelAllowed(
