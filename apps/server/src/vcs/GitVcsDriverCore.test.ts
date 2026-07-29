@@ -166,17 +166,37 @@ describe("worktree materialization timeout", () => {
     Effect.gen(function* () {
       const killed = yield* Ref.make(false);
       const started = yield* Ref.make(false);
+      const commands = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
       const spawner = ChildProcessSpawner.make((command) =>
         Effect.gen(function* () {
           if (!ChildProcess.isStandardCommand(command)) {
             return assert.fail("expected a standard Git command");
           }
+          yield* Ref.update(commands, (current) => [...current, command.args]);
           if (command.args[0] === "show-ref") {
             const running = yield* Ref.make(false);
             return yield* scopedGitHandle(
               makeGitHandle({
                 exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
                 running,
+              }),
+            );
+          }
+          if (command.args[0] === "rev-parse" || command.args[0] === "symbolic-ref") {
+            const running = yield* Ref.make(false);
+            const stdout =
+              command.args[1] === "--git-common-dir"
+                ? ".git\n"
+                : command.args[1] === "--show-toplevel"
+                  ? "/repo\n"
+                  : command.args[0] === "symbolic-ref"
+                    ? "main\n"
+                    : "";
+            return yield* scopedGitHandle(
+              makeGitHandle({
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                running,
+                stdout,
               }),
             );
           }
@@ -217,6 +237,13 @@ describe("worktree materialization timeout", () => {
       const result = yield* Fiber.join(fiber);
       assert.equal(result.worktree.path, "/worktrees/large");
       assert.isFalse(yield* Ref.get(killed));
+      assert.sameDeepMembers(Array.from(yield* Ref.get(commands)), [
+        ["show-ref", "--verify", "--quiet", "refs/heads/t3code/large"],
+        ["worktree", "add", "-b", "t3code/large", "/worktrees/large", "main"],
+        ["rev-parse", "--git-common-dir"],
+        ["rev-parse", "--show-toplevel"],
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+      ]);
     }).pipe(Effect.scoped),
   );
 
@@ -266,9 +293,15 @@ describe("worktree materialization timeout", () => {
           const stdout =
             command.args[0] === "worktree"
               ? `worktree ${worktreePath}\nHEAD ${sha}\nbranch refs/heads/t3code/boundary\n\n`
-              : command.args[0] === "rev-parse"
-                ? `${sha}\n`
-                : "";
+              : command.args[0] === "rev-parse" && command.args[1] === "--git-common-dir"
+                ? ".git\n"
+                : command.args[0] === "rev-parse" && command.args[1] === "--show-toplevel"
+                  ? `${repoPath}\n`
+                  : command.args[0] === "symbolic-ref"
+                    ? "main\n"
+                    : command.args[0] === "rev-parse"
+                      ? `${sha}\n`
+                      : "";
           return yield* scopedGitHandle(
             makeGitHandle({
               exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
@@ -308,6 +341,9 @@ describe("worktree materialization timeout", () => {
           ["rev-parse", "t3code/boundary^{commit}"],
           ["rev-parse", "HEAD"],
           ["status", "--porcelain=v1", "--untracked-files=no"],
+          ["rev-parse", "--git-common-dir"],
+          ["rev-parse", "--show-toplevel"],
+          ["symbolic-ref", "--quiet", "--short", "HEAD"],
         ],
       );
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
