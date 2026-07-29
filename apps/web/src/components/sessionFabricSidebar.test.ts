@@ -2,7 +2,7 @@ import {
   SessionFabricSessionRecord,
   type SessionFabricSessionRecord as SessionFabricSessionRecordType,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, vi } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
 import {
@@ -100,8 +100,6 @@ describe("session fabric sidebar", () => {
         ]);
       },
       onState: (state) => states.push(state),
-      setInterval: () => 1,
-      clearInterval: () => undefined,
     });
 
     await discovery.initialLoad;
@@ -120,11 +118,34 @@ describe("session fabric sidebar", () => {
     discovery.dispose();
   });
 
-  it("refreshes the directory so a session created after mount appears", async () => {
+  it("does not issue timer-driven requests while idle", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const discovery = startSessionFabricSidebarDiscovery({
+        load: async () => {
+          calls += 1;
+          return [];
+        },
+        onState: () => undefined,
+      });
+
+      await discovery.initialLoad;
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(calls).toBe(1);
+      discovery.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refreshes after focus, online, and explicit refresh requests", async () => {
     const states: SessionFabricSidebarDirectoryState[] = [];
-    let intervalRefresh: (() => void) | undefined;
+    const eventTarget = new EventTarget();
     let calls = 0;
     const discovery = startSessionFabricSidebarDiscovery({
+      eventTarget,
       load: async () => {
         calls += 1;
         return calls === 1
@@ -138,21 +159,77 @@ describe("session fabric sidebar", () => {
             ]);
       },
       onState: (state) => states.push(state),
-      setInterval: (handler) => {
-        intervalRefresh = handler;
-        return 1;
-      },
-      clearInterval: () => undefined,
     });
 
     await discovery.initialLoad;
     expect(states.at(-1)).toMatchObject({ status: "ready", sessions: [] });
 
-    intervalRefresh?.();
+    eventTarget.dispatchEvent(new Event("focus"));
     await discovery.refresh();
     expect(states.at(-1)).toMatchObject({
       status: "ready",
       sessions: [{ sessionId: "created-later" }],
+    });
+
+    eventTarget.dispatchEvent(new Event("online"));
+    await discovery.refresh();
+    await discovery.refresh();
+    expect(calls).toBe(4);
+    discovery.dispose();
+  });
+
+  it("coalesces concurrent event and explicit refresh requests", async () => {
+    const eventTarget = new EventTarget();
+    let resolveLoad: ((sessions: ReadonlyArray<never>) => void) | undefined;
+    let calls = 0;
+    const discovery = startSessionFabricSidebarDiscovery({
+      eventTarget,
+      load: async () => {
+        calls += 1;
+        return new Promise<ReadonlyArray<never>>((resolve) => {
+          resolveLoad = resolve;
+        });
+      },
+      onState: () => undefined,
+    });
+
+    eventTarget.dispatchEvent(new Event("focus"));
+    eventTarget.dispatchEvent(new Event("online"));
+    const firstRefresh = discovery.refresh();
+    const secondRefresh = discovery.refresh();
+    expect(firstRefresh).toBe(secondRefresh);
+    expect(calls).toBe(1);
+
+    resolveLoad?.([]);
+    await discovery.initialLoad;
+    const nextRefresh = discovery.refresh();
+    expect(calls).toBe(2);
+    resolveLoad?.([]);
+    await nextRefresh;
+    discovery.dispose();
+  });
+
+  it("keeps the last successful directory when a refresh fails", async () => {
+    const states: SessionFabricSidebarDirectoryState[] = [];
+    let calls = 0;
+    const discovery = startSessionFabricSidebarDiscovery({
+      load: async () => {
+        calls += 1;
+        if (calls > 1) throw new Error("relay unavailable");
+        return selectPublicLocalSidebarSessions([
+          record({ sessionId: "cached", publication: "public", environmentKind: "local" }),
+        ]);
+      },
+      onState: (state) => states.push(state),
+    });
+
+    await discovery.initialLoad;
+    await discovery.refresh();
+
+    expect(states.at(-1)).toMatchObject({
+      status: "error",
+      message: "relay unavailable",
+      sessions: [{ sessionId: "cached" }],
     });
     discovery.dispose();
   });
@@ -170,8 +247,6 @@ describe("session fabric sidebar", () => {
         return [];
       },
       onState: (state) => states.push(state),
-      setInterval: () => 1,
-      clearInterval: () => undefined,
       setTimeout: (handler) => {
         timeout = handler;
         return 2;
@@ -193,16 +268,28 @@ describe("session fabric sidebar", () => {
     discovery.dispose();
   });
 
-  it("aborts an in-flight load when discovery is disposed", async () => {
+  it("aborts an in-flight load, removes event listeners, and ignores refresh after disposal", async () => {
+    const backingEventTarget = new EventTarget();
+    const removedListeners: string[] = [];
+    const eventTarget = {
+      addEventListener: (type: "focus" | "online", listener: () => void) => {
+        backingEventTarget.addEventListener(type, listener);
+      },
+      removeEventListener: (type: "focus" | "online", listener: () => void) => {
+        removedListeners.push(type);
+        backingEventTarget.removeEventListener(type, listener);
+      },
+    };
+    let calls = 0;
     let signal: AbortSignal | undefined;
     const discovery = startSessionFabricSidebarDiscovery({
+      eventTarget,
       load: async (nextSignal) => {
+        calls += 1;
         signal = nextSignal;
         return new Promise(() => undefined);
       },
       onState: () => undefined,
-      setInterval: () => 1,
-      clearInterval: () => undefined,
       setTimeout: () => 2,
       clearTimeout: () => undefined,
     });
@@ -210,6 +297,11 @@ describe("session fabric sidebar", () => {
     discovery.dispose();
     await discovery.initialLoad;
     expect(signal?.aborted).toBe(true);
+    expect(removedListeners).toEqual(["focus", "online"]);
+    backingEventTarget.dispatchEvent(new Event("focus"));
+    backingEventTarget.dispatchEvent(new Event("online"));
+    await discovery.refresh();
+    expect(calls).toBe(1);
   });
 
   it("deduplicates connected threads and respects All Projects or a project scope", () => {
