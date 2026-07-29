@@ -322,9 +322,11 @@ class TestRelay {
   readonly sockets: TestWebSocket[] = [];
   clientHelloCount = 0;
   private readonly initialSnapshot: SessionFabricSnapshot;
+  private readonly emitReplayEvent: boolean;
 
-  constructor(initialSnapshot: SessionFabricSnapshot = snapshot) {
+  constructor(initialSnapshot: SessionFabricSnapshot = snapshot, emitReplayEvent = true) {
     this.initialSnapshot = initialSnapshot;
+    this.emitReplayEvent = emitReplayEvent;
   }
 
   readonly construct = (url: string, protocols?: string | Array<string>) => {
@@ -337,16 +339,18 @@ class TestRelay {
     if (frame.type === "client.hello") {
       this.clientHelloCount += 1;
       socket.serverFrame({ type: "session.snapshot", snapshot: this.initialSnapshot });
-      socket.serverFrame({
-        type: "session.event",
-        sequence: 1,
-        published: {
-          sessionId: SESSION_ID,
-          runnerId: "runner-1" as never,
-          runnerGeneration: 0,
-          event: staleEvent,
-        },
-      });
+      if (this.emitReplayEvent) {
+        socket.serverFrame({
+          type: "session.event",
+          sequence: 1,
+          published: {
+            sessionId: SESSION_ID,
+            runnerId: "runner-1" as never,
+            runnerGeneration: 0,
+            event: staleEvent,
+          },
+        });
+      }
       socket.serverFrame({
         type: "session.synchronized",
         cursor: { eventSequence: 1, snapshotSequence: 7 },
@@ -529,6 +533,138 @@ describe("Relay session fabric UI source", () => {
     }),
   );
 
+  it.live("merges a live session overlay onto a newer complete projection", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay(makeRunningSnapshot());
+      const projectedAfterInterveningEvent: SessionFabricSnapshot = {
+        ...makeRunningSnapshot("Intervening title"),
+        shell: {
+          ...makeRunningSnapshot("Intervening title").shell,
+          snapshotSequence: 8,
+        },
+        thread: {
+          ...makeRunningSnapshot("Intervening title").thread,
+          snapshotSequence: 8,
+        },
+      };
+      const source = makeSource(relay, "client-partial-session-overlay", (() =>
+        Promise.resolve(Response.json(projectedAfterInterveningEvent))) as typeof fetch);
+      const items = yield* Queue.unbounded<OrchestrationShellStreamItem>();
+      const streamed = yield* Effect.forkChild(
+        source
+          .subscribeShell(() => Effect.succeed({ afterSequence: 0, requestCompletionMarker: true }))
+          .pipe(
+            Stream.runForEach((item) => Queue.offer(items, item)),
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          ),
+      );
+
+      yield* awaitSocketCount(relay, 1);
+      relay.sockets[0]!.open();
+      yield* awaitHelloCount(relay, 1);
+      expect(yield* Queue.take(items)).toEqual(expect.objectContaining({ kind: "snapshot" }));
+      expect(yield* Queue.take(items)).toEqual({ kind: "synchronized" });
+      relay.broadcast(makeSessionSetFrame({ eventSequence: 9 }));
+      expect(yield* Queue.take(items)).toEqual(
+        expect.objectContaining({ kind: "thread-upserted", sequence: 9 }),
+      );
+
+      const projected = yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID);
+      yield* Fiber.interrupt(streamed);
+
+      expect(Option.map(projected, (value) => value.snapshotSequence)).toEqual(Option.some(8));
+      expect(Option.map(projected, (value) => value.thread.title)).toEqual(
+        Option.some("Intervening title"),
+      );
+      expect(Option.map(projected, (value) => value.thread.session?.status)).toEqual(
+        Option.some("ready"),
+      );
+      expect(Option.map(projected, (value) => value.thread.latestTurn?.state)).toEqual(
+        Option.some("completed"),
+      );
+    }),
+  );
+
+  it.live("accepts the first cold shell and thread websocket snapshots at sequence zero", () =>
+    Effect.gen(function* () {
+      const zeroSnapshot: SessionFabricSnapshot = {
+        ...snapshot,
+        session: {
+          ...snapshot.session,
+          cursor: { eventSequence: 0, snapshotSequence: 0 },
+        },
+        shell: { ...snapshot.shell, snapshotSequence: 0 },
+        thread: { ...snapshot.thread, snapshotSequence: 0 },
+        compactedThroughEventSequence: 0,
+      };
+      const relay = new TestRelay(zeroSnapshot, false);
+      const source = makeSource(relay, "client-cold-sequence-zero", (() =>
+        Promise.resolve(new Response(null, { status: 503 }))) as typeof fetch);
+      expect(yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID)).toEqual(
+        Option.none(),
+      );
+      const items = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
+      const streamed = yield* Effect.forkChild(
+        source
+          .subscribeThread(() =>
+            Effect.succeed({
+              threadId: THREAD_ID,
+              afterSequence: 0,
+              requestCompletionMarker: true,
+            }),
+          )
+          .pipe(
+            Stream.runForEach((item) => Queue.offer(items, item)),
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          ),
+      );
+
+      yield* awaitSocketCount(relay, 1);
+      relay.sockets[0]!.open();
+      yield* awaitHelloCount(relay, 1);
+      expect(yield* Queue.take(items)).toEqual(
+        expect.objectContaining({
+          kind: "snapshot",
+          snapshot: expect.objectContaining({ snapshotSequence: 0 }),
+        }),
+      );
+      expect(yield* Queue.take(items)).toEqual({ kind: "synchronized" });
+      relay.broadcast({ type: "session.snapshot", snapshot: zeroSnapshot });
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      expect(yield* Queue.poll(items)).toEqual(Option.none());
+      yield* Fiber.interrupt(streamed);
+
+      const shellRelay = new TestRelay(zeroSnapshot, false);
+      const shellSource = makeSource(shellRelay, "client-cold-shell-sequence-zero", (() =>
+        Promise.resolve(new Response(null, { status: 503 }))) as typeof fetch);
+      expect(yield* shellSource.authoritativeShellSnapshot({} as never)).toEqual(Option.none());
+      const shellItems = yield* Queue.unbounded<OrchestrationShellStreamItem>();
+      const shellStreamed = yield* Effect.forkChild(
+        shellSource
+          .subscribeShell(() => Effect.succeed({ afterSequence: 0, requestCompletionMarker: true }))
+          .pipe(
+            Stream.runForEach((item) => Queue.offer(shellItems, item)),
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          ),
+      );
+
+      yield* awaitSocketCount(shellRelay, 1);
+      shellRelay.sockets[0]!.open();
+      yield* awaitHelloCount(shellRelay, 1);
+      expect(yield* Queue.take(shellItems)).toEqual(
+        expect.objectContaining({
+          kind: "snapshot",
+          snapshot: expect.objectContaining({ snapshotSequence: 0 }),
+        }),
+      );
+      expect(yield* Queue.take(shellItems)).toEqual({ kind: "synchronized" });
+      shellRelay.broadcast({ type: "session.snapshot", snapshot: zeroSnapshot });
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      expect(yield* Queue.poll(shellItems)).toEqual(Option.none());
+      yield* Fiber.interrupt(shellStreamed);
+    }),
+  );
+
   it.effect(
     "lets two independent clients observe and interact with one session without browser storage",
     () =>
@@ -666,7 +802,7 @@ describe("Relay session fabric UI source", () => {
       );
 
       const fetched = yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID);
-      expect(Option.map(fetched, (value) => value.snapshotSequence)).toEqual(Option.some(8));
+      expect(Option.map(fetched, (value) => value.snapshotSequence)).toEqual(Option.some(7));
       expect(Option.map(fetched, (value) => value.thread.session?.status)).toEqual(
         Option.some("ready"),
       );
@@ -700,7 +836,7 @@ describe("Relay session fabric UI source", () => {
         expect.objectContaining({
           kind: "snapshot",
           snapshot: expect.objectContaining({
-            snapshotSequence: 8,
+            snapshotSequence: 7,
             thread: expect.objectContaining({
               session: expect.objectContaining({ status: "ready" }),
               latestTurn: expect.objectContaining({ state: "completed" }),
@@ -896,6 +1032,139 @@ describe("Relay session fabric UI source", () => {
       relay.sockets[0]!.open();
       expect(yield* Fiber.join(dispatched)).toEqual({ sequence: 8 });
       expect(capabilityCalls).toEqual(["viewer", "controller"]);
+    }),
+  );
+
+  it.effect("accepts cursor-newer Scaffold replacement and local transition records", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      const replacementSnapshot: SessionFabricSnapshot = {
+        ...snapshot,
+        session: {
+          ...snapshot.session,
+          location: {
+            ...snapshot.session.location,
+            scaffoldSessionId: "ses-scaffold-replacement",
+            scaffoldSessionUrl: "https://scaffold.example/sessions/ses-scaffold-replacement",
+            scaffoldLifecycleEpoch: 0,
+          },
+          cursor: { eventSequence: 2, snapshotSequence: 8 },
+          updatedAt: "2026-07-24T19:10:00.000Z",
+        },
+      };
+      const localTransitionSnapshot: SessionFabricSnapshot = {
+        ...replacementSnapshot,
+        session: {
+          ...replacementSnapshot.session,
+          location: {
+            ...replacementSnapshot.session.location,
+            environmentKind: "local",
+            scaffoldSessionId: null,
+            scaffoldSessionUrl: null,
+            scaffoldLifecycleEpoch: null,
+          },
+          cursor: { eventSequence: 3, snapshotSequence: 9 },
+          updatedAt: "2026-07-24T18:10:00.000Z",
+        },
+      };
+      let snapshotFetchCount = 0;
+      const capabilityBodies: Array<Record<string, unknown>> = [];
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        fetch: (async (_input, init) => {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown> & {
+            role: "viewer" | "controller";
+          };
+          capabilityBodies.push(body);
+          return Response.json({
+            capability: `${body.role}-replacement-secret`,
+            tokenType: "Bearer",
+            role: body.role,
+            scopes:
+              body.role === "viewer"
+                ? ["directory:read", "session:read"]
+                : ["session:read", "session:command"],
+            expiresAt: "2026-07-24T21:00:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings:
+              body.role === "viewer"
+                ? {}
+                : body.environmentKind === "local"
+                  ? {
+                      fabricSessionId: body.fabricSessionId,
+                      environmentKind: "local",
+                      environmentId: body.environmentId,
+                      threadId: body.threadId,
+                      actorId: "user-1",
+                    }
+                  : {
+                      fabricSessionId: body.fabricSessionId,
+                      scaffoldSessionId: body.scaffoldSessionId,
+                      scaffoldLifecycleEpoch: body.scaffoldLifecycleEpoch,
+                    },
+          });
+        }) as typeof fetch,
+      });
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-scaffold-replacement"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Relay test",
+        authorization,
+        fetch: (() =>
+          Promise.resolve(
+            Response.json(
+              [snapshot, replacementSnapshot, localTransitionSnapshot][snapshotFetchCount++] ??
+                localTransitionSnapshot,
+            ),
+          )) as typeof fetch,
+        webSocketConstructor: relay.construct,
+      });
+
+      yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID);
+      yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID);
+      const dispatched = yield* Effect.forkChild(
+        source
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("command-scaffold-replacement"),
+            threadId: THREAD_ID,
+            title: "Replacement",
+          })
+          .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
+      );
+      yield* awaitSocketCount(relay, 1);
+      relay.sockets[0]!.open();
+      expect(yield* Fiber.join(dispatched)).toEqual({ sequence: 8 });
+      expect(capabilityBodies.at(-1)).toMatchObject({
+        role: "controller",
+        scaffoldSessionId: "ses-scaffold-replacement",
+        scaffoldLifecycleEpoch: 0,
+      });
+
+      yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID);
+      const localDispatch = yield* Effect.forkChild(
+        source
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("command-local-transition"),
+            threadId: THREAD_ID,
+            title: "Local transition",
+          })
+          .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
+      );
+      yield* awaitSocketCount(relay, 2);
+      relay.sockets[1]!.open();
+      expect(yield* Fiber.join(localDispatch)).toEqual({ sequence: 8 });
+      expect(capabilityBodies.at(-1)).toMatchObject({
+        role: "controller",
+        environmentKind: "local",
+        environmentId: ENVIRONMENT_ID,
+        threadId: THREAD_ID,
+      });
     }),
   );
 
