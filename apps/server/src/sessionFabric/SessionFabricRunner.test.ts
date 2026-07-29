@@ -16,6 +16,7 @@ import {
   resolveSessionFabricRunnerConfig,
   resolveSessionFabricSessionId,
   requestLocalSessionFabricRunnerCapability,
+  requestScaffoldSessionFabricRunnerCapability,
   sessionFabricCommandReceipt,
   sessionFabricCapabilityRefreshDelayMs,
 } from "./SessionFabricRunner.ts";
@@ -54,6 +55,7 @@ describe("SessionFabricRunner", () => {
       overrideThreadId: Option.none(),
       scaffoldSessionId: Option.some("ses_scaffold"),
       scaffoldSessionUrl: Option.none(),
+      scaffoldCapabilityBaseUrl: Option.some(new URL("https://worker.example.test/")),
       scaffoldLifecycleEpoch: Option.some(4),
       runtimeApiToken: Option.some("runtime-secret"),
       authMode: "required",
@@ -63,6 +65,7 @@ describe("SessionFabricRunner", () => {
     expect(config.environmentKind).toBe("scaffold");
     expect(config.runnerGeneration).toBe(0);
     expect(config.scaffoldLifecycleEpoch).toBe(4);
+    expect(config.scaffoldCapabilityBaseUrl?.toString()).toBe("https://worker.example.test/");
     expect(
       makeSessionFabricWebSocketUrl(
         config.relayUrl!,
@@ -176,6 +179,7 @@ describe("SessionFabricRunner", () => {
         overrideThreadId: Option.none(),
         scaffoldSessionId: Option.some("ses_scaffold"),
         scaffoldSessionUrl: Option.some("https://scaffold.example.test/?q=ses_scaffold"),
+        scaffoldCapabilityBaseUrl: Option.some(new URL("https://worker.example.test/")),
         scaffoldLifecycleEpoch: Option.some(4),
         runtimeApiToken: Option.some("runtime-secret"),
         authMode: "disabled",
@@ -194,8 +198,9 @@ describe("SessionFabricRunner", () => {
         runnerGeneration: 0,
         overrideSessionId: Option.none(),
         overrideThreadId: Option.none(),
-        scaffoldSessionId: Option.some("ses_mixed"),
+        scaffoldSessionId: Option.none(),
         scaffoldSessionUrl: Option.none(),
+        scaffoldCapabilityBaseUrl: Option.some(new URL("https://worker.example.test/")),
         scaffoldLifecycleEpoch: Option.none(),
         runtimeApiToken: Option.none(),
         authMode: "required",
@@ -203,6 +208,102 @@ describe("SessionFabricRunner", () => {
         scaffoldDefaultDeployment: Option.none(),
       }),
     ).toThrow("cannot include Scaffold runtime bindings");
+  });
+
+  it("requires a valid direct capability origin for a Scaffold runner", () => {
+    const baseConfig = {
+      relayUrl: Option.some(new URL("https://relay.example.test/")),
+      environmentKind: Option.some("scaffold" as const),
+      publication: "public" as const,
+      runnerGeneration: 0,
+      overrideSessionId: Option.none(),
+      overrideThreadId: Option.none(),
+      scaffoldSessionId: Option.some("ses_scaffold"),
+      scaffoldSessionUrl: Option.some("https://scaffold.example.test/?q=ses_scaffold"),
+      scaffoldLifecycleEpoch: Option.some(4),
+      runtimeApiToken: Option.some("runtime-secret"),
+      authMode: "required" as const,
+      capabilityDeployment: Option.none(),
+      scaffoldDefaultDeployment: Option.none(),
+    };
+    expect(() =>
+      resolveSessionFabricRunnerConfig({
+        ...baseConfig,
+        scaffoldCapabilityBaseUrl: Option.none(),
+      }),
+    ).toThrow("requires a capability base URL");
+    expect(() =>
+      resolveSessionFabricRunnerConfig({
+        ...baseConfig,
+        scaffoldCapabilityBaseUrl: Option.some(
+          new URL("https://worker.example.test/not-an-origin"),
+        ),
+      }),
+    ).toThrow("must be an HTTP origin");
+  });
+
+  it("requests a Scaffold runner capability from the direct Worker origin", async () => {
+    const config = resolveSessionFabricRunnerConfig({
+      relayUrl: Option.some(new URL("https://relay.example.test/")),
+      environmentKind: Option.some("scaffold"),
+      publication: "public",
+      runnerGeneration: 0,
+      overrideSessionId: Option.none(),
+      overrideThreadId: Option.none(),
+      scaffoldSessionId: Option.some("ses_scaffold"),
+      scaffoldSessionUrl: Option.some(
+        "https://scaffold-staging.internal.ashler.com/sessions/ses_scaffold/agent/",
+      ),
+      scaffoldCapabilityBaseUrl: Option.some(
+        new URL("https://scaffold-control-plane-staging.workers.dev/"),
+      ),
+      scaffoldLifecycleEpoch: Option.some(7),
+      runtimeApiToken: Option.some("runtime-secret"),
+      authMode: "required",
+      capabilityDeployment: Option.none(),
+      scaffoldDefaultDeployment: Option.none(),
+    });
+    const requests: Array<{
+      url: string;
+      init: Parameters<typeof globalThis.fetch>[1];
+    }> = [];
+    const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(input), init });
+      return Response.json({
+        capability: "header.payload.signature",
+        tokenType: "Bearer",
+        role: "runner",
+        scopes: ["session:publish", "session:execute"],
+        expiresAt: "2026-07-24T20:15:00.000Z",
+        issuer: "scaffold",
+        audience: "session-fabric",
+        keyId: "proof-1",
+        bindings: {
+          scaffoldSessionId: "ses_scaffold",
+          scaffoldLifecycleEpoch: 7,
+        },
+      });
+    }) as typeof globalThis.fetch;
+
+    await requestScaffoldSessionFabricRunnerCapability({
+      capabilityBaseUrl: config.scaffoldCapabilityBaseUrl!,
+      runtimeApiToken: config.runtimeApiToken!,
+      scaffoldSessionId: config.scaffoldSessionId!,
+      lifecycleEpoch: config.scaffoldLifecycleEpoch!,
+      fetch,
+      now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+    });
+
+    expect(config.scaffoldSessionUrl).toContain("scaffold-staging.internal.ashler.com");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe(
+      "https://scaffold-control-plane-staging.workers.dev/api/sessions/ses_scaffold/session-fabric/runner-capability",
+    );
+    expect(requests[0]?.url).not.toContain("scaffold-staging.internal.ashler.com");
+    expect(requests[0]?.init?.headers).toMatchObject({
+      "x-scaffold-runtime-api-token": "runtime-secret",
+    });
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({ lifecycleEpoch: 7 });
   });
 
   it("uses the OAuth-backed global capability endpoint for an exact local runner binding", async () => {

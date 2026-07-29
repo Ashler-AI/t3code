@@ -77,6 +77,9 @@ const SessionFabricRunnerEnvConfig = Config.all({
   overrideThreadId: Config.string("T3CODE_SESSION_FABRIC_THREAD_ID").pipe(Config.option),
   scaffoldSessionId: Config.string("SCAFFOLD_SESSION_ID").pipe(Config.option),
   scaffoldSessionUrl: Config.string("SCAFFOLD_SESSION_URL").pipe(Config.option),
+  scaffoldCapabilityBaseUrl: Config.url("T3CODE_SESSION_FABRIC_CAPABILITY_BASE_URL").pipe(
+    Config.option,
+  ),
   scaffoldLifecycleEpoch: Config.int("SCAFFOLD_LIFECYCLE_EPOCH").pipe(Config.option),
   runtimeApiToken: Config.string("SCAFFOLD_RUNTIME_API_TOKEN").pipe(Config.option),
   authMode: Config.literals(["required", "disabled"], "T3CODE_SESSION_FABRIC_AUTH_MODE").pipe(
@@ -101,6 +104,7 @@ export interface SessionFabricRunnerConfig {
   readonly overrideThreadId: ThreadId | null;
   readonly scaffoldSessionId: string | null;
   readonly scaffoldSessionUrl: string | null;
+  readonly scaffoldCapabilityBaseUrl: URL | null;
   readonly scaffoldLifecycleEpoch: number | null;
   readonly runtimeApiToken: string | null;
   readonly authMode: "required" | "disabled";
@@ -123,6 +127,21 @@ const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
 const optionValue = <A>(value: Option.Option<A>): A | null =>
   Option.isSome(value) ? value.value : null;
 
+function normalizeScaffoldCapabilityBaseUrl(value: URL | null): URL | null {
+  if (value === null) return null;
+  if (
+    (value.protocol !== "https:" && value.protocol !== "http:") ||
+    value.username.length > 0 ||
+    value.password.length > 0 ||
+    value.pathname !== "/" ||
+    value.search.length > 0 ||
+    value.hash.length > 0
+  ) {
+    throw new Error("Scaffold session fabric capability base URL must be an HTTP origin.");
+  }
+  return new URL(value.origin);
+}
+
 export function resolveSessionFabricRunnerConfig(
   config: Config.Success<typeof SessionFabricRunnerEnvConfig>,
 ): SessionFabricRunnerConfig {
@@ -140,11 +159,18 @@ export function resolveSessionFabricRunnerConfig(
     throw new Error("Scaffold lifecycle epoch must be non-negative.");
   }
   const scaffoldSessionUrl = optionValue(config.scaffoldSessionUrl);
+  const scaffoldCapabilityBaseUrl = normalizeScaffoldCapabilityBaseUrl(
+    optionValue(config.scaffoldCapabilityBaseUrl),
+  );
   const runtimeApiToken = optionValue(config.runtimeApiToken);
+  if (environmentKind === "scaffold" && scaffoldCapabilityBaseUrl === null) {
+    throw new Error("A Scaffold session fabric runner requires a capability base URL.");
+  }
   if (
     environmentKind === "local" &&
     (scaffoldSessionId !== null ||
       scaffoldSessionUrl !== null ||
+      scaffoldCapabilityBaseUrl !== null ||
       scaffoldLifecycleEpoch !== null ||
       runtimeApiToken !== null)
   ) {
@@ -160,6 +186,7 @@ export function resolveSessionFabricRunnerConfig(
     overrideThreadId: overrideThreadId === null ? null : (overrideThreadId as ThreadId),
     scaffoldSessionId,
     scaffoldSessionUrl,
+    scaffoldCapabilityBaseUrl,
     scaffoldLifecycleEpoch,
     runtimeApiToken,
     authMode: config.authMode,
@@ -232,6 +259,26 @@ export async function requestLocalSessionFabricRunnerCapability(input: {
     throw new Error("Scaffold returned an invalid local session fabric capability.");
   }
   return grant;
+}
+
+export async function requestScaffoldSessionFabricRunnerCapability(input: {
+  readonly capabilityBaseUrl: URL;
+  readonly runtimeApiToken: string;
+  readonly scaffoldSessionId: string;
+  readonly lifecycleEpoch: number;
+  readonly fetch?: typeof globalThis.fetch;
+  readonly now?: () => number;
+  readonly timeoutMs?: number;
+}): Promise<SessionFabricCapabilityGrant> {
+  return requestScaffoldRunnerCapability({
+    baseUrl: input.capabilityBaseUrl.origin,
+    runtimeApiToken: input.runtimeApiToken,
+    scaffoldSessionId: input.scaffoldSessionId,
+    lifecycleEpoch: input.lifecycleEpoch,
+    ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+    ...(input.now === undefined ? {} : { now: input.now }),
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+  });
 }
 
 export function resolveSessionFabricSessionId(input: {
@@ -503,6 +550,7 @@ export const make = Effect.gen(function* () {
             if (
               config.scaffoldSessionId === null ||
               config.scaffoldSessionUrl === null ||
+              config.scaffoldCapabilityBaseUrl === null ||
               config.scaffoldLifecycleEpoch === null ||
               config.runtimeApiToken === null
             ) {
@@ -510,18 +558,14 @@ export const make = Effect.gen(function* () {
                 reason: "configuration",
               });
             }
-            const scaffoldSessionUrl = config.scaffoldSessionUrl;
+            const scaffoldCapabilityBaseUrl = config.scaffoldCapabilityBaseUrl;
             const runtimeApiToken = config.runtimeApiToken;
             const scaffoldSessionId = config.scaffoldSessionId;
             const scaffoldLifecycleEpoch = config.scaffoldLifecycleEpoch;
-            const baseUrl = yield* Effect.try({
-              try: () => new URL(scaffoldSessionUrl).origin,
-              catch: () => new SessionFabricRunnerCapabilityError({ reason: "configuration" }),
-            });
             return yield* Effect.tryPromise({
               try: () =>
-                requestScaffoldRunnerCapability({
-                  baseUrl,
+                requestScaffoldSessionFabricRunnerCapability({
+                  capabilityBaseUrl: scaffoldCapabilityBaseUrl,
                   runtimeApiToken,
                   scaffoldSessionId,
                   lifecycleEpoch: scaffoldLifecycleEpoch,
