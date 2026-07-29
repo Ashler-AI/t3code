@@ -33,7 +33,6 @@ const scope: McpInvocationContext.McpInvocationScope = {
   providerInstanceId: ompInstanceId,
   capabilities: new Set(["session_reference_read", "session_message_send"]),
   issuedAt: 1,
-  expiresAt: Number.MAX_SAFE_INTEGER,
 };
 
 const makeReadModel = (overrides?: {

@@ -41,6 +41,7 @@ describe("RPC authorization scopes", () => {
     for (const method of [
       WS_METHODS.ompAccountsBeginLogin,
       WS_METHODS.ompAccountsRespondLogin,
+      WS_METHODS.ompAccountsSubmitLogin,
       WS_METHODS.ompAccountsCancelLogin,
       WS_METHODS.ompAccountsRemove,
       WS_METHODS.scaffoldPause,

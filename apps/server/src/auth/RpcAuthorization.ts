@@ -53,6 +53,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.ompAccountsRefresh]: AuthOrchestrationReadScope,
   [WS_METHODS.ompAccountsBeginLogin]: AuthOrchestrationOperateScope,
   [WS_METHODS.ompAccountsRespondLogin]: AuthOrchestrationOperateScope,
+  [WS_METHODS.ompAccountsSubmitLogin]: AuthOrchestrationOperateScope,
   [WS_METHODS.ompAccountsCancelLogin]: AuthOrchestrationOperateScope,
   [WS_METHODS.ompAccountsRemove]: AuthOrchestrationOperateScope,
   [WS_METHODS.scaffoldPause]: AuthOrchestrationOperateScope,
