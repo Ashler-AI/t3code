@@ -1,5 +1,4 @@
 import { OmpSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
-import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -42,7 +41,6 @@ import {
 const decodeOmpSettings = Schema.decodeSync(OmpSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("omp");
-const SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
 const UPDATE = makeStaticProviderMaintenanceResolver(
   makeManualOnlyProviderMaintenanceCapabilities({
     provider: DRIVER_KIND,
@@ -148,7 +146,6 @@ export const OmpDriver: ProviderDriver<OmpSettings, OmpDriverEnv> = {
             publishSnapshot,
             httpClient,
           }),
-        refreshInterval: SNAPSHOT_REFRESH_INTERVAL,
       }).pipe(
         Effect.mapError(
           (cause) =>

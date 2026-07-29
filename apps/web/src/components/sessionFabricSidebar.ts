@@ -29,18 +29,14 @@ interface SessionFabricSidebarDiscoveryEventTarget {
   removeEventListener(type: "focus" | "online", listener: () => void): void;
 }
 
-export const SESSION_FABRIC_SIDEBAR_REFRESH_INTERVAL_MS = 15_000;
 export const SESSION_FABRIC_SIDEBAR_REQUEST_TIMEOUT_MS = 10_000;
 
 export function startSessionFabricSidebarDiscovery(options: {
   readonly load: (signal: AbortSignal) => Promise<ReadonlyArray<SessionFabricSidebarSession>>;
   readonly onState: (state: SessionFabricSidebarDirectoryState) => void;
   readonly eventTarget?: SessionFabricSidebarDiscoveryEventTarget;
-  readonly setInterval?: (handler: () => void, timeoutMs: number) => number;
-  readonly clearInterval?: (intervalId: number) => void;
   readonly setTimeout?: (handler: () => void, timeoutMs: number) => number;
   readonly clearTimeout?: (timeoutId: number) => void;
-  readonly refreshIntervalMs?: number;
   readonly requestTimeoutMs?: number;
 }): {
   readonly initialLoad: Promise<void>;
@@ -110,12 +106,6 @@ export function startSessionFabricSidebarDiscovery(options: {
   eventTarget?.addEventListener("focus", refreshAfterConnectivityChange);
   eventTarget?.addEventListener("online", refreshAfterConnectivityChange);
 
-  const setIntervalImplementation = options.setInterval ?? window.setInterval.bind(window);
-  const clearIntervalImplementation = options.clearInterval ?? window.clearInterval.bind(window);
-  const intervalId = setIntervalImplementation(
-    refreshAfterConnectivityChange,
-    options.refreshIntervalMs ?? SESSION_FABRIC_SIDEBAR_REFRESH_INTERVAL_MS,
-  );
   const initialLoad = refresh();
 
   return {
@@ -124,7 +114,6 @@ export function startSessionFabricSidebarDiscovery(options: {
     dispose: () => {
       disposed = true;
       activeController?.abort(new DOMException("Discovery disposed.", "AbortError"));
-      clearIntervalImplementation(intervalId);
       eventTarget?.removeEventListener("focus", refreshAfterConnectivityChange);
       eventTarget?.removeEventListener("online", refreshAfterConnectivityChange);
     },

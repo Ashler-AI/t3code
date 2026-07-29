@@ -246,7 +246,6 @@ describe("ScaffoldLifecycleService", () => {
     const service = makeScaffoldLifecycleService({
       client: () => client,
       now: () => Date.parse("2026-07-24T20:00:00.000Z"),
-      sleep: async () => {},
     });
 
     const created = await service.prepare(
@@ -323,7 +322,6 @@ describe("ScaffoldLifecycleService", () => {
     const service = makeScaffoldLifecycleService({
       client: () => fakeClient(),
       now: () => Date.parse("2026-07-24T20:00:00.000Z"),
-      sleep: async () => {},
     });
     const result = await service.prepare(
       new ScaffoldCreateAndPrepareInput({
@@ -456,6 +454,102 @@ describe("ScaffoldLifecycleService", () => {
       modelRouteId: "scaffold-openai/gpt-5.6-sol",
       agentEffort: "high",
     });
+  });
+
+  it("returns pending after one readiness observation instead of polling inside the server", async () => {
+    const createSession = vi.fn(async () => observation("starting"));
+    const getSession = vi.fn(async () => observation("starting"));
+    const issueT3Transport = vi.fn<ScaffoldControlPlaneClient["issueT3Transport"]>();
+    const sleep = vi.fn(async () => {});
+    const service = makeScaffoldLifecycleService({
+      client: () => fakeClient({ createSession, getSession, issueT3Transport }),
+      sleep,
+      readinessTimeoutMs: 60_000,
+      readinessIntervalMs: 2_500,
+    });
+
+    const preparation = service.prepare(
+      new ScaffoldCreateAndPrepareInput({
+        deployment: "staging",
+        operationId: "op_single_observation",
+        sessionId: "ses_1",
+        create: {},
+      }),
+    );
+
+    await expect(preparation).rejects.toMatchObject({
+      reason: "unavailable",
+      status: 202,
+      code: "scaffold_preparation_pending",
+      retryAfterMs: 2_500,
+      observation: { sessionId: "ses_1", status: "starting", lifecycleEpoch: 1 },
+    });
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(getSession).toHaveBeenCalledExactlyOnceWith("ses_1");
+    expect(sleep).not.toHaveBeenCalled();
+    expect(issueT3Transport).not.toHaveBeenCalled();
+  });
+
+  it("reuses the stable operation on the next outbox attempt and prepares once ready", async () => {
+    const createSession = vi.fn(async () => observation("starting"));
+    const getSession = vi
+      .fn<ScaffoldControlPlaneClient["getSession"]>()
+      .mockResolvedValueOnce(observation("starting"))
+      .mockResolvedValueOnce(observation("ready"));
+    const issueT3Transport = vi.fn(fakeClient().issueT3Transport);
+    const service = makeScaffoldLifecycleService({
+      client: () => fakeClient({ createSession, getSession, issueT3Transport }),
+    });
+    const input = new ScaffoldCreateAndPrepareInput({
+      deployment: "staging",
+      operationId: "op_stable_retry",
+      sessionId: "ses_1",
+      create: {},
+    });
+
+    await expect(service.prepare(input)).rejects.toMatchObject({
+      status: 202,
+      code: "scaffold_preparation_pending",
+    });
+    await expect(service.prepare(input)).resolves.toMatchObject({
+      binding: { sessionId: "ses_1", status: "ready" },
+    });
+
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(createSession).toHaveBeenNthCalledWith(1, {
+      operationId: "op_stable_retry",
+      sessionId: "ses_1",
+    });
+    expect(createSession).toHaveBeenNthCalledWith(2, {
+      operationId: "op_stable_retry",
+      sessionId: "ses_1",
+    });
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(issueT3Transport).toHaveBeenCalledOnce();
+  });
+
+  it("reports a terminal state from the single readiness observation", async () => {
+    const getSession = vi.fn(async () => observation("stopped", 2));
+    const service = makeScaffoldLifecycleService({
+      client: () => fakeClient({ getSession }),
+    });
+
+    await expect(
+      service.prepare(
+        new ScaffoldCreateAndPrepareInput({
+          deployment: "staging",
+          operationId: "op_terminal_observation",
+          sessionId: "ses_1",
+          create: {},
+        }),
+      ),
+    ).rejects.toMatchObject({
+      reason: "terminal",
+      status: 409,
+      code: "scaffold_session_stopped",
+      observation: { sessionId: "ses_1", status: "stopped", lifecycleEpoch: 2 },
+    });
+    expect(getSession).toHaveBeenCalledExactlyOnceWith("ses_1");
   });
 
   it("treats pause 409 with stopped state as converged", async () => {

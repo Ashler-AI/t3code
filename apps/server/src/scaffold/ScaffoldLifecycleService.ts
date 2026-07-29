@@ -22,7 +22,6 @@ import { resolveScaffoldTarget, ScaffoldConfigurationError } from "./ScaffoldCon
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
-const DEFAULT_READINESS_TIMEOUT_MS = 60_000;
 const DEFAULT_READINESS_INTERVAL_MS = 1_000;
 const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
 const SCAFFOLD_DEPLOYMENTS = ["staging", "production"] as const;
@@ -31,7 +30,9 @@ export interface ScaffoldLifecycleServiceOptions {
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly client?: (deployment: ScaffoldDeployment) => ScaffoldControlPlaneClient;
   readonly now?: () => number;
+  /** @deprecated Readiness retries are owned by the durable client outbox. */
   readonly sleep?: (milliseconds: number) => Promise<void>;
+  /** @deprecated Readiness retries are owned by the durable client outbox. */
   readonly readinessTimeoutMs?: number;
   readonly readinessIntervalMs?: number;
 }
@@ -81,9 +82,6 @@ function stableLinks(baseUrl: string, sessionId: string): ScaffoldSessionLinks {
 export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOptions = {}) {
   const serviceEnvironment = options.environment ?? process.env;
   const now = options.now ?? Date.now;
-  const sleep =
-    options.sleep ?? ((milliseconds: number) => NodeTimersPromises.setTimeout(milliseconds));
-  const readinessTimeoutMs = options.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
   const readinessIntervalMs = options.readinessIntervalMs ?? DEFAULT_READINESS_INTERVAL_MS;
 
   const clientFor = (deployment: ScaffoldDeployment): ScaffoldControlPlaneClient => {
@@ -98,30 +96,32 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
     }
   };
 
-  const awaitReady = async (
+  const observeReadiness = async (
     client: ScaffoldControlPlaneClient,
     initial: ScaffoldSessionObservation,
   ): Promise<ScaffoldSessionObservation> => {
-    let observation = initial;
-    const deadline = now() + readinessTimeoutMs;
-    while (observation.status !== "ready" && observation.status !== "agent_running") {
-      if (observation.status === "failed" || observation.status === "stopped") {
-        throw terminalError(observation);
-      }
-      if (now() >= deadline) {
-        throw new ScaffoldLifecycleError({
-          reason: "unavailable",
-          message: "Scaffold session is still preparing.",
-          status: 202,
-          code: "scaffold_preparation_pending",
-          retryAfterMs: readinessIntervalMs,
-          observation,
-        });
-      }
-      await sleep(readinessIntervalMs);
-      observation = await client.getSession(observation.sessionId);
+    // The durable client outbox owns retries. A server invocation takes one
+    // fresh observation so it never nests a polling loop inside an outbox attempt.
+    if (initial.status === "ready" || initial.status === "agent_running") return initial;
+    if (initial.status === "failed" || initial.status === "stopped") {
+      throw terminalError(initial);
     }
-    return observation;
+
+    const observation = await client.getSession(initial.sessionId);
+    if (observation.status === "ready" || observation.status === "agent_running") {
+      return observation;
+    }
+    if (observation.status === "failed" || observation.status === "stopped") {
+      throw terminalError(observation);
+    }
+    throw new ScaffoldLifecycleError({
+      reason: "unavailable",
+      message: "Scaffold session is still preparing.",
+      status: 202,
+      code: "scaffold_preparation_pending",
+      retryAfterMs: readinessIntervalMs,
+      observation,
+    });
   };
 
   const reconcileResume = async (
@@ -194,7 +194,7 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
       input._tag === "ScaffoldCreateAndPrepareInput"
         ? await reconcileCreate(client, input)
         : await reconcileResume(client, input);
-    const ready = await awaitReady(client, initial);
+    const ready = await observeReadiness(client, initial);
     const transport = await client.issueT3Transport({
       sessionId: ready.sessionId,
       lifecycleEpoch: ready.lifecycleEpoch,
@@ -314,4 +314,3 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
 }
 
 export type ScaffoldLifecycleService = ReturnType<typeof makeScaffoldLifecycleService>;
-import * as NodeTimersPromises from "node:timers/promises";
