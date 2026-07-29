@@ -11,6 +11,7 @@ import type {
   SessionFabricServerFrame,
   SessionFabricSessionId,
   SessionFabricSnapshot,
+  SessionFabricRunnerHello,
 } from "@t3tools/contracts/session-fabric";
 import {
   SessionFabricClientFrame as SessionFabricClientFrameSchema,
@@ -27,8 +28,11 @@ import {
   capabilityCanControlSession,
   capabilityCanReadSession,
   capabilityCanRunSession,
+  isLocalSessionFabricCapability,
   isLoopbackSessionFabricRequestUrl,
+  isPublicLocalLocation,
   isPublicScaffoldLocation,
+  localRunnerCapabilityMatchesAuthority,
   makeSessionFabricCapabilityVerifierConfig,
   SessionFabricCapabilityError,
   verifySessionFabricCapability,
@@ -72,6 +76,146 @@ interface MetaRow {
   readonly runner_state: string;
   readonly snapshot_json: string | null;
   readonly snapshot_sequence: number;
+  readonly environment_kind: string | null;
+  readonly environment_id: string | null;
+  readonly thread_id: string | null;
+  readonly actor_id: string | null;
+}
+
+export interface LocalSessionFabricPinnedAuthority {
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly runnerId: string;
+  readonly actorId: string;
+  readonly sessionId: string;
+}
+
+function completeLocalAuthority(meta: MetaRow): LocalSessionFabricPinnedAuthority | null {
+  return meta.environment_kind === "local" &&
+    meta.environment_id !== null &&
+    meta.thread_id !== null &&
+    meta.runner_id !== null &&
+    meta.actor_id !== null &&
+    meta.session_id !== null
+    ? {
+        environmentId: meta.environment_id,
+        threadId: meta.thread_id,
+        runnerId: meta.runner_id,
+        actorId: meta.actor_id,
+        sessionId: meta.session_id,
+      }
+    : null;
+}
+
+export function localRunnerCanClaimPinnedAuthority(input: {
+  readonly claims: SessionFabricCapabilityClaims;
+  readonly hello: SessionFabricRunnerHello;
+  readonly pinned: LocalSessionFabricPinnedAuthority | null;
+  readonly sessionAlreadyClaimed: boolean;
+}): boolean {
+  if (
+    !isLocalSessionFabricCapability(input.claims) ||
+    !capabilityCanRunSession(input.claims, input.hello)
+  ) {
+    return false;
+  }
+  if (input.pinned === null) return !input.sessionAlreadyClaimed;
+  return (
+    input.pinned.sessionId === input.hello.sessionId &&
+    input.pinned.environmentId === input.hello.location.environmentId &&
+    input.pinned.threadId === input.hello.location.threadId &&
+    localRunnerCapabilityMatchesAuthority({
+      claims: input.claims,
+      sessionId: input.hello.sessionId,
+      environmentId: input.hello.location.environmentId,
+      threadId: input.hello.location.threadId,
+      runnerId: input.pinned.runnerId,
+      actorId: input.pinned.actorId,
+    })
+  );
+}
+
+export function localControllerMatchesPinnedAuthority(input: {
+  readonly claims: SessionFabricCapabilityClaims;
+  readonly sessionId: SessionFabricSessionId;
+  readonly location: SessionFabricSnapshot["session"]["location"];
+  readonly pinned: LocalSessionFabricPinnedAuthority | null;
+}): boolean {
+  return (
+    input.pinned !== null &&
+    input.pinned.sessionId === input.sessionId &&
+    input.pinned.environmentId === input.location.environmentId &&
+    input.pinned.threadId === input.location.threadId &&
+    capabilityCanControlSession({
+      claims: input.claims,
+      sessionId: input.sessionId,
+      location: input.location,
+      localAuthority: { actorId: input.pinned.actorId },
+    })
+  );
+}
+
+export function localViewerCanReadPinnedAuthority(input: {
+  readonly claims: SessionFabricCapabilityClaims | null;
+  readonly sessionId: SessionFabricSessionId;
+  readonly pinned: LocalSessionFabricPinnedAuthority | null;
+}): boolean {
+  return (
+    input.claims?.role === "viewer" &&
+    input.pinned !== null &&
+    input.pinned.sessionId === input.sessionId &&
+    input.claims.actorId === input.pinned.actorId
+  );
+}
+
+export function localAuthorityViewForViewer(input: {
+  readonly claims: SessionFabricCapabilityClaims | null;
+  readonly sessionId: SessionFabricSessionId;
+  readonly pinned: LocalSessionFabricPinnedAuthority | null;
+}): {
+  readonly fabricSessionId: string;
+  readonly environmentKind: "local";
+  readonly environmentId: string;
+  readonly threadId: string;
+  readonly actorId: string;
+} | null {
+  return localViewerCanReadPinnedAuthority(input) && input.pinned !== null
+    ? {
+        fabricSessionId: input.pinned.sessionId,
+        environmentKind: "local",
+        environmentId: input.pinned.environmentId,
+        threadId: input.pinned.threadId,
+        actorId: input.pinned.actorId,
+      }
+    : null;
+}
+
+function localAuthorityColumnsAreConsistent(meta: MetaRow): boolean {
+  const values = [meta.environment_kind, meta.environment_id, meta.thread_id, meta.actor_id];
+  return values.every((value) => value === null) || completeLocalAuthority(meta) !== null;
+}
+
+function localCapabilityMatchesPinnedMeta(input: {
+  readonly capability: SessionFabricCapabilityClaims;
+  readonly sessionId: SessionFabricSessionId;
+  readonly location: SessionFabricSnapshot["session"]["location"];
+  readonly meta: MetaRow;
+}): boolean {
+  const pinned = completeLocalAuthority(input.meta);
+  return (
+    pinned !== null &&
+    pinned.sessionId === input.sessionId &&
+    pinned.environmentId === input.location.environmentId &&
+    pinned.threadId === input.location.threadId &&
+    localRunnerCapabilityMatchesAuthority({
+      claims: input.capability,
+      sessionId: input.sessionId,
+      environmentId: input.location.environmentId,
+      threadId: input.location.threadId,
+      runnerId: pinned.runnerId,
+      actorId: pinned.actorId,
+    })
+  );
 }
 
 interface EventRow {
@@ -123,7 +267,7 @@ const encodeFrame = (frame: SessionFabricServerFrame): string => encodeServerFra
 
 const pathSessionId = (url: URL): SessionFabricSessionId | null => {
   const match = url.pathname.match(
-    /^\/v1\/session-fabric\/sessions\/([^/]+)\/(?:connect|snapshot|events|context)$/,
+    /^\/v1\/session-fabric\/sessions\/([^/]+)\/(?:authority|connect|snapshot|events|context)$/,
   );
   if (!match) return null;
   try {
@@ -160,14 +304,25 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
 
       yield* sql
         .exec(
-          "CREATE TABLE IF NOT EXISTS session_meta (id INTEGER PRIMARY KEY CHECK (id = 1), session_id TEXT, runner_id TEXT, runner_generation INTEGER NOT NULL DEFAULT 0, runner_state TEXT NOT NULL DEFAULT 'offline', snapshot_json TEXT, snapshot_sequence INTEGER NOT NULL DEFAULT 0)",
+          "CREATE TABLE IF NOT EXISTS session_meta (id INTEGER PRIMARY KEY CHECK (id = 1), session_id TEXT, runner_id TEXT, runner_generation INTEGER NOT NULL DEFAULT 0, runner_state TEXT NOT NULL DEFAULT 'offline', snapshot_json TEXT, snapshot_sequence INTEGER NOT NULL DEFAULT 0, environment_kind TEXT, environment_id TEXT, thread_id TEXT, actor_id TEXT)",
         )
         .pipe(Effect.asVoid);
       const metaColumns = yield* sql.exec<{ readonly name: string }>(
         "PRAGMA table_info(session_meta)",
       );
-      if (!(yield* metaColumns.toArray()).some((column) => column.name === "runner_id")) {
+      const existingMetaColumns = yield* metaColumns.toArray();
+      if (!existingMetaColumns.some((column) => column.name === "runner_id")) {
         yield* sql.exec("ALTER TABLE session_meta ADD COLUMN runner_id TEXT").pipe(Effect.asVoid);
+      }
+      for (const column of [
+        "environment_kind",
+        "environment_id",
+        "thread_id",
+        "actor_id",
+      ] as const) {
+        if (!existingMetaColumns.some((candidate) => candidate.name === column)) {
+          yield* sql.exec(`ALTER TABLE session_meta ADD COLUMN ${column} TEXT`).pipe(Effect.asVoid);
+        }
       }
       yield* sql
         .exec(
@@ -192,7 +347,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
 
       const readMeta = Effect.fn("session_fabric.read_meta")(function* () {
         const cursor = yield* sql.exec<MetaRow>(
-          "SELECT session_id, runner_id, runner_generation, runner_state, snapshot_json, snapshot_sequence FROM session_meta WHERE id = 1",
+          "SELECT session_id, runner_id, runner_generation, runner_state, snapshot_json, snapshot_sequence, environment_kind, environment_id, thread_id, actor_id FROM session_meta WHERE id = 1",
         );
         return yield* cursor.one();
       });
@@ -332,11 +487,20 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             }) &&
             (verifierConfig?.mode === "disabled" ||
               (attachment.capability?.role === "runner" &&
-                isPublicScaffoldLocation(snapshot.session.location) &&
-                attachment.capability.scaffoldSessionId ===
-                  snapshot.session.location.scaffoldSessionId &&
-                attachment.capability.scaffoldLifecycleEpoch ===
-                  snapshot.session.location.scaffoldLifecycleEpoch))
+                ((isPublicScaffoldLocation(snapshot.session.location) &&
+                  !isLocalSessionFabricCapability(attachment.capability) &&
+                  attachment.capability.scaffoldSessionId ===
+                    snapshot.session.location.scaffoldSessionId &&
+                  attachment.capability.scaffoldLifecycleEpoch ===
+                    snapshot.session.location.scaffoldLifecycleEpoch) ||
+                  (isPublicLocalLocation(snapshot.session.location) &&
+                    isLocalSessionFabricCapability(attachment.capability) &&
+                    localCapabilityMatchesPinnedMeta({
+                      capability: attachment.capability,
+                      sessionId: snapshot.session.sessionId,
+                      location: snapshot.session.location,
+                      meta,
+                    })))))
           ) {
             eligible.push(runner);
           }
@@ -580,6 +744,38 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           );
         }
         const meta = yield* readMeta();
+        const localCapability =
+          attachment.capability?.role === "runner" &&
+          isLocalSessionFabricCapability(attachment.capability)
+            ? attachment.capability
+            : null;
+        if (!localAuthorityColumnsAreConsistent(meta)) {
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Session authority is inconsistent",
+          );
+        }
+        if (localCapability !== null) {
+          const pinned = completeLocalAuthority(meta);
+          if (
+            !localRunnerCanClaimPinnedAuthority({
+              claims: localCapability,
+              hello: frame.hello,
+              pinned,
+              sessionAlreadyClaimed: meta.session_id !== null,
+            })
+          ) {
+            return yield* socket.close(
+              SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+              "Local session authority mismatch",
+            );
+          }
+        } else if (meta.environment_kind !== null) {
+          return yield* socket.close(
+            SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+            "Session authority kind mismatch",
+          );
+        }
         if (
           !runnerHelloMatchesLease({
             currentGeneration: meta.runner_generation,
@@ -596,14 +792,24 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         if (frame.hello.runnerGeneration > meta.runner_generation) {
           yield* rejectPendingCommands("Runner generation changed");
         }
-        yield* sql
-          .exec(
-            "UPDATE session_meta SET session_id = ?, runner_id = ?, runner_generation = ?, runner_state = 'online' WHERE id = 1",
-            frame.hello.sessionId,
-            frame.hello.runnerId,
-            frame.hello.runnerGeneration,
-          )
-          .pipe(Effect.asVoid);
+        yield* (
+          localCapability === null
+            ? sql.exec(
+                "UPDATE session_meta SET session_id = ?, runner_id = ?, runner_generation = ?, runner_state = 'online' WHERE id = 1",
+                frame.hello.sessionId,
+                frame.hello.runnerId,
+                frame.hello.runnerGeneration,
+              )
+            : sql.exec(
+                "UPDATE session_meta SET session_id = ?, runner_id = ?, runner_generation = ?, runner_state = 'online', environment_kind = 'local', environment_id = ?, thread_id = ?, actor_id = ? WHERE id = 1",
+                frame.hello.sessionId,
+                frame.hello.runnerId,
+                frame.hello.runnerGeneration,
+                localCapability.environmentId,
+                localCapability.threadId,
+                localCapability.actorId,
+              )
+        ).pipe(Effect.asVoid);
         socket.serializeAttachment<SocketAttachment>({
           role: "runner",
           sessionId: expectedSessionId,
@@ -749,20 +955,31 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           ) {
             return;
           }
+          const meta = yield* readMeta();
           if (
             verifierConfig?.mode !== "disabled" &&
             (attachment.capability?.role !== "runner" ||
               published.snapshot.session.sessionId !== attachment.sessionId ||
               published.snapshot.session.publication !== "public" ||
-              !isPublicScaffoldLocation(published.snapshot.session.location) ||
-              attachment.capability.scaffoldSessionId !==
-                published.snapshot.session.location.scaffoldSessionId ||
-              attachment.capability.scaffoldLifecycleEpoch !==
-                published.snapshot.session.location.scaffoldLifecycleEpoch)
+              !(
+                (isPublicScaffoldLocation(published.snapshot.session.location) &&
+                  !isLocalSessionFabricCapability(attachment.capability) &&
+                  attachment.capability.scaffoldSessionId ===
+                    published.snapshot.session.location.scaffoldSessionId &&
+                  attachment.capability.scaffoldLifecycleEpoch ===
+                    published.snapshot.session.location.scaffoldLifecycleEpoch) ||
+                (isPublicLocalLocation(published.snapshot.session.location) &&
+                  isLocalSessionFabricCapability(attachment.capability) &&
+                  localCapabilityMatchesPinnedMeta({
+                    capability: attachment.capability,
+                    sessionId: published.snapshot.session.sessionId,
+                    location: published.snapshot.session.location,
+                    meta,
+                  }))
+              ))
           ) {
             return;
           }
-          const meta = yield* readMeta();
           if (
             !isCurrentRunnerAttachment({
               attachmentGeneration: attachment.runnerGeneration,
@@ -837,16 +1054,24 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           return;
         }
         const snapshot = yield* readSnapshot();
+        const meta = yield* readMeta();
+        const localAuthority = completeLocalAuthority(meta);
         const commandAuthorized =
           snapshot !== null &&
           (verifierConfig?.mode === "disabled" ||
             (attachment.capability !== null &&
-              capabilityCanControlSession({
-                claims: attachment.capability,
-                sessionId: command.sessionId,
-                location: snapshot.session.location,
-              })));
-        const meta = yield* readMeta();
+              (isLocalSessionFabricCapability(attachment.capability)
+                ? localControllerMatchesPinnedAuthority({
+                    claims: attachment.capability,
+                    sessionId: command.sessionId,
+                    location: snapshot.session.location,
+                    pinned: localAuthority,
+                  })
+                : capabilityCanControlSession({
+                    claims: attachment.capability,
+                    sessionId: command.sessionId,
+                    location: snapshot.session.location,
+                  }))));
         const runners = snapshot === null ? [] : yield* eligibleRunners(snapshot, meta);
         const existingCursor = yield* sql.exec<CommandRow>(
           "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
@@ -998,6 +1223,24 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           const sessionId = pathSessionId(url);
           if (sessionId === null) {
             return HttpServerResponse.text("Not found", { status: 404 });
+          }
+          if (url.pathname.endsWith("/authority")) {
+            const pinned = completeLocalAuthority(yield* readMeta());
+            const authority =
+              verifierConfig?.mode === "disabled" && pinned !== null
+                ? {
+                    fabricSessionId: pinned.sessionId,
+                    environmentKind: "local" as const,
+                    environmentId: pinned.environmentId,
+                    threadId: pinned.threadId,
+                    actorId: pinned.actorId,
+                  }
+                : localAuthorityViewForViewer({ claims: capability, sessionId, pinned });
+            return authority === null
+              ? HttpServerResponse.empty({ status: 404 })
+              : HttpServerResponse.jsonUnsafe(authority, {
+                  headers: { "cache-control": "no-store" },
+                });
           }
           if (url.pathname.endsWith("/snapshot")) {
             const snapshot = yield* readSnapshot();

@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  type ScaffoldDeploymentCapabilities,
+} from "@t3tools/contracts";
 import type { Thread } from "../types";
+import commandPaletteSource from "./CommandPalette.tsx?raw";
 import {
   buildBrowseGroups,
   buildAshlerRootGroups,
@@ -10,7 +17,9 @@ import {
   reduceCommandPaletteUiState,
   getCommandPaletteInputPlaceholder,
   getScaffoldNewSessionActionPresentation,
+  loadScaffoldDeploymentCapabilities,
   persistScaffoldDraftAction,
+  refreshNewSessionPaletteView,
   runScaffoldDraftLaunch,
   shouldRefreshOmpOverviewOnOpen,
   type CommandPaletteActionItem,
@@ -207,18 +216,107 @@ describe("Ashler command palette root", () => {
   });
 
   it("requires a contextual project before offering Scaffold session creation", () => {
-    expect(getScaffoldNewSessionActionPresentation({ hasContextualProject: false })).toEqual({
+    expect(
+      getScaffoldNewSessionActionPresentation({
+        hasContextualProject: false,
+        capability: null,
+      }),
+    ).toEqual({ disabled: true, description: "Add or open a local project first" });
+    expect(
+      getScaffoldNewSessionActionPresentation({
+        hasContextualProject: true,
+        capability: {
+          deployment: "staging",
+          status: "available",
+          description: "New Scaffold sandbox",
+        },
+      }),
+    ).toEqual({ disabled: false, description: "New Scaffold sandbox" });
+    expect(
+      getScaffoldNewSessionActionPresentation({
+        hasContextualProject: true,
+        capability: {
+          deployment: "production",
+          status: "unsupported",
+          description: "Agent sessions are not available in this deployment",
+        },
+      }),
+    ).toEqual({
       disabled: true,
-      description: "Add or open a local project first",
+      description: "Agent sessions are not available in this deployment",
     });
-    expect(getScaffoldNewSessionActionPresentation({ hasContextualProject: true })).toEqual({
-      disabled: false,
-      description: "New Scaffold sandbox",
+  });
+
+  it("loads Scaffold capabilities before primary environment entity hydration", async () => {
+    const capabilities: ScaffoldDeploymentCapabilities = {
+      deployments: [
+        {
+          deployment: "staging" as const,
+          status: "available" as const,
+          description: "New Scaffold sandbox",
+        },
+        {
+          deployment: "production" as const,
+          status: "unsupported" as const,
+          description: "Agent sessions are not available in this deployment",
+        },
+      ],
+    };
+    const request = vi.fn(async () => capabilities);
+    const updates: Array<ScaffoldDeploymentCapabilities | null> = [];
+
+    loadScaffoldDeploymentCapabilities({
+      request,
+      setCapabilities: (next) => updates.push(next),
     });
+    await vi.waitFor(() => expect(updates).toEqual([null, capabilities]));
+
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes an open new-session view when Scaffold capabilities arrive", () => {
+    const loadingGroups: CommandPaletteGroup[] = [
+      {
+        value: "session-location",
+        label: "Run on",
+        items: [action("scaffold:staging", "Checking Scaffold availability…")],
+      },
+    ];
+    const availableGroups: CommandPaletteGroup[] = [
+      {
+        value: "session-location",
+        label: "Run on",
+        items: [action("scaffold:staging", "New Scaffold sandbox")],
+      },
+    ];
+
+    const refreshed = refreshNewSessionPaletteView(
+      [{ addonIcon: null, groups: loadingGroups }],
+      availableGroups,
+    );
+
+    expect(refreshed.at(-1)?.groups).toBe(availableGroups);
+  });
+
+  it("does not replace unrelated command palette views", () => {
+    const views = [
+      {
+        addonIcon: null,
+        groups: [{ value: "projects", label: "Project", items: [] }],
+      },
+    ];
+
+    expect(refreshNewSessionPaletteView(views, [])).toBe(views);
   });
 });
 
 describe("runScaffoldDraftLaunch", () => {
+  it("uses one resolved model snapshot for the draft controls and Scaffold grant", () => {
+    expect(commandPaletteSource).toMatch(
+      /let launchModelSelection = defaultScaffoldModelSelection;[\s\S]*?launchModelSelection =[\s\S]*?resolveScaffoldDraftModelSelection\(providers, sourceModelSelection\)[\s\S]*?setModelSelection\(draftId, launchModelSelection,[\s\S]*?scaffoldCreateParametersForModelSelection\(launchModelSelection\)/,
+    );
+  });
+
   it("opens the target-labelled draft without waiting for lifecycle persistence", async () => {
     const events: string[] = [];
     let releasePersistence: (() => void) | undefined;

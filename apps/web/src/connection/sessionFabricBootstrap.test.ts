@@ -4,6 +4,7 @@ import {
   configuredSessionFabricRelayUrl,
   isConfiguredSessionFabricRoute,
   sessionFabricRegistrationFromRoute,
+  sessionFabricRoutePath,
 } from "./sessionFabricBootstrap";
 
 describe("session fabric route bootstrap", () => {
@@ -30,6 +31,18 @@ describe("session fabric route bootstrap", () => {
 
     expect(registration?.target.environmentId).toBe("session-fabric:global-session-1");
     expect(registration?.target.sessionId).toBe("global-session-1");
+  });
+
+  it("builds the selected session route beneath the Scaffold runtime mount", () => {
+    expect(
+      sessionFabricRoutePath({
+        sessionId: "sf:local-environment:thread-1",
+        threadId: "thread-1",
+        runtimeBasePath: "/sessions/ses_scaffold/agent",
+      }),
+    ).toBe(
+      "/sessions/ses_scaffold/agent/session-fabric%3Asf%3Alocal-environment%3Athread-1/thread-1",
+    );
   });
 
   it("fails closed when the browser path is outside the supplied runtime mount", () => {

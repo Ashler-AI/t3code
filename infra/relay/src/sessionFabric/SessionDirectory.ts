@@ -19,8 +19,8 @@ import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import {
-  isPublicScaffoldSessionRecord,
-  isPublicScaffoldSnapshot,
+  isPublicSessionRecord,
+  isPublicSessionSnapshot,
 } from "@t3tools/shared/sessionFabricCapability";
 
 import { rankSessionDirectoryEntries } from "./SessionDirectoryModel.ts";
@@ -112,7 +112,7 @@ export default class SessionDirectory extends Cloudflare.DurableObjectNamespace<
         ).pipe(
           Effect.map((entries) =>
             entries.flatMap((entry) =>
-              Option.isSome(entry) && isPublicScaffoldSessionRecord(entry.value.session)
+              Option.isSome(entry) && isPublicSessionRecord(entry.value.session)
                 ? [entry.value]
                 : [],
             ),
@@ -124,7 +124,7 @@ export default class SessionDirectory extends Cloudflare.DurableObjectNamespace<
         snapshot: SessionFabricSnapshot,
       ) {
         const validated = yield* decodeSnapshot(snapshot);
-        if (!isPublicScaffoldSnapshot(validated)) {
+        if (!isPublicSessionSnapshot(validated)) {
           yield* sql
             .exec("DELETE FROM sessions WHERE session_id = ?", validated.session.sessionId)
             .pipe(Effect.asVoid);

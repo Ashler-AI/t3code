@@ -111,7 +111,27 @@ export const SessionFabricViewerCapabilityClaims = Schema.Struct({
 });
 export type SessionFabricViewerCapabilityClaims = typeof SessionFabricViewerCapabilityClaims.Type;
 
-export const SessionFabricControllerCapabilityClaims = Schema.Struct({
+const SessionFabricLocalControllerAuthorityBindingFields = {
+  fabricSessionId: SessionFabricSessionId,
+  environmentKind: Schema.Literal("local"),
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  actorId: TrimmedNonEmptyString,
+} as const;
+
+export const SessionFabricLocalControllerAuthorityBinding = Schema.Struct(
+  SessionFabricLocalControllerAuthorityBindingFields,
+).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type SessionFabricLocalControllerAuthorityBinding =
+  typeof SessionFabricLocalControllerAuthorityBinding.Type;
+
+export const SessionFabricLocalAuthorityBinding = Schema.Struct({
+  ...SessionFabricLocalControllerAuthorityBindingFields,
+  runnerId: SessionFabricRunnerId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type SessionFabricLocalAuthorityBinding = typeof SessionFabricLocalAuthorityBinding.Type;
+
+export const SessionFabricScaffoldControllerCapabilityClaims = Schema.Struct({
   ...SessionFabricCapabilityBaseClaims,
   role: Schema.Literal("controller"),
   actorId: TrimmedNonEmptyString,
@@ -120,10 +140,26 @@ export const SessionFabricControllerCapabilityClaims = Schema.Struct({
   scaffoldSessionId: TrimmedNonEmptyString,
   scaffoldLifecycleEpoch: NonNegativeInt,
 });
+export type SessionFabricScaffoldControllerCapabilityClaims =
+  typeof SessionFabricScaffoldControllerCapabilityClaims.Type;
+
+export const SessionFabricLocalControllerCapabilityClaims = Schema.Struct({
+  ...SessionFabricCapabilityBaseClaims,
+  role: Schema.Literal("controller"),
+  scopes: Schema.Tuple([Schema.Literal("session:read"), Schema.Literal("session:command")]),
+  ...SessionFabricLocalControllerAuthorityBindingFields,
+});
+export type SessionFabricLocalControllerCapabilityClaims =
+  typeof SessionFabricLocalControllerCapabilityClaims.Type;
+
+export const SessionFabricControllerCapabilityClaims = Schema.Union([
+  SessionFabricScaffoldControllerCapabilityClaims,
+  SessionFabricLocalControllerCapabilityClaims,
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type SessionFabricControllerCapabilityClaims =
   typeof SessionFabricControllerCapabilityClaims.Type;
 
-export const SessionFabricRunnerCapabilityClaims = Schema.Struct({
+export const SessionFabricScaffoldRunnerCapabilityClaims = Schema.Struct({
   ...SessionFabricCapabilityBaseClaims,
   role: Schema.Literal("runner"),
   runnerId: Schema.optional(TrimmedNonEmptyString),
@@ -131,6 +167,23 @@ export const SessionFabricRunnerCapabilityClaims = Schema.Struct({
   scaffoldSessionId: TrimmedNonEmptyString,
   scaffoldLifecycleEpoch: NonNegativeInt,
 });
+export type SessionFabricScaffoldRunnerCapabilityClaims =
+  typeof SessionFabricScaffoldRunnerCapabilityClaims.Type;
+
+export const SessionFabricLocalRunnerCapabilityClaims = Schema.Struct({
+  ...SessionFabricCapabilityBaseClaims,
+  role: Schema.Literal("runner"),
+  scopes: Schema.Tuple([Schema.Literal("session:publish"), Schema.Literal("session:execute")]),
+  ...SessionFabricLocalControllerAuthorityBindingFields,
+  runnerId: SessionFabricRunnerId,
+});
+export type SessionFabricLocalRunnerCapabilityClaims =
+  typeof SessionFabricLocalRunnerCapabilityClaims.Type;
+
+export const SessionFabricRunnerCapabilityClaims = Schema.Union([
+  SessionFabricScaffoldRunnerCapabilityClaims,
+  SessionFabricLocalRunnerCapabilityClaims,
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type SessionFabricRunnerCapabilityClaims = typeof SessionFabricRunnerCapabilityClaims.Type;
 
 export const SessionFabricTombstoneCapabilityClaims = Schema.Struct({
@@ -151,6 +204,12 @@ export const SessionFabricCapabilityClaims = Schema.Union([
 ]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type SessionFabricCapabilityClaims = typeof SessionFabricCapabilityClaims.Type;
 
+const SessionFabricScaffoldCapabilityGrantBindings = Schema.Struct({
+  fabricSessionId: Schema.optional(SessionFabricSessionId),
+  scaffoldSessionId: Schema.optional(TrimmedNonEmptyString),
+  scaffoldLifecycleEpoch: Schema.optional(NonNegativeInt),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+
 export const SessionFabricCapabilityGrant = Schema.Struct({
   capability: TrimmedNonEmptyString,
   tokenType: Schema.Literal("Bearer"),
@@ -160,11 +219,11 @@ export const SessionFabricCapabilityGrant = Schema.Struct({
   issuer: TrimmedNonEmptyString,
   audience: TrimmedNonEmptyString,
   keyId: TrimmedNonEmptyString,
-  bindings: Schema.Struct({
-    fabricSessionId: Schema.optional(SessionFabricSessionId),
-    scaffoldSessionId: Schema.optional(TrimmedNonEmptyString),
-    scaffoldLifecycleEpoch: Schema.optional(NonNegativeInt),
-  }),
+  bindings: Schema.Union([
+    SessionFabricScaffoldCapabilityGrantBindings,
+    SessionFabricLocalControllerAuthorityBinding,
+    SessionFabricLocalAuthorityBinding,
+  ]).annotate({ parseOptions: { onExcessProperty: "error" } }),
 });
 export type SessionFabricCapabilityGrant = typeof SessionFabricCapabilityGrant.Type;
 

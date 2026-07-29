@@ -165,6 +165,29 @@ describe("environmentBootstrap", () => {
     );
   });
 
+  it("uses the vite proxy through an equivalent IPv6 loopback origin", () => {
+    vi.stubEnv("VITE_HTTP_URL", "http://localhost:13773");
+    vi.stubEnv("VITE_WS_URL", "ws://localhost:13773");
+    vi.stubEnv("VITE_DEV_SERVER_URL", "http://localhost:5733");
+    installTestBrowser("http://[::1]:5733/");
+
+    expect(resolvePrimaryEnvironmentHttpUrl("/api/auth/session")).toBe(
+      "http://[::1]:5733/api/auth/session",
+    );
+    expect(readPrimaryEnvironmentTarget().target.httpBaseUrl).toBe("http://[::1]:5733");
+  });
+
+  it("does not treat a different loopback port as the configured vite server", () => {
+    vi.stubEnv("VITE_HTTP_URL", "http://localhost:13773");
+    vi.stubEnv("VITE_WS_URL", "ws://localhost:13773");
+    vi.stubEnv("VITE_DEV_SERVER_URL", "http://localhost:5733");
+    installTestBrowser("http://[::1]:5734/");
+
+    expect(resolvePrimaryEnvironmentHttpUrl("/api/auth/session")).toBe(
+      "http://localhost:13773/api/auth/session",
+    );
+  });
+
   it("keeps same-origin auth and websocket targets under a proxy-rewritten document base", () => {
     vi.stubGlobal("window", {
       location: new URL("https://platform.example.test/sessions/session-123/agent/"),

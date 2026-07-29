@@ -237,9 +237,11 @@ import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
 import {
   mergeQueuedScaffoldMessages,
+  SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE,
   resolveEffectiveEnvMode,
   resolveLocalCheckoutBranchMismatch,
   resolveScaffoldPendingTurnMode,
+  resolveScaffoldSendDecision,
   shouldBlockComposerForConnection,
   shouldIgnoreSourceEnvironmentForScaffoldDraft,
   shouldPrepareWorktreeForFirstMessage,
@@ -1191,8 +1193,6 @@ function ChatViewContent(props: ChatViewProps) {
     draftId ? (state.entriesByDraftId[draftId] ?? null) : null,
   );
   const scaffoldSessionsByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
-  const scaffoldSessionBusy =
-    scaffoldSessionUi?.phase === "creating" || scaffoldSessionUi?.phase === "resuming";
   const routeThreadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
@@ -1712,8 +1712,8 @@ function ChatViewContent(props: ChatViewProps) {
   const activeEnvironment =
     activeThread == null ? null : (environmentById.get(activeThread.environmentId) ?? null);
   const ignoreSourceEnvironmentForScaffoldDraft = shouldIgnoreSourceEnvironmentForScaffoldDraft({
-    scaffoldEnvironmentId: scaffoldSessionUi?.environmentId,
-    scaffoldPhase: scaffoldSessionUi?.phase ?? null,
+    hasScaffoldDraft: scaffoldSessionUi !== null,
+    boundToTarget: scaffoldDraftBoundToTarget,
   });
   const composerIsConnecting = shouldBlockComposerForConnection({
     transportConnecting: isConnecting && !ignoreSourceEnvironmentForScaffoldDraft,
@@ -1724,7 +1724,8 @@ function ChatViewContent(props: ChatViewProps) {
     activeEnvironment !== null &&
     !ignoreSourceEnvironmentForScaffoldDraft &&
     activeEnvironmentConnectionPhase !== "connected" &&
-    activeScaffoldSession?.phase !== "paused";
+    activeScaffoldSession?.phase !== "paused" &&
+    activeScaffoldSession?.terminal !== true;
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
   const activeEnvironmentUnavailableState = useMemo<EnvironmentUnavailableState | null>(() => {
     if (!activeEnvironmentUnavailable || !activeEnvironmentUnavailableLabel || !activeEnvironment) {
@@ -1921,6 +1922,7 @@ function ChatViewContent(props: ChatViewProps) {
     thread: activeThread,
     selectedProvider: selectedProviderByThreadId,
     threadProvider,
+    forcedProvider: scaffoldSessionUi === null ? null : "omp",
   });
   // Once a thread selects an environment, never substitute the primary
   // environment's config while the selected environment is still loading.
@@ -2800,6 +2802,8 @@ function ChatViewContent(props: ChatViewProps) {
   // bound to a connected target. Stable command ids keep remount retries safe.
   const scaffoldPendingTurnMode = resolveScaffoldPendingTurnMode({
     hasScaffoldDraft: effectiveScaffoldSession !== null,
+    scaffoldPhase: effectiveScaffoldSession?.phase ?? null,
+    terminal: effectiveScaffoldSession?.terminal === true,
     boundToTarget: scaffoldDraftBoundToTarget,
     targetConnected: activeEnvironmentConnectionPhase === "connected",
   });
@@ -4961,13 +4965,23 @@ function ChatViewContent(props: ChatViewProps) {
       );
       return;
     }
-    const scaffoldDeliveryDeferred =
-      !scaffoldDraftBoundToTarget ||
-      scaffoldSessionBusy ||
-      activeScaffoldSession?.phase === "paused" ||
-      activeScaffoldSession?.phase === "resuming" ||
-      activeProject === null;
-    if (activeScaffoldSession?.phase === "paused") {
+    const scaffoldSendDecision = resolveScaffoldSendDecision({
+      hasScaffoldSession: effectiveScaffoldSession !== null,
+      scaffoldPhase: effectiveScaffoldSession?.phase ?? null,
+      terminal: effectiveScaffoldSession?.terminal === true,
+      boundToTarget: scaffoldDraftBoundToTarget,
+      targetConnected: activeEnvironmentConnectionPhase === "connected",
+      hasProject: activeProject !== null,
+    });
+    if (scaffoldSendDecision.blocked) {
+      setThreadError(
+        activeThread.id,
+        effectiveScaffoldSession?.error ?? "This Scaffold session has ended. Start a new session.",
+      );
+      return;
+    }
+    const scaffoldDeliveryDeferred = scaffoldSendDecision.deliveryDeferred;
+    if (scaffoldSendDecision.shouldResume && activeScaffoldSession) {
       const scaffoldUi = useScaffoldSessionUiStore.getState();
       scaffoldUi.setPhase(activeScaffoldSession.draftId, "resuming");
       void handleReconnectActiveEnvironment(activeThread.environmentId);
@@ -6400,16 +6414,24 @@ function ChatViewContent(props: ChatViewProps) {
                                       scaffoldDraftTarget: {
                                         deployment: scaffoldSessionUi.deployment,
                                         phase: scaffoldSessionUi.phase,
+                                        connectionPhase: activeEnvironmentConnectionPhase,
                                         replacementRequired:
                                           scaffoldSessionUi.error ===
                                           SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE,
+                                        retryable:
+                                          scaffoldSessionUi.terminal !== true &&
+                                          scaffoldSessionUi.error !==
+                                            SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE,
                                       },
                                       scaffoldDraftRetrying:
                                         retryingScaffoldActionId === scaffoldSessionUi.actionId,
                                       ...(scaffoldSessionUi.error ===
                                       SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE
                                         ? { onReplaceScaffoldDraft }
-                                        : { onRetryScaffoldDraft }),
+                                        : scaffoldSessionUi.error ===
+                                            SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE
+                                          ? {}
+                                          : { onRetryScaffoldDraft }),
                                     }
                                   : {})}
                               />

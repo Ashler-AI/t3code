@@ -2,12 +2,18 @@ import {
   EnvironmentId,
   ScaffoldCreateAndPrepareInput,
   ScaffoldEnvironmentBinding,
+  ScaffoldObserveInput,
   ScaffoldPreparedConnection,
   ScaffoldSessionLinks,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS, requestScaffoldPreparedConnection } from "./scaffold";
+import {
+  DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS,
+  requestScaffoldDeploymentCapabilities,
+  requestScaffoldPreparedConnection,
+  requestScaffoldSessionObservation,
+} from "./scaffold";
 
 const prepared = new ScaffoldPreparedConnection({
   binding: new ScaffoldEnvironmentBinding({
@@ -31,6 +37,66 @@ const prepared = new ScaffoldPreparedConnection({
 });
 
 describe("Scaffold connection lifecycle client", () => {
+  it("observes a session through the authenticated no-store local route", async () => {
+    const calls: Array<readonly [RequestInfo | URL, RequestInit | undefined]> = [];
+    const observation = await requestScaffoldSessionObservation(
+      new ScaffoldObserveInput({ deployment: "staging", sessionId: "ses_stopped" }),
+      async (request, init) => {
+        calls.push([request, init]);
+        return Response.json({
+          sessionId: "ses_stopped",
+          status: "stopped",
+          lifecycleEpoch: 4,
+        });
+      },
+      "http://127.0.0.1:3773/api/scaffold/observation",
+    );
+
+    expect(observation).toMatchObject({
+      sessionId: "ses_stopped",
+      status: "stopped",
+      lifecycleEpoch: 4,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.[1]).toMatchObject({
+      method: "POST",
+      credentials: "include",
+      cache: "no-store",
+    });
+    expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual({
+      deployment: "staging",
+      sessionId: "ses_stopped",
+    });
+  });
+
+  it("loads the server-probed deployment capability projection", async () => {
+    const calls: Array<readonly [RequestInfo | URL, RequestInit | undefined]> = [];
+    const capabilities = await requestScaffoldDeploymentCapabilities(async (request, init) => {
+      calls.push([request, init]);
+      return Response.json({
+        deployments: [
+          {
+            deployment: "staging",
+            status: "available",
+            description: "New Scaffold sandbox",
+          },
+          {
+            deployment: "production",
+            status: "unsupported",
+            description: "Agent sessions are not available in this deployment",
+          },
+        ],
+      });
+    }, "http://127.0.0.1:3773/api/scaffold/deployments");
+
+    expect(capabilities.deployments.map(({ deployment, status }) => [deployment, status])).toEqual([
+      ["staging", "available"],
+      ["production", "unsupported"],
+    ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.[1]).toMatchObject({ method: "GET", credentials: "include" });
+  });
+
   it("keeps the browser deadline above the server readiness window", () => {
     expect(DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS).toBeGreaterThan(60_000);
   });

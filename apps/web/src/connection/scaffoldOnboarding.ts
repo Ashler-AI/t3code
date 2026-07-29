@@ -7,7 +7,6 @@ import {
 } from "@t3tools/client-runtime/connection";
 import {
   ScaffoldLifecycleGateway,
-  mapScaffoldLifecycleError,
   scaffoldTargetFromBinding,
 } from "@t3tools/client-runtime/scaffold";
 import {
@@ -74,16 +73,14 @@ export const registerScaffoldEnvironment = Effect.fn("web.scaffold.registerEnvir
   }) {
     const gateway = yield* ScaffoldLifecycleGateway;
     const registry = yield* EnvironmentRegistry;
-    const prepared = yield* gateway
-      .create(
-        new ScaffoldCreateAndPrepareInput({
-          deployment: input.deployment,
-          operationId: input.operationId,
-          sessionId: input.sessionId,
-          create: input.create,
-        }),
-      )
-      .pipe(Effect.mapError(mapScaffoldLifecycleError));
+    const prepared = yield* gateway.create(
+      new ScaffoldCreateAndPrepareInput({
+        deployment: input.deployment,
+        operationId: input.operationId,
+        sessionId: input.sessionId,
+        create: input.create,
+      }),
+    );
     if (prepared.binding.deployment !== input.deployment) {
       return yield* new ConnectionBlockedError({
         reason: "configuration",

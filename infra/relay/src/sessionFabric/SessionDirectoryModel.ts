@@ -2,7 +2,7 @@ import type {
   SessionFabricSearchResult,
   SessionFabricSessionRecord,
 } from "@t3tools/contracts/session-fabric";
-import { isPublicScaffoldSessionRecord } from "@t3tools/shared/sessionFabricCapability";
+import { isPublicSessionRecord } from "@t3tools/shared/sessionFabricCapability";
 
 export interface SessionDirectorySearchEntry {
   readonly session: SessionFabricSessionRecord;
@@ -64,7 +64,7 @@ export function rankSessionDirectoryEntries(input: {
   readonly limit: number;
 }): ReadonlyArray<SessionFabricSearchResult> {
   return input.entries
-    .filter((entry) => isPublicScaffoldSessionRecord(entry.session))
+    .filter((entry) => isPublicSessionRecord(entry.session))
     .map((entry) => {
       const lexical = lexicalSimilarity(input.query, entry.session.searchableText);
       const semantic =

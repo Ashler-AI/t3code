@@ -420,6 +420,22 @@ function awaitConnectionState(
 }
 
 describe("EnvironmentRegistry", () => {
+  it.effect("marks platform topology authoritative only after reconciliation", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+
+        expect(yield* SubscriptionRef.get(registry.platformReconciled)).toBe(false);
+
+        yield* registry.reconcilePlatform([]);
+
+        expect(yield* SubscriptionRef.get(registry.platformReconciled)).toBe(true);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("hydrates connection profiles into catalog entries", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness([SSH_CONNECTION], [SSH_PROFILE]);

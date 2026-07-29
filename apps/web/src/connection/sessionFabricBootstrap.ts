@@ -6,6 +6,18 @@ import {
 
 const SESSION_FABRIC_ENVIRONMENT_PREFIX = "session-fabric:";
 
+export function sessionFabricRoutePath(input: {
+  readonly sessionId: string;
+  readonly threadId: string;
+  readonly runtimeBasePath?: string;
+}): string {
+  const runtimeBasePath = (input.runtimeBasePath ?? "").replace(/\/+$/, "");
+  const environmentSegment = encodeURIComponent(
+    `${SESSION_FABRIC_ENVIRONMENT_PREFIX}${input.sessionId}`,
+  );
+  return `${runtimeBasePath}/${environmentSegment}/${encodeURIComponent(input.threadId)}`;
+}
+
 function pathnameWithinRuntimeBase(pathname: string, runtimeBasePath: string): string | null {
   const normalizedBasePath = runtimeBasePath.replace(/\/+$/, "");
   if (!normalizedBasePath) return pathname;

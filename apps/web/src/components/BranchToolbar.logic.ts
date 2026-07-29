@@ -1,4 +1,5 @@
 import type { EnvironmentId, ProjectId, ScaffoldDeployment, VcsRef } from "@t3tools/contracts";
+import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import * as Schema from "effect/Schema";
 import { toSortableTimestamp } from "../lib/threadSort";
 export {
@@ -60,10 +61,15 @@ export function resolveEnvModeLabel(mode: EnvMode): string {
 
 export type ScaffoldDraftPhase = "creating" | "ready" | "resuming" | "paused" | "failed";
 
+export const SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE =
+  "Agent sessions are not available in this Scaffold deployment.";
+
 export function resolveScaffoldDraftTargetPresentation(input: {
   deployment: ScaffoldDeployment;
   phase: ScaffoldDraftPhase;
+  connectionPhase?: EnvironmentConnectionPhase;
   replacementRequired?: boolean;
+  retryable?: boolean;
 }): { targetLabel: string; statusLabel: string; actionLabel: string | null } {
   if (input.replacementRequired) {
     return {
@@ -74,19 +80,25 @@ export function resolveScaffoldDraftTargetPresentation(input: {
   }
   const targetLabel = input.deployment === "staging" ? "Scaffold staging" : "Scaffold production";
   const statusLabel =
-    input.phase === "creating"
-      ? "Starting"
-      : input.phase === "resuming"
-        ? "Resuming"
-        : input.phase === "paused"
-          ? "Paused"
-          : input.phase === "failed"
-            ? "Failed"
-            : "Ready";
+    input.phase === "ready" && input.connectionPhase === "error"
+      ? "Unavailable"
+      : input.phase === "ready" &&
+          input.connectionPhase !== undefined &&
+          input.connectionPhase !== "connected"
+        ? "Reconnecting"
+        : input.phase === "creating"
+          ? "Starting"
+          : input.phase === "resuming"
+            ? "Resuming"
+            : input.phase === "paused"
+              ? "Paused"
+              : input.phase === "failed"
+                ? "Failed"
+                : "Ready";
   return {
     targetLabel,
     statusLabel,
-    actionLabel: input.phase === "failed" ? "Retry" : null,
+    actionLabel: input.phase === "failed" && input.retryable !== false ? "Retry" : null,
   };
 }
 
@@ -150,11 +162,49 @@ export type ScaffoldPendingTurnMode = "none" | "hydrate" | "drain";
 
 export function resolveScaffoldPendingTurnMode(input: {
   hasScaffoldDraft: boolean;
+  scaffoldPhase: ScaffoldDraftPhase | null;
+  terminal?: boolean;
   boundToTarget: boolean;
   targetConnected: boolean;
 }): ScaffoldPendingTurnMode {
   if (!input.hasScaffoldDraft) return "none";
-  return input.boundToTarget && input.targetConnected ? "drain" : "hydrate";
+  return input.terminal !== true &&
+    input.scaffoldPhase === "ready" &&
+    input.boundToTarget &&
+    input.targetConnected
+    ? "drain"
+    : "hydrate";
+}
+
+export interface ScaffoldSendDecision {
+  readonly blocked: boolean;
+  readonly deliveryDeferred: boolean;
+  readonly shouldResume: boolean;
+}
+
+export function resolveScaffoldSendDecision(input: {
+  hasScaffoldSession: boolean;
+  scaffoldPhase: ScaffoldDraftPhase | null;
+  terminal?: boolean;
+  boundToTarget: boolean;
+  targetConnected: boolean;
+  hasProject: boolean;
+}): ScaffoldSendDecision {
+  if (!input.hasScaffoldSession) {
+    return { blocked: false, deliveryDeferred: false, shouldResume: false };
+  }
+  if (input.terminal === true) {
+    return { blocked: true, deliveryDeferred: true, shouldResume: false };
+  }
+  return {
+    blocked: false,
+    deliveryDeferred:
+      input.scaffoldPhase !== "ready" ||
+      !input.boundToTarget ||
+      !input.targetConnected ||
+      !input.hasProject,
+    shouldResume: input.scaffoldPhase === "paused",
+  };
 }
 
 export function mergeQueuedScaffoldMessages<
@@ -174,11 +224,10 @@ export function mergeQueuedScaffoldMessages<
 }
 
 export function shouldIgnoreSourceEnvironmentForScaffoldDraft(input: {
-  scaffoldEnvironmentId: EnvironmentId | null | undefined;
-  scaffoldPhase: ScaffoldDraftPhase | null;
+  hasScaffoldDraft: boolean;
+  boundToTarget: boolean;
 }): boolean {
-  if (input.scaffoldEnvironmentId !== null) return false;
-  return input.scaffoldPhase === "creating" || input.scaffoldPhase === "resuming";
+  return input.hasScaffoldDraft && !input.boundToTarget;
 }
 
 export function resolveCurrentWorkspaceLabel(activeWorktreePath: string | null): string {

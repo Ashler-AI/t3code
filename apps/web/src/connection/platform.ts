@@ -47,6 +47,7 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
 
 import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
+import { reauthenticatePrimaryEnvironment } from "../environments/primary/auth";
 import { readRuntimeBasePath, resolveRuntimePathname } from "../runtimeBasePath";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import {
@@ -220,13 +221,35 @@ const capabilitiesLayer = Layer.effectContext(
     });
     const primaryAuth = PrimaryEnvironmentAuth.of({
       bearerToken: Effect.tryPromise({
-        try: readDesktopPrimaryBearerToken,
+        try: async () => {
+          const bearerToken = await readDesktopPrimaryBearerToken();
+          if (bearerToken !== null) {
+            return { bearerToken, authenticated: true } as const;
+          }
+
+          const gateState = await reauthenticatePrimaryEnvironment();
+          return {
+            bearerToken: null,
+            authenticated: gateState.status === "authenticated",
+          } as const;
+        },
         catch: (cause) =>
           new ConnectionTransientError({
             reason: "remote-unavailable",
-            detail: `Could not load the desktop primary credential: ${String(cause)}`,
+            detail: `Could not refresh the primary environment credential: ${String(cause)}`,
           }),
-      }).pipe(Effect.map(Option.fromNullishOr)),
+      }).pipe(
+        Effect.flatMap(({ authenticated, bearerToken }) =>
+          authenticated
+            ? Effect.succeed(Option.fromNullishOr(bearerToken))
+            : Effect.fail(
+                new ConnectionBlockedError({
+                  reason: "authentication",
+                  detail: "Authenticate with the primary environment to reconnect.",
+                }),
+              ),
+        ),
+      ),
     });
     const ssh = SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(function* (target) {
@@ -492,8 +515,7 @@ const platformConnectionSourceLayer = Layer.effect(
     });
     if (isHostedStaticApp()) {
       return PlatformConnectionSource.of({
-        registrations:
-          fabricRegistration === null ? Stream.empty : Stream.succeed([fabricRegistration]),
+        registrations: Stream.succeed(fabricRegistration === null ? [] : [fabricRegistration]),
       });
     }
     const cacheRef = yield* Ref.make(new Map<string, CachedPlatformRegistration>());

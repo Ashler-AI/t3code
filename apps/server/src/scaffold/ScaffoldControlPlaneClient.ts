@@ -7,6 +7,7 @@ import {
   ScaffoldLifecycleError,
   ScaffoldSessionObservation,
   ScaffoldSessionStatus,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -38,6 +39,13 @@ export type ScaffoldSessionFabricCapabilityInput =
       readonly fabricSessionId: SessionFabricSessionId;
       readonly scaffoldSessionId: string;
       readonly scaffoldLifecycleEpoch: number;
+    }
+  | {
+      readonly role: "controller";
+      readonly fabricSessionId: SessionFabricSessionId;
+      readonly environmentKind: "local";
+      readonly environmentId: EnvironmentId;
+      readonly threadId: ThreadId;
     };
 
 export interface ScaffoldRunnerCapabilityInput {
@@ -172,33 +180,51 @@ function validateCapabilityGrant(
   ) {
     throw invalidCapability();
   }
+  const scaffoldBindings = "environmentKind" in grant.bindings ? null : grant.bindings;
   if (input.role === "viewer") {
     if (
+      scaffoldBindings === null ||
       !hasExactScopes(grant.scopes, ["directory:read", "session:read"]) ||
-      grant.bindings.fabricSessionId !== undefined ||
-      grant.bindings.scaffoldSessionId !== undefined ||
-      grant.bindings.scaffoldLifecycleEpoch !== undefined
+      scaffoldBindings.fabricSessionId !== undefined ||
+      scaffoldBindings.scaffoldSessionId !== undefined ||
+      scaffoldBindings.scaffoldLifecycleEpoch !== undefined
     ) {
       throw invalidCapability();
     }
     return grant;
   }
   if (input.role === "controller") {
+    if ("environmentKind" in input) {
+      const localBindings = "environmentKind" in grant.bindings ? grant.bindings : null;
+      if (
+        localBindings === null ||
+        !hasExactScopes(grant.scopes, ["session:read", "session:command"]) ||
+        localBindings.fabricSessionId !== input.fabricSessionId ||
+        localBindings.environmentKind !== "local" ||
+        localBindings.environmentId !== input.environmentId ||
+        localBindings.threadId !== input.threadId
+      ) {
+        throw invalidCapability();
+      }
+      return grant;
+    }
     if (
+      scaffoldBindings === null ||
       !hasExactScopes(grant.scopes, ["session:read", "session:command"]) ||
-      grant.bindings.fabricSessionId !== input.fabricSessionId ||
-      grant.bindings.scaffoldSessionId !== input.scaffoldSessionId ||
-      grant.bindings.scaffoldLifecycleEpoch !== input.scaffoldLifecycleEpoch
+      scaffoldBindings.fabricSessionId !== input.fabricSessionId ||
+      scaffoldBindings.scaffoldSessionId !== input.scaffoldSessionId ||
+      scaffoldBindings.scaffoldLifecycleEpoch !== input.scaffoldLifecycleEpoch
     ) {
       throw invalidCapability();
     }
     return grant;
   }
   if (
+    scaffoldBindings === null ||
     !hasExactScopes(grant.scopes, ["session:publish", "session:execute"]) ||
-    grant.bindings.fabricSessionId !== undefined ||
-    grant.bindings.scaffoldSessionId !== input.scaffoldSessionId ||
-    grant.bindings.scaffoldLifecycleEpoch !== input.lifecycleEpoch
+    scaffoldBindings.fabricSessionId !== undefined ||
+    scaffoldBindings.scaffoldSessionId !== input.scaffoldSessionId ||
+    scaffoldBindings.scaffoldLifecycleEpoch !== input.lifecycleEpoch
   ) {
     throw invalidCapability();
   }
@@ -406,6 +432,19 @@ export function makeScaffoldControlPlaneClient(options: {
   return {
     deployment: options.target.deployment as ScaffoldDeployment,
     baseUrl: options.target.baseUrl,
+    probeSessionCollection: async (): Promise<void> => {
+      const body = record(
+        await request(`${options.target.collectionPath}?limit=1&offset=0&showStopped=true`),
+      );
+      if (!Array.isArray(body?.sessions)) {
+        throw new ScaffoldLifecycleError({
+          reason: "invalid_response",
+          message: "Scaffold returned an invalid session collection.",
+          status: 502,
+          code: "scaffold_invalid_session_collection",
+        });
+      }
+    },
     createSession,
     getSession: async (sessionId: string) =>
       expectObservation(

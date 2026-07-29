@@ -152,6 +152,20 @@ export function prepareOmpLoginBrowserWindow(
   };
 }
 
+/**
+ * Treat a closed provider window as presentation context only. Some embedded
+ * browsers close a preopened tab after navigation even though the same flow can
+ * still finish through the visible fallback link or manual code input.
+ */
+export async function observeOmpLoginBrowserWindowClose(
+  browserWindow: PreparedOmpLoginBrowserWindow,
+  signal: AbortSignal,
+  onClosed: () => void,
+  pollIntervalMs?: number,
+): Promise<void> {
+  if (await browserWindow.waitUntilClosed(signal, pollIntervalMs)) onClosed();
+}
+
 export function describeOmpLoginTerminalFailure(input: {
   readonly message: string | undefined;
   readonly browserWindowClosed: boolean;

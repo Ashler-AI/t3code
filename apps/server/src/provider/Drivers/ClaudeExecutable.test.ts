@@ -24,6 +24,22 @@ function withWindowsResolution(input: {
 }
 
 describe("resolveClaudeSdkExecutablePath", () => {
+  it.effect("finds the native Claude launcher outside a macOS GUI application's PATH", () =>
+    Effect.gen(function* () {
+      const nativeBinary = "/Users/test/.local/bin/claude";
+      expect(
+        yield* resolveClaudeSdkExecutablePath("claude", {
+          HOME: "/Users/test",
+          PATH: "/usr/bin:/bin",
+        }).pipe(
+          Effect.provideService(HostProcessPlatform, "darwin"),
+          Effect.provideService(SpawnExecutableResolution, () => undefined),
+          Effect.provideService(ClaudeExecutableFileCheck, (filePath) => filePath === nativeBinary),
+        ),
+      ).toBe(nativeBinary);
+    }),
+  );
+
   it.effect("returns the configured path unchanged on non-Windows platforms", () =>
     Effect.gen(function* () {
       expect(

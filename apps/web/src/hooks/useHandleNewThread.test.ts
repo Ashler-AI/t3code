@@ -165,10 +165,40 @@ describe("resolveScaffoldDraftModelSelection", () => {
   ];
 
   it.each([
-    { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.6-sol" },
-    { instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude-sonnet-5" },
-  ])("replaces a direct-provider source with the OMP default", (sourceSelection) => {
-    expect(resolveScaffoldDraftModelSelection(providers, sourceSelection)).toEqual({
+    {
+      sourceSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-5.6-sol",
+        options: [{ id: "reasoning_effort", value: "high" }],
+      },
+      targetModel: "openai/gpt-5.6-sol",
+    },
+    {
+      sourceSelection: {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-sonnet-5",
+        options: [{ id: "reasoning_effort", value: "high" }],
+      },
+      targetModel: "anthropic/claude-sonnet-5",
+    },
+  ])(
+    "translates a direct-provider source to the matching OMP route",
+    ({ sourceSelection, targetModel }) => {
+      expect(resolveScaffoldDraftModelSelection(providers, sourceSelection)).toEqual({
+        ...sourceSelection,
+        instanceId: "omp",
+        model: targetModel,
+      });
+    },
+  );
+
+  it("uses the OMP default when a direct-provider model has no unique route", () => {
+    expect(
+      resolveScaffoldDraftModelSelection(providers, {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "gpt-unknown",
+      }),
+    ).toEqual({
       instanceId: "omp",
       model: "openai/gpt-5.6-sol",
     });

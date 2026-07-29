@@ -1,6 +1,8 @@
 import type {
   SessionFabricCapabilityClaims,
   SessionFabricExecutionLocation,
+  SessionFabricLocalControllerAuthorityBinding,
+  SessionFabricLocalAuthorityBinding,
   SessionFabricRunnerHello,
   SessionFabricSessionRecord,
   SessionFabricSessionId,
@@ -240,6 +242,82 @@ export function isPublicScaffoldSessionRecord(record: SessionFabricSessionRecord
   return record.publication === "public" && isPublicScaffoldViewLocation(record.location);
 }
 
+export function isPublicLocalLocation(
+  location: SessionFabricExecutionLocation,
+): location is SessionFabricExecutionLocation & { readonly environmentKind: "local" } {
+  return (
+    location.environmentKind === "local" &&
+    location.scaffoldSessionId === null &&
+    location.scaffoldSessionUrl === null &&
+    (location.scaffoldLifecycleEpoch === null || location.scaffoldLifecycleEpoch === undefined)
+  );
+}
+
+export function isPublicSessionRecord(record: SessionFabricSessionRecord): boolean {
+  return (
+    record.publication === "public" &&
+    (isPublicScaffoldViewLocation(record.location) || isPublicLocalLocation(record.location))
+  );
+}
+
+export function isPublicSessionSnapshot(snapshot: SessionFabricSnapshot): boolean {
+  return isPublicSessionRecord(snapshot.session);
+}
+
+export function isLocalSessionFabricCapability(
+  claims: SessionFabricCapabilityClaims,
+): claims is Extract<SessionFabricCapabilityClaims, { readonly environmentKind: "local" }> {
+  return "environmentKind" in claims && claims.environmentKind === "local";
+}
+
+export function localCapabilityBinding(
+  claims: SessionFabricCapabilityClaims,
+): SessionFabricLocalAuthorityBinding | SessionFabricLocalControllerAuthorityBinding | null {
+  if (!isLocalSessionFabricCapability(claims)) return null;
+  return {
+    fabricSessionId: claims.fabricSessionId,
+    environmentKind: claims.environmentKind,
+    environmentId: claims.environmentId,
+    threadId: claims.threadId,
+    actorId: claims.actorId,
+    ...("runnerId" in claims ? { runnerId: claims.runnerId } : {}),
+  };
+}
+
+export function localCapabilityMatchesAuthority(input: {
+  readonly claims: SessionFabricCapabilityClaims;
+  readonly sessionId: SessionFabricSessionId;
+  readonly environmentId: SessionFabricExecutionLocation["environmentId"];
+  readonly threadId: SessionFabricExecutionLocation["threadId"];
+  readonly actorId: string;
+}): boolean {
+  const binding = localCapabilityBinding(input.claims);
+  return (
+    binding !== null &&
+    binding.fabricSessionId === input.sessionId &&
+    binding.environmentId === input.environmentId &&
+    binding.threadId === input.threadId &&
+    binding.actorId === input.actorId
+  );
+}
+
+export function localRunnerCapabilityMatchesAuthority(input: {
+  readonly claims: SessionFabricCapabilityClaims;
+  readonly sessionId: SessionFabricSessionId;
+  readonly environmentId: SessionFabricExecutionLocation["environmentId"];
+  readonly threadId: SessionFabricExecutionLocation["threadId"];
+  readonly runnerId: string;
+  readonly actorId: string;
+}): boolean {
+  const binding = localCapabilityBinding(input.claims);
+  return (
+    binding !== null &&
+    "runnerId" in binding &&
+    localCapabilityMatchesAuthority(input) &&
+    binding.runnerId === input.runnerId
+  );
+}
+
 export function capabilityCanListDirectory(claims: SessionFabricCapabilityClaims): boolean {
   return claims.role === "viewer";
 }
@@ -248,9 +326,17 @@ export function capabilityCanReadSession(
   claims: SessionFabricCapabilityClaims,
   snapshot: SessionFabricSnapshot,
 ): boolean {
-  if (!isPublicScaffoldSnapshot(snapshot)) return false;
+  if (!isPublicSessionSnapshot(snapshot)) return false;
   if (claims.role === "viewer") return true;
   if (claims.role !== "controller") return false;
+  if (isLocalSessionFabricCapability(claims)) {
+    return (
+      isPublicLocalLocation(snapshot.session.location) &&
+      claims.fabricSessionId === snapshot.session.sessionId &&
+      claims.environmentId === snapshot.session.location.environmentId &&
+      claims.threadId === snapshot.session.location.threadId
+    );
+  }
   return (
     claims.fabricSessionId === snapshot.session.sessionId &&
     claims.scaffoldSessionId === snapshot.session.location.scaffoldSessionId &&
@@ -262,8 +348,24 @@ export function capabilityCanControlSession(input: {
   readonly claims: SessionFabricCapabilityClaims;
   readonly sessionId: SessionFabricSessionId;
   readonly location: SessionFabricExecutionLocation;
+  readonly localAuthority?: {
+    readonly actorId: string;
+  };
 }): boolean {
   const { claims, sessionId, location } = input;
+  if (claims.role === "controller" && isLocalSessionFabricCapability(claims)) {
+    return (
+      input.localAuthority !== undefined &&
+      isPublicLocalLocation(location) &&
+      localCapabilityMatchesAuthority({
+        claims,
+        sessionId,
+        environmentId: location.environmentId,
+        threadId: location.threadId,
+        actorId: input.localAuthority.actorId,
+      })
+    );
+  }
   return (
     claims.role === "controller" &&
     isPublicScaffoldLocation(location) &&
@@ -277,6 +379,16 @@ export function capabilityCanRunSession(
   claims: SessionFabricCapabilityClaims,
   hello: SessionFabricRunnerHello,
 ): boolean {
+  if (claims.role === "runner" && isLocalSessionFabricCapability(claims)) {
+    return (
+      hello.publication === "public" &&
+      isPublicLocalLocation(hello.location) &&
+      claims.fabricSessionId === hello.sessionId &&
+      claims.environmentId === hello.location.environmentId &&
+      claims.threadId === hello.location.threadId &&
+      claims.runnerId === hello.runnerId
+    );
+  }
   return (
     claims.role === "runner" &&
     hello.publication === "public" &&
