@@ -20,6 +20,9 @@ import {
   capabilityCanControlSession,
   capabilityCanReadSession,
   capabilityCanRunSession,
+  isPublicLocalLocation,
+  isPublicSessionRecord,
+  localRunnerCapabilityMatchesAuthority,
   isPublicScaffoldLocation,
   isPublicScaffoldSnapshot,
   isPublicScaffoldViewLocation,
@@ -323,7 +326,7 @@ describe("session fabric capabilities", () => {
     ).toBe(false);
   });
 
-  it("never exposes local sessions to a global viewer", () => {
+  it("lets authenticated viewers read public local sessions but hides local-only sessions", () => {
     const localSnapshot = {
       session: {
         publication: "public",
@@ -331,11 +334,100 @@ describe("session fabric capabilities", () => {
           ...location,
           environmentKind: "local",
           scaffoldSessionId: null,
+          scaffoldSessionUrl: null,
           scaffoldLifecycleEpoch: null,
         },
       },
-    } as never;
-    expect(capabilityCanReadSession(viewer, localSnapshot)).toBe(false);
+    } as unknown as SessionFabricSnapshot;
+    expect(isPublicLocalLocation(localSnapshot.session.location)).toBe(true);
+    expect(isPublicSessionRecord(localSnapshot.session)).toBe(true);
+    expect(capabilityCanReadSession(viewer, localSnapshot)).toBe(true);
+    expect(
+      capabilityCanReadSession(viewer, {
+        ...localSnapshot,
+        session: { ...localSnapshot.session, publication: "local_only" },
+      }),
+    ).toBe(false);
+  });
+
+  it("binds a local runner capability to one actor, environment, thread, runner, and session", () => {
+    const localClaims = {
+      ...base,
+      role: "runner",
+      scopes: ["session:publish", "session:execute"],
+      fabricSessionId: SessionFabricSessionId.make("sf:local:thread"),
+      environmentKind: "local",
+      environmentId: EnvironmentId.make("environment-local"),
+      threadId: ThreadId.make("thread-local"),
+      runnerId: SessionFabricRunnerId.make("runner:environment-local"),
+      actorId: "user-1",
+    } as const satisfies SessionFabricCapabilityClaims;
+    expect(
+      localRunnerCapabilityMatchesAuthority({
+        claims: localClaims,
+        sessionId: localClaims.fabricSessionId,
+        environmentId: localClaims.environmentId,
+        threadId: localClaims.threadId,
+        runnerId: localClaims.runnerId,
+        actorId: localClaims.actorId,
+      }),
+    ).toBe(true);
+    expect(
+      localRunnerCapabilityMatchesAuthority({
+        claims: localClaims,
+        sessionId: localClaims.fabricSessionId,
+        environmentId: localClaims.environmentId,
+        threadId: localClaims.threadId,
+        runnerId: localClaims.runnerId,
+        actorId: "user-other",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not let a local controller name a runner or cross an environment or thread", () => {
+    const controller = {
+      ...base,
+      role: "controller",
+      scopes: ["session:read", "session:command"],
+      fabricSessionId: SessionFabricSessionId.make("sf:local:thread-local"),
+      environmentKind: "local",
+      environmentId: EnvironmentId.make("environment-local"),
+      threadId: ThreadId.make("thread-local"),
+      actorId: "user-1",
+    } as const satisfies SessionFabricCapabilityClaims;
+    const location = {
+      environmentKind: "local",
+      environmentId: controller.environmentId,
+      threadId: controller.threadId,
+      scaffoldSessionId: null,
+      scaffoldSessionUrl: null,
+      scaffoldLifecycleEpoch: null,
+    } as unknown as SessionFabricSnapshot["session"]["location"];
+    expect(
+      capabilityCanControlSession({
+        claims: controller,
+        sessionId: controller.fabricSessionId,
+        location,
+        localAuthority: { actorId: "user-1" },
+      }),
+    ).toBe(true);
+    expect(
+      capabilityCanControlSession({
+        claims: controller,
+        sessionId: controller.fabricSessionId,
+        location: { ...location, threadId: ThreadId.make("thread-other") },
+        localAuthority: { actorId: "user-1" },
+      }),
+    ).toBe(false);
+    expect(
+      capabilityCanControlSession({
+        claims: controller,
+        sessionId: controller.fabricSessionId,
+        location: { ...location, environmentId: EnvironmentId.make("environment-other") },
+        localAuthority: { actorId: "user-1" },
+      }),
+    ).toBe(false);
+    expect("runnerId" in controller).toBe(false);
   });
 
   it.effect("accepts current and previous verifier keys but rejects an empty key set", () =>

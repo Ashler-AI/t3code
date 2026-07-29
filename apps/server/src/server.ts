@@ -23,6 +23,8 @@ import {
   makeScaffoldSessionTransferRouteLayer,
   makeScaffoldWorkspaceMigrationImportRouteLayer,
   makeScaffoldRetentionCaptureRouteLayer,
+  scaffoldDeploymentCapabilitiesRouteLayer,
+  scaffoldObserveSessionRouteLayer,
   scaffoldPrepareConnectionRouteLayer,
   scaffoldSessionFabricCapabilityRouteLayer,
 } from "./http.ts";
@@ -503,6 +505,8 @@ export const makeRoutesLayer = Layer.mergeAll(
       Layer.provide(environmentAuthenticatedAuthLayer),
     ),
     otlpTracesProxyRouteLayer,
+    scaffoldDeploymentCapabilitiesRouteLayer,
+    scaffoldObserveSessionRouteLayer,
     scaffoldPrepareConnectionRouteLayer,
     scaffoldSessionFabricCapabilityRouteLayer,
     assetRouteLayer,

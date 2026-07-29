@@ -50,6 +50,27 @@ export type ThreadTraversalDirection = "previous" | "next";
 export interface ProvisionalDraftRow {
   readonly draftId: DraftId;
   readonly draftThread: DraftThreadState;
+  readonly isPending: boolean;
+}
+
+export interface ProvisionalDraftPresentation {
+  readonly statusLabel: string | null;
+  readonly detail: string;
+}
+
+export function resolveProvisionalDraftPresentation(
+  row: ProvisionalDraftRow,
+): ProvisionalDraftPresentation {
+  if (!row.isPending) {
+    return { statusLabel: null, detail: "Draft saved" };
+  }
+  return {
+    statusLabel: "Local session is starting",
+    detail:
+      row.draftThread.envMode === "worktree"
+        ? "Preparing worktree..."
+        : "Starting local session...",
+  };
 }
 
 /**
@@ -60,11 +81,13 @@ export function selectProvisionalDraftRows(input: {
   draftThreadsByDraftId: Readonly<Record<string, DraftThreadState>>;
   scaffoldDraftIds: ReadonlySet<string>;
   materializedThreadKeys: ReadonlySet<string>;
+  pendingDraftIds: ReadonlySet<string>;
   scopedProjectKeys: ReadonlySet<string> | null;
 }): ProvisionalDraftRow[] {
   return Object.entries(input.draftThreadsByDraftId)
     .flatMap(([draftId, draftThread]) => {
       if (input.scaffoldDraftIds.has(draftId)) return [];
+      if (draftThread.promotedTo) return [];
       if (
         input.materializedThreadKeys.has(
           scopedThreadKey(scopeThreadRef(draftThread.environmentId, draftThread.threadId)),
@@ -78,11 +101,31 @@ export function selectProvisionalDraftRows(input: {
       ) {
         return [];
       }
-      return [{ draftId: draftId as DraftId, draftThread }];
+      return [
+        {
+          draftId: draftId as DraftId,
+          draftThread,
+          isPending: input.pendingDraftIds.has(draftId),
+        },
+      ];
     })
     .toSorted((left, right) =>
       left.draftThread.createdAt.localeCompare(right.draftThread.createdAt),
     );
+}
+
+export function selectScaffoldDraftRows<TEntry extends { readonly draftId: string }>(input: {
+  entries: readonly TEntry[];
+  draftThreadsByDraftId: Readonly<Record<string, DraftThreadState>>;
+  materializedThreadKeys: ReadonlySet<string>;
+}): TEntry[] {
+  return input.entries.filter((entry) => {
+    const draftThread = input.draftThreadsByDraftId[entry.draftId];
+    if (!draftThread) return false;
+    const targetThreadRef =
+      draftThread.promotedTo ?? scopeThreadRef(draftThread.environmentId, draftThread.threadId);
+    return !input.materializedThreadKeys.has(scopedThreadKey(targetThreadRef));
+  });
 }
 
 export async function archiveSelectedThreadEntries<
@@ -899,4 +942,19 @@ export function sortScopedProjectsForSidebar<
       left.environmentId.localeCompare(right.environmentId) ||
       left.id.localeCompare(right.id),
   );
+}
+
+export function resolveThreadSettlementPresentation(input: {
+  readonly serverSupportsSettlement: boolean;
+  readonly disconnectedScaffold: boolean;
+  readonly locallySettled: boolean;
+  readonly effectivelySettled: boolean;
+}): { readonly supported: boolean; readonly settled: boolean } {
+  const supported = input.serverSupportsSettlement || input.disconnectedScaffold;
+  return {
+    supported,
+    settled:
+      supported &&
+      (input.locallySettled || (input.serverSupportsSettlement && input.effectivelySettled)),
+  };
 }

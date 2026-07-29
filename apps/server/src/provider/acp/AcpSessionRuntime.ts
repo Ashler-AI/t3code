@@ -267,10 +267,11 @@ type AcpStartState =
     }
   | { readonly _tag: "Started"; readonly result: AcpStartedState };
 
-interface AcpAssistantSegmentState {
+export interface AcpAssistantSegmentState {
   readonly nextSegmentIndex: number;
   readonly activeItemId?: string;
   readonly activeItemType?: "assistant_message" | "reasoning";
+  readonly activeUpstreamMessageId?: string;
 }
 
 interface EnsureActiveAssistantSegmentResult {
@@ -887,7 +888,7 @@ function configOptionCurrentValueMatches(
   return currentValue.trim() === String(value).trim();
 }
 
-const handleSessionUpdate = ({
+export const handleSessionUpdate = ({
   queue,
   modeStateRef,
   configOptionsRef,
@@ -953,7 +954,14 @@ const handleSessionUpdate = ({
         }
         const itemType = event.streamKind === "reasoning_text" ? "reasoning" : "assistant_message";
         const activeSegment = yield* Ref.get(assistantSegmentRef);
-        if (activeSegment.activeItemId && activeSegment.activeItemType !== itemType) {
+        const upstreamMessageChanged =
+          event.itemId !== undefined &&
+          activeSegment.activeUpstreamMessageId !== undefined &&
+          event.itemId !== activeSegment.activeUpstreamMessageId;
+        if (
+          activeSegment.activeItemId &&
+          (activeSegment.activeItemType !== itemType || upstreamMessageChanged)
+        ) {
           yield* closeActiveAssistantSegment({ queue, assistantSegmentRef });
         }
         const itemId = yield* ensureActiveAssistantSegment({
@@ -962,6 +970,7 @@ const handleSessionUpdate = ({
           sessionId: params.sessionId,
           assistantItemRuntimeId,
           itemType,
+          ...(event.itemId !== undefined ? { upstreamMessageId: event.itemId } : {}),
         });
         yield* Queue.offer(queue, {
           ...event,
@@ -1009,18 +1018,25 @@ const ensureActiveAssistantSegment = ({
   sessionId,
   assistantItemRuntimeId,
   itemType,
+  upstreamMessageId,
 }: {
   readonly queue: Queue.Queue<AcpSessionRuntimeEvent>;
   readonly assistantSegmentRef: Ref.Ref<AcpAssistantSegmentState>;
   readonly sessionId: string;
   readonly assistantItemRuntimeId: string;
   readonly itemType: "assistant_message" | "reasoning";
+  readonly upstreamMessageId?: string;
 }) =>
   Ref.modify<AcpAssistantSegmentState, EnsureActiveAssistantSegmentResult>(
     assistantSegmentRef,
     (current) => {
       if (current.activeItemId) {
-        return [{ itemId: current.activeItemId }, current] as const;
+        return [
+          { itemId: current.activeItemId },
+          current.activeUpstreamMessageId === undefined && upstreamMessageId !== undefined
+            ? { ...current, activeUpstreamMessageId: upstreamMessageId }
+            : current,
+        ] as const;
       }
       const itemId = assistantItemId(sessionId, assistantItemRuntimeId, current.nextSegmentIndex);
       return [
@@ -1036,6 +1052,9 @@ const ensureActiveAssistantSegment = ({
           nextSegmentIndex: current.nextSegmentIndex + 1,
           activeItemId: itemId,
           activeItemType: itemType,
+          ...(upstreamMessageId !== undefined
+            ? { activeUpstreamMessageId: upstreamMessageId }
+            : {}),
         } satisfies AcpAssistantSegmentState,
       ] as const;
     },

@@ -53,20 +53,29 @@ export const ClaudeExecutableFileCheck = Context.Reference<ExecutableFileCheck>(
  * `spawn EINVAL`. CLI probes avoid this via `resolveSpawnCommand`, which can
  * fall back to `shell: true`; the SDK offers no such escape hatch.
  *
- * On Windows this resolves the command against PATH/PATHEXT and, when the
- * result is an npm launcher shim, follows it to the real package entry
- * (`bin/claude.exe`, or `cli.js` for older package versions). On other
- * platforms the configured value is returned unchanged.
+ * On macOS and Linux, Claude's native installer places its launcher in
+ * `~/.local/bin`, which is commonly absent from GUI-app PATH values. Resolve
+ * that documented per-user launcher before falling back to the configured
+ * value. On Windows this resolves the command against PATH/PATHEXT and, when
+ * the result is an npm launcher shim, follows it to the real package entry
+ * (`bin/claude.exe`, or `cli.js` for older package versions).
  */
 export const resolveClaudeSdkExecutablePath = Effect.fn("resolveClaudeSdkExecutablePath")(
   function* (binaryPath: string, environment: NodeJS.ProcessEnv): Effect.fn.Return<string> {
     const platform = yield* HostProcessPlatform;
+    const isFile = yield* ClaudeExecutableFileCheck;
     if (platform !== "win32") {
+      const homePath = environment.HOME?.trim();
+      if (binaryPath === "claude" && homePath) {
+        const nativeLauncher = NodePath.posix.join(homePath, ".local", "bin", "claude");
+        if (isFile(nativeLauncher)) {
+          return nativeLauncher;
+        }
+      }
       return binaryPath;
     }
 
     const resolveExecutable = yield* SpawnExecutableResolution;
-    const isFile = yield* ClaudeExecutableFileCheck;
     const resolved = resolveExecutable(binaryPath, platform, environment) ?? binaryPath;
     const extension = NodePath.win32.extname(resolved).toLowerCase();
     if (!WINDOWS_SHIM_EXTENSIONS.has(extension)) {

@@ -18,6 +18,7 @@ import {
   resolvePreviousWorktreeSeed,
   resolveScaffoldDraftTargetPresentation,
   resolveScaffoldPendingTurnMode,
+  resolveScaffoldSendDecision,
   shouldBlockComposerForConnection,
   shouldIgnoreSourceEnvironmentForScaffoldDraft,
   shouldIncludeBranchPickerItem,
@@ -40,6 +41,13 @@ describe("Scaffold draft presentation", () => {
     ).toEqual({ targetLabel: "Scaffold staging", statusLabel: "Failed", actionLabel: "Retry" });
     expect(
       resolveScaffoldDraftTargetPresentation({
+        deployment: "production",
+        phase: "failed",
+        retryable: false,
+      }),
+    ).toEqual({ targetLabel: "Scaffold production", statusLabel: "Failed", actionLabel: null });
+    expect(
+      resolveScaffoldDraftTargetPresentation({
         deployment: "staging",
         phase: "failed",
         replacementRequired: true,
@@ -49,6 +57,30 @@ describe("Scaffold draft presentation", () => {
       statusLabel: "Target not recorded",
       actionLabel: "New session",
     });
+  });
+
+  it("derives a ready session's presentation from its live transport state", () => {
+    expect(
+      resolveScaffoldDraftTargetPresentation({
+        deployment: "staging",
+        phase: "ready",
+        connectionPhase: "reconnecting",
+      }),
+    ).toMatchObject({ statusLabel: "Reconnecting" });
+    expect(
+      resolveScaffoldDraftTargetPresentation({
+        deployment: "staging",
+        phase: "ready",
+        connectionPhase: "connected",
+      }),
+    ).toMatchObject({ statusLabel: "Ready" });
+    expect(
+      resolveScaffoldDraftTargetPresentation({
+        deployment: "staging",
+        phase: "ready",
+        connectionPhase: "error",
+      }),
+    ).toMatchObject({ statusLabel: "Unavailable" });
   });
 
   it("keeps first send enabled while Scaffold starts", () => {
@@ -85,6 +117,7 @@ describe("Scaffold draft presentation", () => {
     expect(
       resolveScaffoldPendingTurnMode({
         hasScaffoldDraft: true,
+        scaffoldPhase: "creating",
         boundToTarget: false,
         targetConnected: false,
       }),
@@ -105,10 +138,74 @@ describe("Scaffold draft presentation", () => {
     expect(
       resolveScaffoldPendingTurnMode({
         hasScaffoldDraft: true,
+        scaffoldPhase: "ready",
         boundToTarget: true,
         targetConnected: true,
       }),
     ).toBe("drain");
+  });
+
+  it("resumes a paused target once while keeping its turn durably queued", () => {
+    expect(
+      resolveScaffoldSendDecision({
+        hasScaffoldSession: true,
+        scaffoldPhase: "paused",
+        boundToTarget: true,
+        targetConnected: false,
+        hasProject: true,
+      }),
+    ).toEqual({ blocked: false, deliveryDeferred: true, shouldResume: true });
+    expect(
+      resolveScaffoldPendingTurnMode({
+        hasScaffoldDraft: true,
+        scaffoldPhase: "paused",
+        boundToTarget: true,
+        targetConnected: true,
+      }),
+    ).toBe("hydrate");
+  });
+
+  it("queues while resuming without requesting a duplicate resume", () => {
+    expect(
+      resolveScaffoldSendDecision({
+        hasScaffoldSession: true,
+        scaffoldPhase: "resuming",
+        boundToTarget: true,
+        targetConnected: false,
+        hasProject: true,
+      }),
+    ).toEqual({ blocked: false, deliveryDeferred: true, shouldResume: false });
+  });
+
+  it("drains only a ready connected target and blocks terminal reconnects", () => {
+    expect(
+      resolveScaffoldSendDecision({
+        hasScaffoldSession: true,
+        scaffoldPhase: "ready",
+        boundToTarget: true,
+        targetConnected: true,
+        hasProject: true,
+      }),
+    ).toEqual({ blocked: false, deliveryDeferred: false, shouldResume: false });
+    expect(
+      resolveScaffoldSendDecision({
+        hasScaffoldSession: true,
+        scaffoldPhase: "failed",
+        terminal: true,
+        boundToTarget: true,
+        targetConnected: true,
+        hasProject: true,
+      }),
+    ).toEqual({ blocked: true, deliveryDeferred: true, shouldResume: false });
+    expect(
+      resolveScaffoldPendingTurnMode({
+        hasScaffoldDraft: true,
+        scaffoldPhase: "failed",
+        terminal: true,
+        boundToTarget: true,
+        targetConnected: true,
+      }),
+    ).toBe("hydrate");
   });
 
   it("does not rehydrate a prompt already acknowledged by the server", () => {
@@ -121,29 +218,23 @@ describe("Scaffold draft presentation", () => {
     ).toEqual([]);
   });
 
-  it("ignores the source device connection only while an unbound Scaffold draft starts", () => {
+  it("ignores the source environment until a Scaffold draft is bound to its target", () => {
     expect(
       shouldIgnoreSourceEnvironmentForScaffoldDraft({
-        scaffoldEnvironmentId: null,
-        scaffoldPhase: "creating",
+        hasScaffoldDraft: true,
+        boundToTarget: false,
       }),
     ).toBe(true);
     expect(
       shouldIgnoreSourceEnvironmentForScaffoldDraft({
-        scaffoldEnvironmentId: null,
-        scaffoldPhase: "resuming",
-      }),
-    ).toBe(true);
-    expect(
-      shouldIgnoreSourceEnvironmentForScaffoldDraft({
-        scaffoldEnvironmentId: null,
-        scaffoldPhase: "failed",
+        hasScaffoldDraft: true,
+        boundToTarget: true,
       }),
     ).toBe(false);
     expect(
       shouldIgnoreSourceEnvironmentForScaffoldDraft({
-        scaffoldEnvironmentId: remoteEnvironmentId,
-        scaffoldPhase: "creating",
+        hasScaffoldDraft: false,
+        boundToTarget: false,
       }),
     ).toBe(false);
   });

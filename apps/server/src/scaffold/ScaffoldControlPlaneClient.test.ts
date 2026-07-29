@@ -1,4 +1,4 @@
-import { EnvironmentId, SessionFabricSessionId } from "@t3tools/contracts";
+import { EnvironmentId, SessionFabricSessionId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -20,6 +20,41 @@ function json(body: unknown, status = 200): Response {
 }
 
 describe("ScaffoldControlPlaneClient", () => {
+  it("probes the authenticated session collection without creating a sandbox", async () => {
+    let request: { readonly url: string; readonly init?: RequestInit } | undefined;
+    const client = makeScaffoldControlPlaneClient({
+      target: {
+        ...target,
+        authMode: "oauth",
+        collectionPath: "/api/code-sandboxes/agent-sessions",
+      },
+      fetch: async (input, init) => {
+        request = { url: String(input), ...(init ? { init } : {}) };
+        return json({ sessions: [] });
+      },
+    });
+
+    await expect(client.probeSessionCollection()).resolves.toBeUndefined();
+    expect(request?.url).toBe(
+      "https://scaffold-staging.example.com/api/code-sandboxes/agent-sessions?limit=1&offset=0&showStopped=true",
+    );
+    expect(request?.init?.method).toBeUndefined();
+    expect(new Headers(request?.init?.headers).get("authorization")).toBe("Bearer server-only");
+  });
+
+  it("rejects a successful response that is not a session collection", async () => {
+    const client = makeScaffoldControlPlaneClient({
+      target,
+      fetch: async () => new Response("<html>Sign in</html>", { status: 200 }),
+    });
+
+    await expect(client.probeSessionCollection()).rejects.toMatchObject({
+      reason: "invalid_response",
+      status: 502,
+      code: "scaffold_invalid_session_collection",
+    });
+  });
+
   it("parses the real Scaffold id field and rejects the prototype sessionId field", () => {
     expect(
       parseScaffoldSessionObservation({
@@ -285,6 +320,91 @@ describe("ScaffoldControlPlaneClient", () => {
       }),
     );
     expect(String(request?.init?.body)).not.toContain('"lifecycleEpoch"');
+  });
+
+  it("forwards and validates the canonical local controller binding", async () => {
+    let request: { readonly init?: RequestInit } | undefined;
+    const fabricSessionId = SessionFabricSessionId.make("sf:env_1:thread_1");
+    const client = makeScaffoldControlPlaneClient({
+      target,
+      now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+      fetch: async (_input, init) => {
+        request = init ? { init } : {};
+        return json({
+          capability: "header.payload.signature",
+          tokenType: "Bearer",
+          role: "controller",
+          scopes: ["session:read", "session:command"],
+          expiresAt: "2026-07-24T20:01:00.000Z",
+          issuer: "scaffold",
+          audience: "session-fabric",
+          keyId: "proof-1",
+          bindings: {
+            fabricSessionId,
+            environmentKind: "local",
+            environmentId: "env_1",
+            threadId: "thread_1",
+            actorId: "actor_1",
+          },
+        });
+      },
+    });
+    await expect(
+      client.issueSessionFabricCapability({
+        role: "controller",
+        fabricSessionId,
+        environmentKind: "local",
+        environmentId: EnvironmentId.make("env_1"),
+        threadId: ThreadId.make("thread_1"),
+      }),
+    ).resolves.toMatchObject({
+      role: "controller",
+      bindings: { environmentKind: "local", environmentId: "env_1", threadId: "thread_1" },
+    });
+    expect(String(request?.init?.body)).toBe(
+      JSON.stringify({
+        role: "controller",
+        fabricSessionId,
+        environmentKind: "local",
+        environmentId: "env_1",
+        threadId: "thread_1",
+      }),
+    );
+  });
+
+  it("rejects a local controller grant with a different authority binding", async () => {
+    const fabricSessionId = SessionFabricSessionId.make("sf:env_1:thread_1");
+    const client = makeScaffoldControlPlaneClient({
+      target,
+      now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+      fetch: async () =>
+        json({
+          capability: "header.payload.signature",
+          tokenType: "Bearer",
+          role: "controller",
+          scopes: ["session:read", "session:command"],
+          expiresAt: "2026-07-24T20:01:00.000Z",
+          issuer: "scaffold",
+          audience: "session-fabric",
+          keyId: "proof-1",
+          bindings: {
+            fabricSessionId,
+            environmentKind: "local",
+            environmentId: "env_other",
+            threadId: "thread_1",
+            actorId: "actor_1",
+          },
+        }),
+    });
+    await expect(
+      client.issueSessionFabricCapability({
+        role: "controller",
+        fabricSessionId,
+        environmentKind: "local",
+        environmentId: EnvironmentId.make("env_1"),
+        threadId: ThreadId.make("thread_1"),
+      }),
+    ).rejects.toMatchObject({ code: "scaffold_invalid_session_fabric_capability" });
   });
 
   it("issues an exact epoch-bound runner capability with only the runtime token header", async () => {

@@ -93,6 +93,67 @@ describe("SessionFabricAuthorization", () => {
     }),
   );
 
+  it.effect("clears a timed-out pending request so the next capability request can retry", () =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        requestTimeoutMs: 5,
+        fetch: (async (_input, init) => {
+          calls += 1;
+          if (calls === 1) {
+            return new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError"));
+              });
+            });
+          }
+          return Response.json(grant("viewer", "viewer-after-timeout"));
+        }) as typeof fetch,
+      });
+
+      const error = yield* authorization.viewer().pipe(Effect.flip);
+      expect(error.reason).toBe("network");
+      expect((yield* authorization.viewer())?.capability).toBe("viewer-after-timeout");
+      expect(calls).toBe(2);
+    }),
+  );
+
+  it.effect("rejects viewer capabilities carrying any session binding shape", () =>
+    Effect.gen(function* () {
+      const bindings = [
+        { fabricSessionId: "fabric-1" },
+        { scaffoldSessionId: "ses-1" },
+        { scaffoldLifecycleEpoch: 2 },
+        {
+          fabricSessionId: "fabric-1",
+          environmentKind: "local",
+          environmentId: "environment-1",
+          threadId: "thread-1",
+          actorId: "user-1",
+        },
+        {
+          fabricSessionId: "fabric-1",
+          environmentKind: "local",
+          environmentId: "environment-1",
+          threadId: "thread-1",
+          actorId: "user-1",
+          runnerId: "runner-1",
+        },
+      ] as const;
+
+      for (const binding of bindings) {
+        const authorization = makeSessionFabricCapabilityAuthorization({
+          endpoint: "https://t3.example/api/session-fabric/capabilities",
+          fetch: (async () =>
+            Response.json({ ...grant("viewer", "viewer"), bindings: binding })) as typeof fetch,
+        });
+        const error = yield* authorization.viewer().pipe(Effect.flip);
+        expect(error.reason).toBe("invalid-response");
+      }
+    }),
+  );
+
   it.effect("acquires a separate exact-session controller capability", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly body: unknown }> = [];
@@ -152,6 +213,55 @@ describe("SessionFabricAuthorization", () => {
         .pipe(Effect.flip);
 
       expect(error.reason).toBe("invalid-response");
+    }),
+  );
+
+  it.effect("acquires a local controller capability without any Scaffold binding", () =>
+    Effect.gen(function* () {
+      const bodies: unknown[] = [];
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "http://127.0.0.1:5733/api/session-fabric/capabilities",
+        now: () => Date.parse("2026-07-27T20:00:00.000Z"),
+        fetch: (async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return Response.json({
+            capability: "local.controller.token",
+            tokenType: "Bearer",
+            role: "controller",
+            scopes: ["session:read", "session:command"],
+            expiresAt,
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings: {
+              fabricSessionId: "fabric-local",
+              environmentKind: "local",
+              environmentId: "environment-local",
+              threadId: "thread-local",
+              actorId: "user-1",
+            },
+          });
+        }) as typeof fetch,
+      });
+      const result = yield* authorization.controller({
+        fabricSessionId: SessionFabricSessionId.make("fabric-local"),
+        environmentKind: "local",
+        environmentId: "environment-local",
+        threadId: "thread-local",
+      });
+      expect(result?.bindings).toMatchObject({
+        environmentKind: "local",
+        actorId: "user-1",
+      });
+      expect(bodies).toEqual([
+        {
+          role: "controller",
+          fabricSessionId: "fabric-local",
+          environmentKind: "local",
+          environmentId: "environment-local",
+          threadId: "thread-local",
+        },
+      ]);
     }),
   );
 

@@ -273,6 +273,74 @@ describe("pending turn outbox", () => {
     expect(await storage.list()).toEqual([]);
   });
 
+  it("preserves a Scaffold pending draft across unrelated navigation and dispatches it once after retargeting", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    const draftId = "draft-navigation";
+    const provisionalEnvironmentId = EnvironmentId.make(`scaffold-pending:${draftId}`);
+    const authoritativeEnvironmentId = EnvironmentId.make("environment-scaffold");
+    const authoritativeProjectId = ProjectId.make("project-scaffold");
+    const accepted = await enqueuePendingTurn(storage, {
+      ...pendingInput(),
+      draftId,
+      environmentId: provisionalEnvironmentId,
+    });
+    const acceptedCommandId = accepted.input.commandId;
+    const acceptedMessageId = accepted.input.message.messageId;
+
+    const unrelatedDispatch = vi.fn(async () => undefined);
+    expect(
+      await listPendingTurnsForThread(
+        storage,
+        EnvironmentId.make("environment-unrelated"),
+        ThreadId.make("thread-unrelated"),
+      ),
+    ).toEqual([]);
+    await drainPendingTurnOutbox({
+      storage,
+      environmentId: EnvironmentId.make("environment-unrelated"),
+      threadId: ThreadId.make("thread-unrelated"),
+      dispatch: unrelatedDispatch,
+    });
+    expect(unrelatedDispatch).not.toHaveBeenCalled();
+    expect(await storage.list()).toEqual([accepted]);
+
+    const rehydrated = (await storage.list()).find((entry) => entry.draftId === draftId);
+    expect(rehydrated).toBe(accepted);
+    expect(rehydrated?.input.commandId).toBe(acceptedCommandId);
+    expect(rehydrated?.input.message.messageId).toBe(acceptedMessageId);
+
+    await retargetPendingTurnsForDraft(
+      storage,
+      draftId,
+      authoritativeEnvironmentId,
+      authoritativeProjectId,
+      targetProviders,
+    );
+
+    const dispatch = vi.fn(async (entry: PendingTurnOutboxEntry) => {
+      expect(entry.environmentId).toBe(authoritativeEnvironmentId);
+      expect(entry.input.commandId).toBe(acceptedCommandId);
+      expect(entry.input.message.messageId).toBe(acceptedMessageId);
+    });
+    await Promise.all([
+      drainPendingTurnOutbox({
+        storage,
+        environmentId: authoritativeEnvironmentId,
+        threadId,
+        dispatch,
+      }),
+      drainPendingTurnOutbox({
+        storage,
+        environmentId: authoritativeEnvironmentId,
+        threadId,
+        dispatch,
+      }),
+    ]);
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(await storage.list()).toEqual([]);
+  });
+
   it("atomically retargets every draft turn before one drain announcement", async () => {
     const memoryStorage = createMemoryPendingTurnOutboxStorage();
     await enqueuePendingTurn(memoryStorage, pendingInput());

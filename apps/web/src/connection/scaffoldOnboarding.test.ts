@@ -1,14 +1,11 @@
-import {
-  EnvironmentRegistry,
-  ConnectionBlockedError,
-  ConnectionTransientError,
-} from "@t3tools/client-runtime/connection";
+import { EnvironmentRegistry, ConnectionBlockedError } from "@t3tools/client-runtime/connection";
 import { ScaffoldLifecycleGateway } from "@t3tools/client-runtime/scaffold";
 import {
   EnvironmentId,
   ScaffoldEnvironmentBinding,
   ScaffoldLifecycleError,
   ScaffoldPreparedConnection,
+  ScaffoldSessionObservation,
   ScaffoldSessionLinks,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
@@ -161,38 +158,64 @@ describe("Scaffold onboarding", () => {
     }),
   );
 
-  it.effect("maps authentication lifecycle failures to blocked connection failures", () =>
+  it.effect("preserves authentication lifecycle failures for the create coordinator", () =>
     Effect.gen(function* () {
-      const result = runWithLifecycleFailure(
-        new ScaffoldLifecycleError({
-          reason: "authentication",
-          message: "remote detail",
-          status: 401,
-          code: "auth_required",
-        }),
-      );
+      const lifecycleError = new ScaffoldLifecycleError({
+        reason: "authentication",
+        message: "remote detail",
+        status: 401,
+        code: "auth_required",
+      });
+      const result = runWithLifecycleFailure(lifecycleError);
 
       const failure = yield* result.failure;
-      expect(failure).toBeInstanceOf(ConnectionBlockedError);
-      expect(failure).toMatchObject({ reason: "authentication" });
+      expect(failure).toBe(lifecycleError);
       expect(result.registered()).toBe(false);
     }),
   );
 
-  it.effect("maps network lifecycle failures to retryable connection failures", () =>
+  it.effect("preserves retryable lifecycle failures for the create coordinator", () =>
     Effect.gen(function* () {
-      const result = runWithLifecycleFailure(
-        new ScaffoldLifecycleError({
-          reason: "network",
-          message: "request timed out",
-          status: 0,
-          code: "scaffold_local_network_error",
-        }),
-      );
+      const lifecycleError = new ScaffoldLifecycleError({
+        reason: "network",
+        message: "request timed out",
+        status: 0,
+        code: "scaffold_local_network_error",
+      });
+      const result = runWithLifecycleFailure(lifecycleError);
 
       const failure = yield* result.failure;
-      expect(failure).toBeInstanceOf(ConnectionTransientError);
-      expect(failure).toMatchObject({ reason: "network" });
+      expect(failure).toBe(lifecycleError);
+      expect(result.registered()).toBe(false);
+    }),
+  );
+
+  it.effect("preserves preparation-pending retry metadata for the create coordinator", () =>
+    Effect.gen(function* () {
+      const lifecycleError = new ScaffoldLifecycleError({
+        reason: "unavailable",
+        message: "Scaffold session is still preparing.",
+        status: 202,
+        code: "scaffold_preparation_pending",
+        retryAfterMs: 2_500,
+        observation: new ScaffoldSessionObservation({
+          sessionId: "server-minted-session",
+          status: "creating",
+          lifecycleEpoch: 3,
+        }),
+      });
+      const result = runWithLifecycleFailure(lifecycleError);
+
+      const failure = yield* result.failure;
+      expect(failure).toBe(lifecycleError);
+      expect(failure).toMatchObject({
+        code: "scaffold_preparation_pending",
+        retryAfterMs: 2_500,
+        observation: {
+          sessionId: "server-minted-session",
+          lifecycleEpoch: 3,
+        },
+      });
       expect(result.registered()).toBe(false);
     }),
   );

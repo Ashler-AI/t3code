@@ -14,6 +14,8 @@ import {
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
   resolveProjectStatusIndicator,
+  resolveThreadSettlementPresentation,
+  resolveProvisionalDraftPresentation,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveSidebarV2Status,
@@ -21,6 +23,7 @@ import {
   isScaffoldEnvironmentLabel,
   resolveThreadStatusPill,
   resolveWorkingStartedAt,
+  selectScaffoldDraftRows,
   selectProvisionalDraftRows,
   formatWorkingDurationLabel,
   shouldNavigateAfterProjectRemoval,
@@ -51,6 +54,41 @@ import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environ
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
 
+describe("resolveThreadSettlementPresentation", () => {
+  it("keeps Mark done available for a disconnected Scaffold without server config", () => {
+    expect(
+      resolveThreadSettlementPresentation({
+        serverSupportsSettlement: false,
+        disconnectedScaffold: true,
+        locallySettled: false,
+        effectivelySettled: false,
+      }),
+    ).toEqual({ supported: true, settled: false });
+  });
+
+  it("shows a browser-local disconnected Scaffold settlement as Done", () => {
+    expect(
+      resolveThreadSettlementPresentation({
+        serverSupportsSettlement: false,
+        disconnectedScaffold: true,
+        locallySettled: true,
+        effectivelySettled: false,
+      }),
+    ).toEqual({ supported: true, settled: true });
+  });
+
+  it("does not expose settlement for an unsupported non-Scaffold environment", () => {
+    expect(
+      resolveThreadSettlementPresentation({
+        serverSupportsSettlement: false,
+        disconnectedScaffold: false,
+        locallySettled: true,
+        effectivelySettled: true,
+      }),
+    ).toEqual({ supported: false, settled: false });
+  });
+});
+
 describe("selectProvisionalDraftRows", () => {
   const localDraftId = DraftId.make("draft-local");
   const scaffoldDraftId = DraftId.make("draft-scaffold");
@@ -79,11 +117,12 @@ describe("selectProvisionalDraftRows", () => {
     const baseInput = {
       draftThreadsByDraftId,
       scaffoldDraftIds: new Set<string>([scaffoldDraftId]),
+      pendingDraftIds: new Set<string>(),
       scopedProjectKeys: null,
     };
 
     expect(selectProvisionalDraftRows({ ...baseInput, materializedThreadKeys: new Set() })).toEqual(
-      [{ draftId: localDraftId, draftThread }],
+      [{ draftId: localDraftId, draftThread, isPending: false }],
     );
 
     expect(
@@ -91,6 +130,107 @@ describe("selectProvisionalDraftRows", () => {
         ...baseInput,
         materializedThreadKeys: new Set([
           scopedThreadKey(scopeThreadRef(localEnvironmentId, localThreadId)),
+        ]),
+      }),
+    ).toEqual([]);
+  });
+
+  it("excludes drafts that already promoted to a server thread", () => {
+    expect(
+      selectProvisionalDraftRows({
+        draftThreadsByDraftId: {
+          [localDraftId]: {
+            ...draftThread,
+            promotedTo: scopeThreadRef(localEnvironmentId, localThreadId),
+          },
+        },
+        scaffoldDraftIds: new Set(),
+        materializedThreadKeys: new Set(),
+        pendingDraftIds: new Set([localDraftId]),
+        scopedProjectKeys: null,
+      }),
+    ).toEqual([]);
+  });
+
+  it("only presents drafts with pending-turn evidence as starting", () => {
+    const savedRow = { draftId: localDraftId, draftThread, isPending: false };
+    const pendingRow = { ...savedRow, isPending: true };
+
+    expect(resolveProvisionalDraftPresentation(savedRow)).toEqual({
+      statusLabel: null,
+      detail: "Draft saved",
+    });
+    expect(resolveProvisionalDraftPresentation(pendingRow)).toEqual({
+      statusLabel: "Local session is starting",
+      detail: "Preparing worktree...",
+    });
+  });
+});
+
+describe("selectScaffoldDraftRows", () => {
+  const draftId = DraftId.make("draft-scaffold");
+  const threadId = ThreadId.make("thread-scaffold");
+  const promotedEnvironmentId = EnvironmentId.make("environment-scaffold");
+  const promotedThreadId = ThreadId.make("thread-scaffold-promoted");
+  const draftThread: DraftThreadState = {
+    threadId,
+    environmentId: localEnvironmentId,
+    projectId: ProjectId.make("project-scaffold"),
+    logicalProjectKey: "scaffold-project",
+    createdAt: "2026-07-28T12:00:00.000Z",
+    runtimeMode: DEFAULT_RUNTIME_MODE,
+    interactionMode: DEFAULT_INTERACTION_MODE,
+    branch: "main",
+    worktreePath: null,
+    envMode: "local",
+    startFromOrigin: false,
+    promotedTo: null,
+  };
+  const entry = { draftId, createdAt: "2026-07-28T12:00:00.000Z" };
+
+  it("keeps a Scaffold draft until its canonical promoted thread materializes", () => {
+    expect(
+      selectScaffoldDraftRows({
+        entries: [entry],
+        draftThreadsByDraftId: { [draftId]: draftThread },
+        materializedThreadKeys: new Set(),
+      }),
+    ).toEqual([entry]);
+
+    expect(
+      selectScaffoldDraftRows({
+        entries: [entry],
+        draftThreadsByDraftId: {
+          [draftId]: {
+            ...draftThread,
+            promotedTo: scopeThreadRef(promotedEnvironmentId, promotedThreadId),
+          },
+        },
+        materializedThreadKeys: new Set(),
+      }),
+    ).toEqual([entry]);
+
+    expect(
+      selectScaffoldDraftRows({
+        entries: [entry],
+        draftThreadsByDraftId: {
+          [draftId]: {
+            ...draftThread,
+            promotedTo: scopeThreadRef(promotedEnvironmentId, promotedThreadId),
+          },
+        },
+        materializedThreadKeys: new Set([
+          scopedThreadKey(scopeThreadRef(promotedEnvironmentId, promotedThreadId)),
+        ]),
+      }),
+    ).toEqual([]);
+
+    expect(
+      selectScaffoldDraftRows({
+        entries: [entry],
+        draftThreadsByDraftId: { [draftId]: draftThread },
+        materializedThreadKeys: new Set([
+          scopedThreadKey(scopeThreadRef(localEnvironmentId, threadId)),
         ]),
       }),
     ).toEqual([]);

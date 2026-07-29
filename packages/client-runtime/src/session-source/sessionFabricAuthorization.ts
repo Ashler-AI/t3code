@@ -10,11 +10,18 @@ export type { SessionFabricCapabilityGrant } from "@t3tools/contracts";
 
 export type SessionFabricCapabilityRole = "viewer" | "controller";
 
-export interface SessionFabricControllerBinding {
-  readonly fabricSessionId: SessionFabricSessionId;
-  readonly scaffoldSessionId: string;
-  readonly scaffoldLifecycleEpoch: number;
-}
+export type SessionFabricControllerBinding =
+  | {
+      readonly fabricSessionId: SessionFabricSessionId;
+      readonly scaffoldSessionId: string;
+      readonly scaffoldLifecycleEpoch: number;
+    }
+  | {
+      readonly fabricSessionId: SessionFabricSessionId;
+      readonly environmentKind: "local";
+      readonly environmentId: string;
+      readonly threadId: string;
+    };
 
 export class SessionFabricAuthorizationError extends Schema.TaggedErrorClass<SessionFabricAuthorizationError>()(
   "SessionFabricAuthorizationError",
@@ -71,6 +78,7 @@ export interface SessionFabricCapabilityClientOptions {
   readonly deployment?: "staging" | "production";
   readonly fetch?: typeof globalThis.fetch;
   readonly now?: () => number;
+  readonly requestTimeoutMs?: number;
 }
 
 export interface RuntimeSessionFabricAuthorizationOptions extends SessionFabricCapabilityClientOptions {
@@ -81,6 +89,7 @@ export interface RuntimeSessionFabricAuthorizationOptions extends SessionFabricC
 }
 
 const REFRESH_SKEW_MS = 30_000;
+const DEFAULT_CAPABILITY_REQUEST_TIMEOUT_MS = 10_000;
 const isCapabilityGrant = Schema.is(SessionFabricCapabilityGrantSchema);
 const isAuthorizationError = Schema.is(SessionFabricAuthorizationError);
 
@@ -112,25 +121,43 @@ function decodeGrant(
     return null;
   }
   if (expectedRole === "viewer") {
+    const bindings = value.bindings;
     if (
       !hasExactScopes(value.scopes, ["directory:read", "session:read"]) ||
-      value.bindings.fabricSessionId !== undefined ||
-      value.bindings.scaffoldSessionId !== undefined ||
-      value.bindings.scaffoldLifecycleEpoch !== undefined
+      bindings.fabricSessionId !== undefined ||
+      ("scaffoldSessionId" in bindings && bindings.scaffoldSessionId !== undefined) ||
+      ("scaffoldLifecycleEpoch" in bindings && bindings.scaffoldLifecycleEpoch !== undefined) ||
+      "environmentKind" in bindings
+    ) {
+      return null;
+    }
+    return value;
+  }
+  if (binding === undefined || !hasExactScopes(value.scopes, ["session:read", "session:command"])) {
+    return null;
+  }
+  const bindings = value.bindings;
+  if ("environmentKind" in binding) {
+    if (
+      !("environmentKind" in bindings) ||
+      bindings.environmentKind !== "local" ||
+      bindings.fabricSessionId !== binding.fabricSessionId ||
+      bindings.environmentId !== binding.environmentId ||
+      bindings.threadId !== binding.threadId ||
+      bindings.actorId.length === 0 ||
+      "runnerId" in bindings
     ) {
       return null;
     }
     return value;
   }
   if (
-    binding === undefined ||
-    !hasExactScopes(value.scopes, ["session:read", "session:command"]) ||
-    value.bindings.fabricSessionId !== binding.fabricSessionId ||
-    value.bindings.scaffoldSessionId !== binding.scaffoldSessionId ||
-    value.bindings.scaffoldLifecycleEpoch !== binding.scaffoldLifecycleEpoch
-  ) {
+    "environmentKind" in bindings ||
+    bindings.fabricSessionId !== binding.fabricSessionId ||
+    bindings.scaffoldSessionId !== binding.scaffoldSessionId ||
+    bindings.scaffoldLifecycleEpoch !== binding.scaffoldLifecycleEpoch
+  )
     return null;
-  }
   return value;
 }
 
@@ -145,10 +172,16 @@ export function makeSessionFabricCapabilityAuthorization(
   const cache = new Map<string, SessionFabricCapabilityGrant>();
   const pending = new Map<string, Promise<SessionFabricCapabilityGrant>>();
 
-  const cacheKey = (role: SessionFabricCapabilityRole, binding?: SessionFabricControllerBinding) =>
-    role === "viewer"
-      ? role
-      : `${role}:${binding?.fabricSessionId ?? ""}:${binding?.scaffoldSessionId ?? ""}:${binding?.scaffoldLifecycleEpoch ?? ""}`;
+  const cacheKey = (
+    role: SessionFabricCapabilityRole,
+    binding?: SessionFabricControllerBinding,
+  ) => {
+    if (role === "viewer") return role;
+    if (binding === undefined) return `${role}:missing`;
+    return "environmentKind" in binding
+      ? `${role}:local:${binding.fabricSessionId}:${binding.environmentId}:${binding.threadId}`
+      : `${role}:scaffold:${binding.fabricSessionId}:${binding.scaffoldSessionId}:${binding.scaffoldLifecycleEpoch}`;
+  };
 
   const invalidate = (
     role: SessionFabricCapabilityRole,
@@ -181,6 +214,9 @@ export function makeSessionFabricCapabilityAuthorization(
           const response = await fetchImplementation(endpoint, {
             method: "POST",
             credentials: "same-origin",
+            signal: AbortSignal.timeout(
+              options.requestTimeoutMs ?? DEFAULT_CAPABILITY_REQUEST_TIMEOUT_MS,
+            ),
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
               role,

@@ -17,6 +17,7 @@ import {
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  deriveLockedProvider,
   dismissBranchMismatchForSession,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
@@ -84,6 +85,19 @@ const readySession = {
   lastError: null,
   updatedAt: "2026-03-29T00:00:10.000Z",
 };
+
+describe("deriveLockedProvider", () => {
+  it("locks an unstarted Scaffold draft to OMP", () => {
+    expect(
+      deriveLockedProvider({
+        thread: makeThread(),
+        selectedProvider: "codex",
+        threadProvider: "codex",
+        forcedProvider: "omp",
+      }),
+    ).toBe("omp");
+  });
+});
 
 describe("resolveThreadMetadataUpdateForNextTurn", () => {
   const modelSelection = {

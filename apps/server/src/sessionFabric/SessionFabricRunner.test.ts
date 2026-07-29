@@ -15,6 +15,7 @@ import {
   makeSessionFabricWebSocketUrl,
   resolveSessionFabricRunnerConfig,
   resolveSessionFabricSessionId,
+  requestLocalSessionFabricRunnerCapability,
   sessionFabricCommandReceipt,
   sessionFabricCapabilityRefreshDelayMs,
 } from "./SessionFabricRunner.ts";
@@ -56,6 +57,8 @@ describe("SessionFabricRunner", () => {
       scaffoldLifecycleEpoch: Option.some(4),
       runtimeApiToken: Option.some("runtime-secret"),
       authMode: "required",
+      capabilityDeployment: Option.none(),
+      scaffoldDefaultDeployment: Option.none(),
     });
     expect(config.environmentKind).toBe("scaffold");
     expect(config.runnerGeneration).toBe(0);
@@ -176,8 +179,88 @@ describe("SessionFabricRunner", () => {
         scaffoldLifecycleEpoch: Option.some(4),
         runtimeApiToken: Option.some("runtime-secret"),
         authMode: "disabled",
+        capabilityDeployment: Option.none(),
+        scaffoldDefaultDeployment: Option.none(),
       }),
     ).toThrow("only be disabled for a local runner");
+  });
+
+  it("rejects mixed local and Scaffold runtime bindings", () => {
+    expect(() =>
+      resolveSessionFabricRunnerConfig({
+        relayUrl: Option.some(new URL("https://relay.example.test/")),
+        environmentKind: Option.some("local"),
+        publication: "public",
+        runnerGeneration: 0,
+        overrideSessionId: Option.none(),
+        overrideThreadId: Option.none(),
+        scaffoldSessionId: Option.some("ses_mixed"),
+        scaffoldSessionUrl: Option.none(),
+        scaffoldLifecycleEpoch: Option.none(),
+        runtimeApiToken: Option.none(),
+        authMode: "required",
+        capabilityDeployment: Option.some("staging"),
+        scaffoldDefaultDeployment: Option.none(),
+      }),
+    ).toThrow("cannot include Scaffold runtime bindings");
+  });
+
+  it("uses the OAuth-backed global capability endpoint for an exact local runner binding", async () => {
+    const environmentId = EnvironmentId.make("environment-local");
+    const sessionId = SessionFabricSessionId.make("sf:environment-local:thread-1");
+    const requests: Array<{
+      url: string;
+      init: Parameters<typeof globalThis.fetch>[1];
+    }> = [];
+    const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(input), init });
+      return Response.json({
+        capability: "header.payload.signature",
+        tokenType: "Bearer",
+        role: "runner",
+        scopes: ["session:publish", "session:execute"],
+        expiresAt: "2026-07-24T20:15:00.000Z",
+        issuer: "scaffold",
+        audience: "session-fabric",
+        keyId: "proof-1",
+        bindings: {
+          fabricSessionId: sessionId,
+          environmentKind: "local",
+          environmentId,
+          threadId: "thread-1",
+          runnerId: "runner:environment-local",
+          actorId: "user-1",
+        },
+      });
+    }) as typeof globalThis.fetch;
+    const grant = await requestLocalSessionFabricRunnerCapability({
+      deployment: "staging",
+      fabricSessionId: sessionId,
+      environmentId,
+      threadId: ThreadId.make("thread-1"),
+      runnerId: "runner:environment-local" as never,
+      target: {
+        baseUrl: "https://scaffold.example.test/",
+        authMode: "oauth",
+        authorization: "Bearer oauth-user-token",
+      },
+      fetch,
+      now: () => Date.parse("2026-07-24T20:00:00.000Z"),
+    });
+    expect(grant.bindings).toMatchObject({ actorId: "user-1", environmentKind: "local" });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe("https://scaffold.example.test/api/session-fabric/capabilities");
+    expect(requests[0]?.init?.headers).toMatchObject({
+      authorization: "Bearer oauth-user-token",
+    });
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      role: "runner",
+      fabricSessionId: sessionId,
+      environmentKind: "local",
+      environmentId,
+      threadId: "thread-1",
+      runnerId: "runner:environment-local",
+    });
   });
 
   it("returns the orchestration engine's original sequence on accepted duplicate dispatch", () => {

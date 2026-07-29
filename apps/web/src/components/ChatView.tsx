@@ -231,9 +231,11 @@ import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
 import {
   mergeQueuedScaffoldMessages,
+  SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE,
   resolveEffectiveEnvMode,
   resolveLocalCheckoutBranchMismatch,
   resolveScaffoldPendingTurnMode,
+  resolveScaffoldSendDecision,
   shouldBlockComposerForConnection,
   shouldIgnoreSourceEnvironmentForScaffoldDraft,
   shouldPrepareWorktreeForFirstMessage,
@@ -304,6 +306,10 @@ import {
   scaffoldSessionForEnvironment,
   useScaffoldSessionUiStore,
 } from "../scaffoldSessionUiStore";
+import {
+  localThreadSettlementApplies,
+  useThreadSettlementUiStore,
+} from "../threadSettlementUiStore";
 import { RightPanelSheet } from "./RightPanelSheet";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -1175,8 +1181,6 @@ function ChatViewContent(props: ChatViewProps) {
     draftId ? (state.entriesByDraftId[draftId] ?? null) : null,
   );
   const scaffoldSessionsByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
-  const scaffoldSessionBusy =
-    scaffoldSessionUi?.phase === "creating" || scaffoldSessionUi?.phase === "resuming";
   const routeThreadRef = useMemo(
     () => scopeThreadRef(environmentId, threadId),
     [environmentId, threadId],
@@ -1663,8 +1667,8 @@ function ChatViewContent(props: ChatViewProps) {
   const activeEnvironment =
     activeThread == null ? null : (environmentById.get(activeThread.environmentId) ?? null);
   const ignoreSourceEnvironmentForScaffoldDraft = shouldIgnoreSourceEnvironmentForScaffoldDraft({
-    scaffoldEnvironmentId: scaffoldSessionUi?.environmentId,
-    scaffoldPhase: scaffoldSessionUi?.phase ?? null,
+    hasScaffoldDraft: scaffoldSessionUi !== null,
+    boundToTarget: scaffoldDraftBoundToTarget,
   });
   const composerIsConnecting = shouldBlockComposerForConnection({
     transportConnecting: isConnecting && !ignoreSourceEnvironmentForScaffoldDraft,
@@ -1675,7 +1679,8 @@ function ChatViewContent(props: ChatViewProps) {
     activeEnvironment !== null &&
     !ignoreSourceEnvironmentForScaffoldDraft &&
     activeEnvironmentConnectionPhase !== "connected" &&
-    activeScaffoldSession?.phase !== "paused";
+    activeScaffoldSession?.phase !== "paused" &&
+    activeScaffoldSession?.terminal !== true;
   const activeEnvironmentUnavailableLabel = activeEnvironment?.label ?? null;
   const activeEnvironmentUnavailableState = useMemo<EnvironmentUnavailableState | null>(() => {
     if (!activeEnvironmentUnavailable || !activeEnvironmentUnavailableLabel || !activeEnvironment) {
@@ -1872,6 +1877,7 @@ function ChatViewContent(props: ChatViewProps) {
     thread: activeThread,
     selectedProvider: selectedProviderByThreadId,
     threadProvider,
+    forcedProvider: scaffoldSessionUi === null ? null : "omp",
   });
   // Once a thread selects an environment, never substitute the primary
   // environment's config while the selected environment is still loading.
@@ -2692,6 +2698,8 @@ function ChatViewContent(props: ChatViewProps) {
   // bound to a connected target. Stable command ids keep remount retries safe.
   const scaffoldPendingTurnMode = resolveScaffoldPendingTurnMode({
     hasScaffoldDraft: effectiveScaffoldSession !== null,
+    scaffoldPhase: effectiveScaffoldSession?.phase ?? null,
+    terminal: effectiveScaffoldSession?.terminal === true,
     boundToTarget: scaffoldDraftBoundToTarget,
     targetConnected: activeEnvironmentConnectionPhase === "connected",
   });
@@ -4159,6 +4167,9 @@ function ChatViewContent(props: ChatViewProps) {
   // partition (same shell, same capability gate, same PR auto-settle input)
   // so the banner and the sidebar row never disagree.
   const activeThreadShell = useThreadShell(isServerThread ? activeThreadRef : null);
+  const activeLocalSettlement = useThreadSettlementUiStore((state) =>
+    activeThreadKey === null ? undefined : state.settlementsByThreadKey[activeThreadKey],
+  );
   const autoSettleAfterDays = useClientSettings((settings) => settings.sidebarAutoSettleAfterDays);
   const activeThreadPr = resolveThreadPr({
     threadBranch: activeThread?.branch ?? null,
@@ -4186,12 +4197,16 @@ function ChatViewContent(props: ChatViewProps) {
   }, [activeThreadShell?.snoozedUntil, activeThreadSnoozed, snoozeWakeTick]);
   const activeThreadSettled = useMemo(() => {
     if (activeThreadShell === null || !supportsSettlement) return false;
-    return effectiveSettled(activeThreadShell, {
-      now: `${nowMinute}:00.000Z`,
-      autoSettleAfterDays,
-      changeRequestState: activeThreadPr?.state ?? null,
-    });
+    return (
+      localThreadSettlementApplies(activeLocalSettlement, activeThreadShell.updatedAt) ||
+      effectiveSettled(activeThreadShell, {
+        now: `${nowMinute}:00.000Z`,
+        autoSettleAfterDays,
+        changeRequestState: activeThreadPr?.state ?? null,
+      })
+    );
   }, [
+    activeLocalSettlement,
     activeThreadPr?.state,
     activeThreadShell,
     autoSettleAfterDays,
@@ -4209,6 +4224,14 @@ function ChatViewContent(props: ChatViewProps) {
   const handleUnsettleActiveThread = useCallback(async () => {
     if (!activeThreadRef) return;
     const threadKey = scopedThreadKey(activeThreadRef);
+    useThreadSettlementUiStore.getState().clearSettled(activeThreadRef);
+    const targetEnvironment = environmentById.get(activeThreadRef.environmentId);
+    if (
+      targetEnvironment?.entry.target._tag === "ScaffoldConnectionTarget" &&
+      targetEnvironment.connection.phase !== "connected"
+    ) {
+      return;
+    }
     setUnsettlingThreadKey(threadKey);
     try {
       const result = await unsettleThreadMutation({
@@ -4228,7 +4251,7 @@ function ChatViewContent(props: ChatViewProps) {
     } finally {
       setUnsettlingThreadKey((current) => (current === threadKey ? null : current));
     }
-  }, [activeThreadRef, unsettleThreadMutation]);
+  }, [activeThreadRef, environmentById, unsettleThreadMutation]);
   const unsnoozeThreadMutation = useAtomCommand(threadEnvironment.unsnooze, {
     reportFailure: false,
   });
@@ -4853,13 +4876,23 @@ function ChatViewContent(props: ChatViewProps) {
       );
       return;
     }
-    const scaffoldDeliveryDeferred =
-      !scaffoldDraftBoundToTarget ||
-      scaffoldSessionBusy ||
-      activeScaffoldSession?.phase === "paused" ||
-      activeScaffoldSession?.phase === "resuming" ||
-      activeProject === null;
-    if (activeScaffoldSession?.phase === "paused") {
+    const scaffoldSendDecision = resolveScaffoldSendDecision({
+      hasScaffoldSession: effectiveScaffoldSession !== null,
+      scaffoldPhase: effectiveScaffoldSession?.phase ?? null,
+      terminal: effectiveScaffoldSession?.terminal === true,
+      boundToTarget: scaffoldDraftBoundToTarget,
+      targetConnected: activeEnvironmentConnectionPhase === "connected",
+      hasProject: activeProject !== null,
+    });
+    if (scaffoldSendDecision.blocked) {
+      setThreadError(
+        activeThread.id,
+        effectiveScaffoldSession?.error ?? "This Scaffold session has ended. Start a new session.",
+      );
+      return;
+    }
+    const scaffoldDeliveryDeferred = scaffoldSendDecision.deliveryDeferred;
+    if (scaffoldSendDecision.shouldResume && activeScaffoldSession) {
       const scaffoldUi = useScaffoldSessionUiStore.getState();
       scaffoldUi.setPhase(activeScaffoldSession.draftId, "resuming");
       void handleReconnectActiveEnvironment(activeThread.environmentId);
@@ -4892,6 +4925,9 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     sendInFlightRef.current = true;
+    useThreadSettlementUiStore
+      .getState()
+      .clearSettled(scopeThreadRef(activeThread.environmentId, threadIdForSend));
     if (isDraftHeroState && activeThreadKey) {
       let resolveDockStarted: (() => void) | undefined;
       const dockStarted = new Promise<void>((resolve) => {
@@ -6287,16 +6323,24 @@ function ChatViewContent(props: ChatViewProps) {
                                       scaffoldDraftTarget: {
                                         deployment: scaffoldSessionUi.deployment,
                                         phase: scaffoldSessionUi.phase,
+                                        connectionPhase: activeEnvironmentConnectionPhase,
                                         replacementRequired:
                                           scaffoldSessionUi.error ===
                                           SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE,
+                                        retryable:
+                                          scaffoldSessionUi.terminal !== true &&
+                                          scaffoldSessionUi.error !==
+                                            SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE,
                                       },
                                       scaffoldDraftRetrying:
                                         retryingScaffoldActionId === scaffoldSessionUi.actionId,
                                       ...(scaffoldSessionUi.error ===
                                       SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE
                                         ? { onReplaceScaffoldDraft }
-                                        : { onRetryScaffoldDraft }),
+                                        : scaffoldSessionUi.error ===
+                                            SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE
+                                          ? {}
+                                          : { onRetryScaffoldDraft }),
                                     }
                                   : {})}
                               />

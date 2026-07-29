@@ -103,6 +103,7 @@ export const ConnectionBlockedReason = Schema.Literals([
   "authentication",
   "configuration",
   "permission",
+  "remote-unavailable",
   "unsupported",
 ]);
 export type ConnectionBlockedReason = typeof ConnectionBlockedReason.Type;

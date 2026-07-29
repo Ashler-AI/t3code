@@ -299,6 +299,7 @@ function withScaffoldLifecycleLock<A>(run: () => Promise<A>): Promise<A> {
 export async function drainScaffoldLifecycleActions(input: {
   readonly store: ScaffoldLifecycleActionStore;
   readonly execute: (action: ScaffoldLifecycleAction) => Promise<ScaffoldOutboxExecutionResult>;
+  readonly onWait?: (action: ScaffoldLifecycleAction) => void;
   readonly onBlocked?: (action: ScaffoldLifecycleAction) => void;
   readonly now?: () => number;
   readonly actionId?: string;
@@ -315,6 +316,7 @@ export async function drainScaffoldLifecycleActions(input: {
     const outbox = makeScaffoldLifecycleOutbox({
       store,
       execute: input.execute,
+      ...(input.onWait ? { onWait: input.onWait } : {}),
       ...(input.onBlocked ? { onBlocked: input.onBlocked } : {}),
       ...(input.now ? { now: input.now } : {}),
     });

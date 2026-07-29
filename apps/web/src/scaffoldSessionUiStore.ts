@@ -18,6 +18,10 @@ export const SCAFFOLD_DEPLOYMENT_MISMATCH_MESSAGE =
   "Scaffold connected to a different target. Start a new session.";
 export const SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE =
   "This saved Scaffold session did not record its target. Start a new session.";
+export const SCAFFOLD_SESSION_STOPPED_MESSAGE =
+  "This Scaffold session has stopped. Start a new session.";
+export const SCAFFOLD_SESSION_FAILED_MESSAGE =
+  "This Scaffold session failed and cannot be resumed. Start a new session.";
 
 export interface ScaffoldSessionUiEntry {
   readonly draftId: DraftId;
@@ -31,6 +35,7 @@ export interface ScaffoldSessionUiEntry {
   readonly lifecycleEpoch: number;
   readonly links: ScaffoldSessionLinks | null;
   readonly error: string | null;
+  readonly terminal?: boolean;
   readonly createdAt: string;
 }
 
@@ -58,6 +63,7 @@ export function scaffoldSessionUiEntryFromCreateAction(
     lifecycleEpoch: action.expectedLifecycleEpoch,
     links: null,
     error: null,
+    terminal: false,
     createdAt: action.createdAt,
   };
 }
@@ -93,10 +99,24 @@ interface ScaffoldSessionUiState {
   begin: (
     entry: Omit<
       ScaffoldSessionUiEntry,
-      "phase" | "environmentId" | "lifecycleEpoch" | "links" | "error"
+      "phase" | "environmentId" | "lifecycleEpoch" | "links" | "error" | "terminal"
     >,
   ) => void;
   connected: (draftId: DraftId, binding: ScaffoldEnvironmentBinding) => void;
+  rebindCreating: (
+    draftId: DraftId,
+    actionId: string,
+    sessionId: string,
+    lifecycleEpoch: number,
+  ) => void;
+  terminal: (
+    draftId: DraftId,
+    observation: {
+      readonly sessionId: string;
+      readonly lifecycleEpoch: number;
+      readonly status: "stopped" | "failed";
+    },
+  ) => void;
   fail: (draftId: DraftId, error: string) => void;
   setPhase: (draftId: DraftId, phase: ScaffoldSessionUiPhase) => void;
   rememberVolatileCreateAction: (action: ScaffoldLifecycleAction) => void;
@@ -124,6 +144,7 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
               lifecycleEpoch: 0,
               links: null,
               error: null,
+              terminal: false,
             },
           },
         })),
@@ -131,6 +152,7 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
         set((state) => {
           const current = state.entriesByDraftId[draftId];
           if (!current) return state;
+          if (current.terminal === true) return state;
           if (binding.deployment !== current.deployment) {
             return {
               entriesByDraftId: {
@@ -146,18 +168,85 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
               },
             };
           }
+          if (binding.status === "stopped" || binding.status === "failed") {
+            return {
+              entriesByDraftId: {
+                ...state.entriesByDraftId,
+                [draftId]: {
+                  ...current,
+                  phase: "failed",
+                  environmentId: binding.environmentId,
+                  sessionId: binding.sessionId,
+                  lifecycleEpoch: binding.lifecycleEpoch,
+                  links: binding.links,
+                  error:
+                    binding.status === "stopped"
+                      ? SCAFFOLD_SESSION_STOPPED_MESSAGE
+                      : SCAFFOLD_SESSION_FAILED_MESSAGE,
+                  terminal: true,
+                },
+              },
+            };
+          }
+          if (current.phase === "paused" && binding.status !== "paused") {
+            return state;
+          }
           return {
             entriesByDraftId: {
               ...state.entriesByDraftId,
               [draftId]: {
                 ...current,
-                phase:
-                  binding.status === "paused" || binding.status === "stopped" ? "paused" : "ready",
+                phase: binding.status === "paused" ? "paused" : "ready",
                 environmentId: binding.environmentId,
                 sessionId: binding.sessionId,
                 lifecycleEpoch: binding.lifecycleEpoch,
                 links: binding.links,
                 error: null,
+                terminal: false,
+              },
+            },
+          };
+        }),
+      rebindCreating: (draftId, actionId, sessionId, lifecycleEpoch) =>
+        set((state) => {
+          const current = state.entriesByDraftId[draftId];
+          if (!current || current.phase !== "creating" || current.actionId !== actionId) {
+            return state;
+          }
+          return {
+            entriesByDraftId: {
+              ...state.entriesByDraftId,
+              [draftId]: {
+                ...current,
+                sessionId,
+                lifecycleEpoch,
+                environmentId: null,
+                links: null,
+                error: null,
+                terminal: false,
+              },
+            },
+          };
+        }),
+      terminal: (draftId, observation) =>
+        set((state) => {
+          const current = state.entriesByDraftId[draftId];
+          if (!current) return state;
+          return {
+            entriesByDraftId: {
+              ...state.entriesByDraftId,
+              [draftId]: {
+                ...current,
+                phase: "failed",
+                environmentId: null,
+                sessionId: observation.sessionId,
+                lifecycleEpoch: observation.lifecycleEpoch,
+                links: null,
+                error:
+                  observation.status === "stopped"
+                    ? SCAFFOLD_SESSION_STOPPED_MESSAGE
+                    : SCAFFOLD_SESSION_FAILED_MESSAGE,
+                terminal: true,
               },
             },
           };
@@ -165,7 +254,7 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
       fail: (draftId, error) =>
         set((state) => {
           const current = state.entriesByDraftId[draftId];
-          if (!current) return state;
+          if (!current || current.terminal === true) return state;
           return {
             entriesByDraftId: {
               ...state.entriesByDraftId,
@@ -176,7 +265,7 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
       setPhase: (draftId, phase) =>
         set((state) => {
           const current = state.entriesByDraftId[draftId];
-          if (!current || current.phase === phase) return state;
+          if (!current || current.terminal === true || current.phase === phase) return state;
           return {
             entriesByDraftId: {
               ...state.entriesByDraftId,

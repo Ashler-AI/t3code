@@ -14,6 +14,7 @@ import {
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
+import { useAtomValue } from "@effect/atom-react";
 import { useRouter } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef } from "react";
 
@@ -45,6 +46,33 @@ import {
   scaffoldSessionForEnvironment,
   useScaffoldSessionUiStore,
 } from "../scaffoldSessionUiStore";
+import { useThreadSettlementUiStore } from "../threadSettlementUiStore";
+import { environmentCatalog } from "../connection/catalog";
+
+export function shouldSettleScaffoldThreadLocally(input: {
+  readonly isScaffold: boolean;
+  readonly connectionPhase:
+    | "available"
+    | "offline"
+    | "connecting"
+    | "reconnecting"
+    | "connected"
+    | "error"
+    | null;
+}): boolean {
+  return input.isScaffold && input.connectionPhase !== "connected";
+}
+
+export function resolveThreadSettlementAuthority(input: {
+  readonly isScaffold: boolean;
+  readonly connectionPhase: Parameters<
+    typeof shouldSettleScaffoldThreadLocally
+  >[0]["connectionPhase"];
+  readonly serverSupportsSettlement: boolean;
+}): "local" | "server" | "unsupported" {
+  if (shouldSettleScaffoldThreadLocally(input)) return "local";
+  return input.serverSupportsSettlement ? "server" : "unsupported";
+}
 
 export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
@@ -108,10 +136,13 @@ export class ThreadSnoozeBlockedError extends Schema.TaggedErrorClass<ThreadSnoo
 
 export function useThreadActions() {
   const { environments } = useEnvironments();
+  const connectionCatalog = useAtomValue(environmentCatalog.catalogValueAtom);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const pauseScaffold = useAtomCommand(serverEnvironment.pauseScaffold, {
     reportFailure: false,
   });
+  const markThreadLocallySettled = useThreadSettlementUiStore((state) => state.markSettled);
+  const clearThreadLocallySettled = useThreadSettlementUiStore((state) => state.clearSettled);
   const closeTerminal = useAtomCommand(terminalEnvironment.close);
   const archiveThreadMutation = useAtomCommand(threadEnvironment.archive, {
     reportFailure: false,
@@ -431,9 +462,25 @@ export function useThreadActions() {
 
   const settleThread = useCallback(
     async (target: ScopedThreadRef) => {
+      const catalogEntry = connectionCatalog.entries.get(target.environmentId);
+      const scaffoldTarget =
+        catalogEntry?.target._tag === "ScaffoldConnectionTarget" ? catalogEntry.target : null;
+      const scaffoldEnvironment = environments.find(
+        (environment) => environment.environmentId === target.environmentId,
+      );
+      const settlementAuthority = resolveThreadSettlementAuthority({
+        isScaffold: scaffoldTarget !== null,
+        // A registered Scaffold target with no presentation is disconnected,
+        // not connected. Cached shells can outlive their transport projection.
+        connectionPhase: scaffoldEnvironment?.connection.phase ?? null,
+        serverSupportsSettlement: readEnvironmentSupportsSettlement(target.environmentId),
+      });
+      const settleLocally = settlementAuthority === "local";
       // Version skew: never send the command to a server that predates it —
       // the raw protocol rejection would read as a random failure.
-      if (!readEnvironmentSupportsSettlement(target.environmentId)) {
+      // A disconnected Scaffold settle is browser presentation state and does
+      // not require the unreachable server to advertise the command.
+      if (settlementAuthority === "unsupported") {
         return AsyncResult.failure(
           Cause.fail(
             new ThreadSettlementUnsupportedError({
@@ -457,24 +504,22 @@ export function useThreadActions() {
           ),
         );
       }
-      // Settle is a high-frequency lifecycle action and stays silent — no
-      // toast.
-      const result = await settleThreadMutation({
-        environmentId: target.environmentId,
-        input: { threadId: target.threadId },
-      });
+      // A terminal thread in a disconnected Scaffold environment cannot write
+      // its own projection. Preserve the user's Done intent locally instead of
+      // requiring a dead connection. Connected sessions still use the T3
+      // server as the authoritative settlement path.
+      const result = settleLocally
+        ? AsyncResult.success(undefined)
+        : await settleThreadMutation({
+            environmentId: target.environmentId,
+            input: { threadId: target.threadId },
+          });
       if (result._tag === "Failure") return result;
+      if (settleLocally && resolved !== null) {
+        markThreadLocallySettled(target, resolved.thread.updatedAt);
+      }
 
-      const scaffoldEnvironment = environments.find(
-        (environment) =>
-          environment.environmentId === target.environmentId &&
-          environment.entry.target._tag === "ScaffoldConnectionTarget",
-      );
-      if (
-        scaffoldEnvironment?.entry.target._tag === "ScaffoldConnectionTarget" &&
-        primaryEnvironmentId !== null
-      ) {
-        const scaffoldTarget = scaffoldEnvironment.entry.target;
+      if (scaffoldTarget !== null && primaryEnvironmentId !== null) {
         const pauseResult = await pauseScaffold({
           environmentId: primaryEnvironmentId,
           input: new ScaffoldPauseInput({
@@ -492,16 +537,48 @@ export function useThreadActions() {
             target.environmentId,
           );
           if (entry) scaffoldUi.connected(entry.draftId, pauseResult.value);
+        } else if (settleLocally) {
+          const error = squashAtomCommandFailure(pauseResult);
+          toastManager.add(
+            stackedThreadToast({
+              type: "warning",
+              title: "Thread marked done",
+              description:
+                error instanceof Error
+                  ? `The sandbox could not be paused. ${error.message}`
+                  : "The sandbox could not be paused.",
+            }),
+          );
         }
       }
       return result;
     },
-    [environments, pauseScaffold, primaryEnvironmentId, resolveThreadTarget, settleThreadMutation],
+    [
+      connectionCatalog.entries,
+      environments,
+      markThreadLocallySettled,
+      pauseScaffold,
+      primaryEnvironmentId,
+      resolveThreadTarget,
+      settleThreadMutation,
+    ],
   );
 
   const unsettleThread = useCallback(
     async (target: ScopedThreadRef) => {
-      if (!readEnvironmentSupportsSettlement(target.environmentId)) {
+      const catalogEntry = connectionCatalog.entries.get(target.environmentId);
+      const scaffoldTarget =
+        catalogEntry?.target._tag === "ScaffoldConnectionTarget" ? catalogEntry.target : null;
+      const scaffoldEnvironment = environments.find(
+        (environment) => environment.environmentId === target.environmentId,
+      );
+      const settlementAuthority = resolveThreadSettlementAuthority({
+        isScaffold: scaffoldTarget !== null,
+        connectionPhase: scaffoldEnvironment?.connection.phase ?? null,
+        serverSupportsSettlement: readEnvironmentSupportsSettlement(target.environmentId),
+      });
+      const unsettleLocally = settlementAuthority === "local";
+      if (settlementAuthority === "unsupported") {
         return AsyncResult.failure(
           Cause.fail(
             new ThreadSettlementUnsupportedError({
@@ -511,6 +588,10 @@ export function useThreadActions() {
           ),
         );
       }
+      clearThreadLocallySettled(target);
+      if (unsettleLocally) {
+        return AsyncResult.success(undefined);
+      }
       // reason "user" pins the thread active: auto-settle (PR merged /
       // inactivity) stays suppressed until real activity clears the pin.
       return unsettleThreadMutation({
@@ -518,7 +599,7 @@ export function useThreadActions() {
         input: { threadId: target.threadId, reason: "user" },
       });
     },
-    [unsettleThreadMutation],
+    [clearThreadLocallySettled, connectionCatalog.entries, environments, unsettleThreadMutation],
   );
 
   const snoozeThread = useCallback(

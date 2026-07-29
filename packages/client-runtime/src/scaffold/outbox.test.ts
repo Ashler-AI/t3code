@@ -44,6 +44,71 @@ function memoryStore(initial: ReadonlyArray<ScaffoldLifecycleAction> = []) {
 }
 
 describe("Scaffold lifecycle outbox", () => {
+  it("schedules a wait without consuming attempt budget, then acknowledges the same action", async () => {
+    const pending = action("1", "create");
+    const { store, values } = memoryStore([pending]);
+    const executions: Array<{ actionId: string; sessionId: string; attempt: number }> = [];
+    const projectedWaits: ScaffoldLifecycleAction[] = [];
+    let now = 100;
+    const outbox = makeScaffoldLifecycleOutbox({
+      store,
+      execute: async (item) => {
+        executions.push({
+          actionId: item.actionId,
+          sessionId: item.sessionId,
+          attempt: item.attempt,
+        });
+        return executions.length === 1
+          ? {
+              _tag: "wait",
+              retryAfterMs: 500,
+              errorCode: "scaffold_preparation_pending",
+              observation: {
+                sessionId: "server-minted-session",
+                lifecycleEpoch: 3,
+              },
+            }
+          : { _tag: "acknowledged" };
+      },
+      now: () => now,
+      maxAttempts: 1,
+      onWait: (item) => projectedWaits.push(item),
+    });
+
+    await outbox.drain();
+
+    expect(values.get(pending.actionId)).toMatchObject({
+      attempt: 0,
+      blocked: false,
+      nextAttemptAt: 600,
+      lastErrorCode: "scaffold_preparation_pending",
+      actionId: pending.actionId,
+      connectionId: pending.connectionId,
+      environmentId: pending.environmentId,
+      sessionId: "server-minted-session",
+      expectedLifecycleEpoch: 3,
+    });
+    expect(projectedWaits).toMatchObject([
+      {
+        actionId: pending.actionId,
+        environmentId: pending.environmentId,
+        sessionId: "server-minted-session",
+        expectedLifecycleEpoch: 3,
+        attempt: 0,
+        blocked: false,
+      },
+    ]);
+
+    now = 600;
+    await outbox.drain();
+
+    expect(executions).toEqual([
+      { actionId: pending.actionId, sessionId: pending.sessionId, attempt: 0 },
+      { actionId: pending.actionId, sessionId: "server-minted-session", attempt: 0 },
+    ]);
+    expect(values.has(pending.actionId)).toBe(false);
+  });
+
   it("does not let a retry or blocked action starve later ready actions", async () => {
     const first = action("1");
     const second = action("2");

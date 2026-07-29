@@ -15,6 +15,7 @@ import {
   type OmpLoginChallenge,
   type ProjectId,
   type ScaffoldDeployment,
+  type ScaffoldDeploymentCapabilities,
   type SourceControlDiscoveryResult,
   type SourceControlProviderKind,
   type SourceControlRepositoryInfo,
@@ -56,6 +57,7 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
+import { requestScaffoldDeploymentCapabilities } from "../connection/scaffold";
 import {
   browserOmpAccountOverviewCache,
   cacheOmpAccountOverview,
@@ -128,6 +130,8 @@ import {
   filterBrowseEntries,
   filterCommandPaletteGroups,
   getScaffoldNewSessionActionPresentation,
+  loadScaffoldDeploymentCapabilities,
+  refreshNewSessionPaletteView,
   runScaffoldDraftLaunch,
   getCommandPaletteInputPlaceholder,
   getCommandPaletteMode,
@@ -147,6 +151,7 @@ import {
   getOmpLoginActionPresentation,
   InvalidOmpAuthorizationUrlError,
   normalizeOmpAuthorizationUrl,
+  observeOmpLoginBrowserWindowClose,
   ompLoginChallengeExpiryDelay,
   preserveOmpOverviewAfterRefreshFailure,
   prepareOmpLoginBrowserWindow,
@@ -791,12 +796,23 @@ function OpenCommandPaletteDialog(props: {
   const [ompRefreshWarning, setOmpRefreshWarning] = useState<string | null>(null);
   const [isOmpCacheHydrated, setIsOmpCacheHydrated] = useState(false);
   const [isRefreshingOmpAccounts, setIsRefreshingOmpAccounts] = useState(false);
+  const [scaffoldDeploymentCapabilities, setScaffoldDeploymentCapabilities] =
+    useState<ScaffoldDeploymentCapabilities | null>(null);
   const ompOverviewRef = useRef(ompOverview);
   const ompOverviewCachedAtRef = useRef(ompOverviewCachedAt);
   ompOverviewRef.current = ompOverview;
   ompOverviewCachedAtRef.current = ompOverviewCachedAt;
   const ompRefreshInFlightRef = useRef<Promise<void> | null>(null);
   const refreshOmpSnapshot = ompSnapshotQuery.refresh;
+
+  useEffect(() => {
+    // The capability endpoint belongs to the configured primary transport and
+    // is usable before environment entity hydration publishes an id.
+    return loadScaffoldDeploymentCapabilities({
+      request: requestScaffoldDeploymentCapabilities,
+      setCapabilities: setScaffoldDeploymentCapabilities,
+    });
+  }, [primaryEnvironmentId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -979,17 +995,13 @@ function OpenCommandPaletteDialog(props: {
                 window.open(authorizationUrl, "_blank", "noopener,noreferrer");
                 return;
               }
-              void loginBrowser
-                .waitUntilClosed(loginBrowserMonitor.signal)
-                .then((closed) => {
-                  if (!closed) return;
+              void observeOmpLoginBrowserWindowClose(
+                loginBrowser,
+                loginBrowserMonitor.signal,
+                () => {
                   loginBrowserWasClosed = true;
-                  // OMP ignores cancellation after accepting the OAuth callback,
-                  // so a user-closed provider tab releases an unfinished flow
-                  // without aborting token exchange already in progress.
-                  void cancel().catch(() => undefined);
-                })
-                .catch(() => undefined);
+                },
+              ).catch(() => undefined);
             },
             requestInput: requestOmpLoginInput,
             respond: async (flowId, response) => {
@@ -1196,12 +1208,23 @@ function OpenCommandPaletteDialog(props: {
       }),
     [activeDraftThread, activeThread, defaultProjectRef, handleNewThread],
   );
-  const scaffoldNewSessionActionPresentation = useMemo(
+  const scaffoldCapabilityByDeployment = useMemo(
     () =>
+      new Map(
+        scaffoldDeploymentCapabilities?.deployments.map((capability) => [
+          capability.deployment,
+          capability,
+        ]) ?? [],
+      ),
+    [scaffoldDeploymentCapabilities],
+  );
+  const scaffoldNewSessionActionPresentation = useCallback(
+    (deployment: ScaffoldDeployment) =>
       getScaffoldNewSessionActionPresentation({
         hasContextualProject: contextualProjectRef !== null,
+        capability: scaffoldCapabilityByDeployment.get(deployment) ?? null,
       }),
-    [contextualProjectRef],
+    [contextualProjectRef, scaffoldCapabilityByDeployment],
   );
   const startScaffoldThread = useCallback(
     (deployment: ScaffoldDeployment) => {
@@ -1219,6 +1242,7 @@ function OpenCommandPaletteDialog(props: {
         deployment,
         execute: async (context) => {
           const scaffoldUi = useScaffoldSessionUiStore.getState();
+          let launchModelSelection = defaultScaffoldModelSelection;
           await runScaffoldDraftLaunch<
             DraftId,
             Extract<ScaffoldLifecycleAction, { readonly kind: "create" }>
@@ -1233,25 +1257,19 @@ function OpenCommandPaletteDialog(props: {
                   const sourceModelSelection = draft?.activeProvider
                     ? (draft.modelSelectionByProvider[draft.activeProvider] ?? null)
                     : null;
-                  composerDrafts.setModelSelection(
-                    draftId,
+                  launchModelSelection =
                     resolveScaffoldDraftModelSelection(providers, sourceModelSelection) ??
-                      defaultScaffoldModelSelection,
-                    { replaceOptions: true },
-                  );
+                    defaultScaffoldModelSelection;
+                  composerDrafts.setModelSelection(draftId, launchModelSelection, {
+                    replaceOptions: true,
+                  });
                 },
                 prepareDraftBeforeNavigation,
               });
             },
             createAction: (draftId) => {
               const locked = context.lockLatest();
-              const draft = useComposerDraftStore.getState().getComposerDraft(draftId);
-              const modelSelection = draft?.activeProvider
-                ? (draft.modelSelectionByProvider[draft.activeProvider] ?? null)
-                : null;
-              const modelGrant = modelSelection
-                ? scaffoldCreateParametersForModelSelection(modelSelection)
-                : null;
+              const modelGrant = scaffoldCreateParametersForModelSelection(launchModelSelection);
               if (modelGrant === null) {
                 throw new Error("Scaffold requires an OMP model before the session can start.");
               }
@@ -1771,8 +1789,10 @@ function OpenCommandPaletteDialog(props: {
     projectThreadItems,
   ]);
 
-  const newSessionGroups = useMemo<CommandPaletteView["groups"]>(
-    () => [
+  const newSessionGroups = useMemo<CommandPaletteView["groups"]>(() => {
+    const stagingPresentation = scaffoldNewSessionActionPresentation("staging");
+    const productionPresentation = scaffoldNewSessionActionPresentation("production");
+    return [
       {
         value: "session-location",
         label: "Run on",
@@ -1793,9 +1813,9 @@ function OpenCommandPaletteDialog(props: {
             value: "action:new-session:scaffold:staging",
             searchTerms: ["staging", "scaffold", "cloud"],
             title: "Scaffold staging",
-            description: scaffoldNewSessionActionPresentation.description,
+            description: stagingPresentation.description,
             icon: <CloudIcon className={ITEM_ICON_CLASS} />,
-            disabled: scaffoldNewSessionActionPresentation.disabled,
+            disabled: stagingPresentation.disabled,
             run: async () => startScaffoldThread("staging"),
           },
           {
@@ -1803,21 +1823,20 @@ function OpenCommandPaletteDialog(props: {
             value: "action:new-session:scaffold:production",
             searchTerms: ["production", "scaffold", "cloud"],
             title: "Scaffold production",
-            description: scaffoldNewSessionActionPresentation.description,
+            description: productionPresentation.description,
             icon: <CloudIcon className={ITEM_ICON_CLASS} />,
-            disabled: scaffoldNewSessionActionPresentation.disabled,
+            disabled: productionPresentation.disabled,
             run: async () => startScaffoldThread("production"),
           },
         ],
       },
-    ],
-    [
-      newLocalSessionProjectItems,
-      projects.length,
-      scaffoldNewSessionActionPresentation,
-      startScaffoldThread,
-    ],
-  );
+    ];
+  }, [
+    newLocalSessionProjectItems,
+    projects.length,
+    scaffoldNewSessionActionPresentation,
+    startScaffoldThread,
+  ]);
   const newSessionItem: CommandPaletteSubmenuItem = {
     kind: "submenu",
     value: "action:new-session",
@@ -1827,6 +1846,10 @@ function OpenCommandPaletteDialog(props: {
     addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
     groups: newSessionGroups,
   };
+
+  useEffect(() => {
+    setViewStack((previousViews) => refreshNewSessionPaletteView(previousViews, newSessionGroups));
+  }, [newSessionGroups]);
 
   useLayoutEffect(() => {
     if (openIntent?.kind !== "new-session") {

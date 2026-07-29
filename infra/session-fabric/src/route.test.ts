@@ -12,6 +12,15 @@ describe("session fabric worker routes", () => {
     ).toEqual({ type: "session", sessionId: "global:session" });
   });
 
+  it("routes session authority reads to the session Durable Object", () => {
+    expect(
+      resolveSessionFabricRoute(
+        "GET",
+        new URL("https://fabric.example/v1/session-fabric/sessions/global%3Asession/authority"),
+      ),
+    ).toEqual({ type: "session", sessionId: "global:session" });
+  });
+
   it("keeps directory and semantic search routes separate from a session stream", () => {
     expect(
       resolveSessionFabricRoute(

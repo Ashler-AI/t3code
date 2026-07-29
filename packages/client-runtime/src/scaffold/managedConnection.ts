@@ -1,6 +1,7 @@
 import { type ScaffoldLifecycleError, type ScaffoldPreparedConnection } from "@t3tools/contracts";
-import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import {
@@ -11,6 +12,8 @@ import {
   type PreparedConnection,
   ScaffoldConnectionTarget,
 } from "../connection/model.ts";
+import { environmentEndpointUrl } from "../environment/endpoint.ts";
+import { shouldRenewScaffoldTransportGrant } from "./reconcile.ts";
 
 export class ScaffoldLifecycleGateway extends Context.Service<
   ScaffoldLifecycleGateway,
@@ -69,6 +72,27 @@ export function mapScaffoldLifecycleError(error: ScaffoldLifecycleError): Connec
   }
 }
 
+function isStaleScaffoldAttachGrant(
+  error: ConnectionAttemptError,
+  prepared: ScaffoldPreparedConnection,
+): boolean {
+  if (error._tag !== "ConnectionTransientError" || error.reason !== "remote-unavailable") {
+    return false;
+  }
+  const descriptorUrl = environmentEndpointUrl(prepared.httpBaseUrl, "/.well-known/t3/environment");
+  return (
+    error.detail === `Remote environment endpoint ${descriptorUrl} returned undeclared status 409.`
+  );
+}
+
+function persistentScaffoldAttachFailure(): ConnectionBlockedError {
+  return new ConnectionBlockedError({
+    reason: "remote-unavailable",
+    detail:
+      "Scaffold could not attach this saved session after refreshing its connection. Try reconnecting later or start a new session.",
+  });
+}
+
 /**
  * Bridges the local-server lifecycle RPC to T3's ordinary direct remote auth.
  * Only the credential-free binding is returned for persistence. Bootstrap and
@@ -81,22 +105,44 @@ export const prepareManagedScaffoldConnection = Effect.fn(
   readonly targetForBinding: (binding: ScaffoldPreparedConnection["binding"]) => ConnectionTarget;
 }) {
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
-  const preparedResult = yield* input.prepare.pipe(Effect.mapError(mapScaffoldLifecycleError));
-  const target = input.targetForBinding(preparedResult.binding);
-  const authorized = yield* remote.authorizeDpop({
-    expectedEnvironmentId: preparedResult.binding.environmentId,
-    persistAccessToken: false,
-    obtainBootstrap: Effect.succeed({
-      environmentId: preparedResult.binding.environmentId,
-      endpoint: {
-        httpBaseUrl: preparedResult.httpBaseUrl,
-        wsBaseUrl: preparedResult.wsBaseUrl,
-        providerKind: "manual" as const,
-      },
-      credential: preparedResult.bootstrapCredential,
-      attachCredential: preparedResult.attachCredential,
+  let preparedResult = yield* input.prepare.pipe(Effect.mapError(mapScaffoldLifecycleError));
+  const nowMs = yield* Clock.currentTimeMillis;
+  if (shouldRenewScaffoldTransportGrant({ expiresAt: preparedResult.expiresAt, nowMs })) {
+    preparedResult = yield* input.prepare.pipe(Effect.mapError(mapScaffoldLifecycleError));
+  }
+  const authorize = (prepared: ScaffoldPreparedConnection) =>
+    remote.authorizeDpop({
+      expectedEnvironmentId: prepared.binding.environmentId,
+      persistAccessToken: false,
+      obtainBootstrap: Effect.succeed({
+        environmentId: prepared.binding.environmentId,
+        endpoint: {
+          httpBaseUrl: prepared.httpBaseUrl,
+          wsBaseUrl: prepared.wsBaseUrl,
+          providerKind: "manual" as const,
+        },
+        credential: prepared.bootstrapCredential,
+        attachCredential: prepared.attachCredential,
+      }),
+    });
+  const authorized = yield* authorize(preparedResult).pipe(
+    Effect.catch((error) => {
+      if (!isStaleScaffoldAttachGrant(error, preparedResult)) {
+        return Effect.fail(error);
+      }
+      return Effect.gen(function* () {
+        preparedResult = yield* input.prepare.pipe(Effect.mapError(mapScaffoldLifecycleError));
+        return yield* authorize(preparedResult).pipe(
+          Effect.mapError((retryError) =>
+            isStaleScaffoldAttachGrant(retryError, preparedResult)
+              ? persistentScaffoldAttachFailure()
+              : retryError,
+          ),
+        );
+      });
     }),
-  });
+  );
+  const target = input.targetForBinding(preparedResult.binding);
   return {
     binding: preparedResult.binding,
     connection: {

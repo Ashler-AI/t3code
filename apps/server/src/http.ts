@@ -2,8 +2,10 @@ import Mime from "@effect/platform-node/Mime";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  EnvironmentId,
   EnvironmentHttpApi,
   ScaffoldLifecycleError,
+  ScaffoldObserveInput,
   SessionFabricSessionId,
   TrimmedNonEmptyString,
   ScaffoldPrepareConnectionInput,
@@ -11,6 +13,7 @@ import {
   ScaffoldRetentionCloneImportInput,
   ScaffoldSessionTransferStartInput,
   ScaffoldWorkspaceMigrationImportInput,
+  ThreadId,
 } from "@t3tools/contracts";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as Data from "effect/Data";
@@ -59,6 +62,7 @@ const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
 const decodeScaffoldPrepareConnectionInput = Schema.decodeUnknownEffect(
   ScaffoldPrepareConnectionInput,
 );
+const decodeScaffoldObserveInput = Schema.decodeUnknownEffect(ScaffoldObserveInput);
 const decodeScaffoldRetentionCaptureInput = Schema.decodeUnknownEffect(
   ScaffoldRetentionCaptureInput,
 );
@@ -68,13 +72,30 @@ const decodeScaffoldWorkspaceMigrationImportInput = Schema.decodeUnknownEffect(
 const decodeScaffoldSessionTransferStartInput = Schema.decodeUnknownEffect(
   ScaffoldSessionTransferStartInput,
 );
-const SessionFabricCapabilityProxyRequest = Schema.Struct({
+const sessionFabricCapabilityDeployment = {
   deployment: Schema.optional(Schema.Literals(["staging", "production"])),
-  role: Schema.Literals(["viewer", "controller"]),
-  fabricSessionId: Schema.optional(SessionFabricSessionId),
-  scaffoldSessionId: Schema.optional(TrimmedNonEmptyString),
-  scaffoldLifecycleEpoch: Schema.optional(Schema.Number),
-}).annotate({ parseOptions: { onExcessProperty: "error" } });
+} as const;
+const SessionFabricCapabilityProxyRequest = Schema.Union([
+  Schema.Struct({
+    ...sessionFabricCapabilityDeployment,
+    role: Schema.Literal("viewer"),
+  }),
+  Schema.Struct({
+    ...sessionFabricCapabilityDeployment,
+    role: Schema.Literal("controller"),
+    fabricSessionId: SessionFabricSessionId,
+    scaffoldSessionId: TrimmedNonEmptyString,
+    scaffoldLifecycleEpoch: Schema.Number,
+  }),
+  Schema.Struct({
+    ...sessionFabricCapabilityDeployment,
+    role: Schema.Literal("controller"),
+    fabricSessionId: SessionFabricSessionId,
+    environmentKind: Schema.Literal("local"),
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+  }),
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 const decodeSessionFabricCapabilityProxyRequest = Schema.decodeUnknownEffect(
   SessionFabricCapabilityProxyRequest,
 );
@@ -294,6 +315,81 @@ export const scaffoldPrepareConnectionRouteLayer = HttpRouter.add(
 );
 
 /**
+ * Read-only reconciliation for persisted Scaffold UI projections. This route
+ * observes lifecycle state only; it never resumes a sandbox or issues transport.
+ */
+export const scaffoldObserveSessionRouteLayer = HttpRouter.add(
+  "POST",
+  "/api/scaffold/observation",
+  Effect.gen(function* () {
+    yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const input = yield* decodeScaffoldObserveInput(yield* request.json).pipe(Effect.option);
+    if (Option.isNone(input)) {
+      return HttpServerResponse.jsonUnsafe(
+        { error: "scaffold_observation_invalid_request" },
+        { status: 400, headers: { "cache-control": "no-store" } },
+      );
+    }
+    return yield* scaffoldLifecycleRequestEffect(
+      () => scaffoldLifecycle.observe(input.value),
+      () =>
+        new ScaffoldLifecycleError({
+          reason: "unavailable",
+          message: "Scaffold session status could not be checked.",
+          status: 503,
+          code: "scaffold_observation_failed",
+        }),
+    ).pipe(
+      Effect.map((observation) =>
+        HttpServerResponse.jsonUnsafe(observation, {
+          status: 200,
+          headers: { "cache-control": "no-store" },
+        }),
+      ),
+      Effect.catch((lifecycleError) =>
+        Effect.succeed(
+          HttpServerResponse.jsonUnsafe(lifecycleError, {
+            status: lifecycleError.status >= 400 ? lifecycleError.status : 503,
+            headers: { "cache-control": "no-store" },
+          }),
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
+  ),
+);
+
+/**
+ * Read-only capability projection for the local UI. The server probes each
+ * configured control-plane collection with its server-held credential, while
+ * the browser receives only a safe availability label.
+ */
+export const scaffoldDeploymentCapabilitiesRouteLayer = HttpRouter.add(
+  "GET",
+  "/api/scaffold/deployments",
+  Effect.gen(function* () {
+    yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
+    const capabilities = yield* Effect.promise(() => scaffoldLifecycle.deploymentCapabilities());
+    return HttpServerResponse.jsonUnsafe(capabilities, {
+      status: 200,
+      headers: { "cache-control": "no-store" },
+    });
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
+  ),
+);
+
+/**
  * Local browsers obtain short-lived relay capabilities through T3 so Scaffold
  * OAuth/IAP credentials never cross into browser storage. Mounted Scaffold
  * routes intercept the same path and apply the authenticated web actor there.
@@ -314,16 +410,9 @@ export const scaffoldSessionFabricCapabilityRouteLayer = HttpRouter.add(
     }
     const input = decoded.value;
     if (
-      (input.role === "viewer" &&
-        (input.fabricSessionId !== undefined ||
-          input.scaffoldSessionId !== undefined ||
-          input.scaffoldLifecycleEpoch !== undefined)) ||
-      (input.role === "controller" &&
-        (input.fabricSessionId === undefined ||
-          input.scaffoldSessionId === undefined ||
-          input.scaffoldLifecycleEpoch === undefined ||
-          !Number.isSafeInteger(input.scaffoldLifecycleEpoch) ||
-          input.scaffoldLifecycleEpoch < 0))
+      input.role === "controller" &&
+      "scaffoldLifecycleEpoch" in input &&
+      (!Number.isSafeInteger(input.scaffoldLifecycleEpoch) || input.scaffoldLifecycleEpoch < 0)
     ) {
       return HttpServerResponse.jsonUnsafe(
         { error: "session_fabric_capability_invalid_request" },
@@ -334,12 +423,20 @@ export const scaffoldSessionFabricCapabilityRouteLayer = HttpRouter.add(
     const capability =
       input.role === "viewer"
         ? ({ role: "viewer" } as const)
-        : ({
-            role: "controller",
-            fabricSessionId: input.fabricSessionId!,
-            scaffoldSessionId: input.scaffoldSessionId!,
-            scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch!,
-          } as const);
+        : "environmentKind" in input
+          ? ({
+              role: "controller",
+              fabricSessionId: input.fabricSessionId,
+              environmentKind: input.environmentKind,
+              environmentId: input.environmentId,
+              threadId: input.threadId,
+            } as const)
+          : ({
+              role: "controller",
+              fabricSessionId: input.fabricSessionId,
+              scaffoldSessionId: input.scaffoldSessionId,
+              scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch,
+            } as const);
     return yield* scaffoldLifecycleRequestEffect(
       () =>
         scaffoldLifecycle.issueSessionFabricCapability({

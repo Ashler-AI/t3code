@@ -8,6 +8,7 @@ import type {
   OrchestrationThread,
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadShell,
+  ScaffoldDeployment,
   SessionFabricClientFrame,
   SessionFabricCapabilityGrant,
   SessionFabricCommand,
@@ -23,6 +24,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   SESSION_FABRIC_PROTOCOL_VERSION,
+  SessionFabricCapabilityGrant as SessionFabricCapabilityGrantSchema,
   SessionFabricClientFrame as SessionFabricClientFrameSchema,
   SessionFabricRunnerId,
   SessionFabricServerFrame as SessionFabricServerFrameSchema,
@@ -57,6 +59,7 @@ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSn
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as CheckpointDiffQuery from "../checkpointing/CheckpointDiffQuery.ts";
 import { requestScaffoldRunnerCapability } from "../scaffold/ScaffoldControlPlaneClient.ts";
+import { resolveScaffoldTarget } from "../scaffold/ScaffoldConfig.ts";
 
 const SessionFabricRunnerEnvConfig = Config.all({
   relayUrl: Config.url("T3CODE_SESSION_FABRIC_RELAY_URL").pipe(Config.option),
@@ -79,6 +82,14 @@ const SessionFabricRunnerEnvConfig = Config.all({
   authMode: Config.literals(["required", "disabled"], "T3CODE_SESSION_FABRIC_AUTH_MODE").pipe(
     Config.withDefault("required"),
   ),
+  capabilityDeployment: Config.literals(
+    ["staging", "production"],
+    "T3CODE_SESSION_FABRIC_CAPABILITY_DEPLOYMENT",
+  ).pipe(Config.option),
+  scaffoldDefaultDeployment: Config.literals(
+    ["staging", "production"],
+    "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT",
+  ).pipe(Config.option),
 });
 
 export interface SessionFabricRunnerConfig {
@@ -93,6 +104,7 @@ export interface SessionFabricRunnerConfig {
   readonly scaffoldLifecycleEpoch: number | null;
   readonly runtimeApiToken: string | null;
   readonly authMode: "required" | "disabled";
+  readonly capabilityDeployment: ScaffoldDeployment | null;
 }
 
 interface SessionFabricRunnerSession {
@@ -127,6 +139,17 @@ export function resolveSessionFabricRunnerConfig(
   if (scaffoldLifecycleEpoch !== null && scaffoldLifecycleEpoch < 0) {
     throw new Error("Scaffold lifecycle epoch must be non-negative.");
   }
+  const scaffoldSessionUrl = optionValue(config.scaffoldSessionUrl);
+  const runtimeApiToken = optionValue(config.runtimeApiToken);
+  if (
+    environmentKind === "local" &&
+    (scaffoldSessionId !== null ||
+      scaffoldSessionUrl !== null ||
+      scaffoldLifecycleEpoch !== null ||
+      runtimeApiToken !== null)
+  ) {
+    throw new Error("A local session fabric runner cannot include Scaffold runtime bindings.");
+  }
   return {
     relayUrl: optionValue(config.relayUrl),
     environmentKind,
@@ -136,11 +159,79 @@ export function resolveSessionFabricRunnerConfig(
       overrideSessionId === null ? null : SessionFabricSessionIdSchema.make(overrideSessionId),
     overrideThreadId: overrideThreadId === null ? null : (overrideThreadId as ThreadId),
     scaffoldSessionId,
-    scaffoldSessionUrl: optionValue(config.scaffoldSessionUrl),
+    scaffoldSessionUrl,
     scaffoldLifecycleEpoch,
-    runtimeApiToken: optionValue(config.runtimeApiToken),
+    runtimeApiToken,
     authMode: config.authMode,
+    capabilityDeployment:
+      optionValue(config.capabilityDeployment) ?? optionValue(config.scaffoldDefaultDeployment),
   };
+}
+
+const decodeCapabilityGrant = Schema.decodeUnknownSync(SessionFabricCapabilityGrantSchema);
+const LOCAL_RUNNER_SCOPES = ["session:publish", "session:execute"] as const;
+
+export async function requestLocalSessionFabricRunnerCapability(input: {
+  readonly deployment: ScaffoldDeployment;
+  readonly fabricSessionId: SessionFabricSessionId;
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly runnerId: typeof SessionFabricRunnerId.Type;
+  readonly fetch?: typeof globalThis.fetch;
+  readonly environment?: Readonly<Record<string, string | undefined>>;
+  readonly now?: () => number;
+  readonly timeoutMs?: number;
+  readonly target?: {
+    readonly baseUrl: string;
+    readonly authorization: string;
+    readonly authMode: "oauth" | "iap";
+  };
+}): Promise<SessionFabricCapabilityGrant> {
+  const target =
+    input.target ?? resolveScaffoldTarget(input.deployment, input.environment ?? process.env);
+  if (target.authMode !== "oauth") {
+    throw new Error("Local session fabric capabilities require Scaffold OAuth.");
+  }
+  const response = await (input.fetch ?? globalThis.fetch.bind(globalThis))(
+    new URL("/api/session-fabric/capabilities", target.baseUrl),
+    {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        authorization: target.authorization,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        role: "runner",
+        fabricSessionId: input.fabricSessionId,
+        environmentKind: "local",
+        environmentId: input.environmentId,
+        threadId: input.threadId,
+        runnerId: input.runnerId,
+      }),
+      signal: AbortSignal.timeout(input.timeoutMs ?? 5_000),
+    },
+  );
+  if (!response.ok) throw new Error(`Scaffold capability request failed (${response.status}).`);
+  const grant = decodeCapabilityGrant(await response.json());
+  const bindings = grant.bindings;
+  if (
+    grant.role !== "runner" ||
+    grant.scopes.length !== LOCAL_RUNNER_SCOPES.length ||
+    !LOCAL_RUNNER_SCOPES.every((scope) => grant.scopes.includes(scope)) ||
+    Date.parse(grant.expiresAt) <= (input.now ?? Date.now)() ||
+    !("environmentKind" in bindings) ||
+    bindings.environmentKind !== "local" ||
+    bindings.fabricSessionId !== input.fabricSessionId ||
+    bindings.environmentId !== input.environmentId ||
+    bindings.threadId !== input.threadId ||
+    !("runnerId" in bindings) ||
+    bindings.runnerId !== input.runnerId ||
+    bindings.actorId.length === 0
+  ) {
+    throw new Error("Scaffold returned an invalid local session fabric capability.");
+  }
+  return grant;
 }
 
 export function resolveSessionFabricSessionId(input: {
@@ -391,8 +482,25 @@ export const make = Effect.gen(function* () {
       config.authMode === "disabled"
         ? null
         : yield* Effect.gen(function* () {
+            if (config.environmentKind === "local") {
+              if (config.capabilityDeployment === null) {
+                return yield* new SessionFabricRunnerCapabilityError({
+                  reason: "configuration",
+                });
+              }
+              return yield* Effect.tryPromise({
+                try: () =>
+                  requestLocalSessionFabricRunnerCapability({
+                    deployment: config.capabilityDeployment!,
+                    fabricSessionId: session.sessionId,
+                    environmentId,
+                    threadId: session.threadId,
+                    runnerId,
+                  }),
+                catch: () => new SessionFabricRunnerCapabilityError({ reason: "unavailable" }),
+              });
+            }
             if (
-              config.environmentKind !== "scaffold" ||
               config.scaffoldSessionId === null ||
               config.scaffoldSessionUrl === null ||
               config.scaffoldLifecycleEpoch === null ||

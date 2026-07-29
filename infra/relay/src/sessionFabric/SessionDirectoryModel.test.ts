@@ -101,7 +101,7 @@ describe("SessionDirectoryModel", () => {
     expect(results[0]?.session.sessionId).toBe(SessionFabricSessionId.make("relay"));
   });
 
-  it("filters local and private sessions before ranking and limiting", () => {
+  it("includes public local sessions but filters private sessions before ranking and limiting", () => {
     const publicScaffold = session({
       id: "public-scaffold",
       text: "relay capacity",
@@ -140,7 +140,7 @@ describe("SessionDirectoryModel", () => {
       ],
     });
     expect(results.map((result) => result.session.sessionId)).toEqual([
-      SessionFabricSessionId.make("public-scaffold"),
+      SessionFabricSessionId.make("local"),
     ]);
   });
 

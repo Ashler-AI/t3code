@@ -13,6 +13,7 @@ import {
   InvalidOmpAuthorizationUrlError,
   normalizeOmpLoginChallengeResponse,
   normalizeOmpAuthorizationUrl,
+  observeOmpLoginBrowserWindowClose,
   ompLoginChallengeExpiryDelay,
   prepareOmpLoginBrowserWindow,
   preserveOmpOverviewAfterRefreshFailure,
@@ -172,6 +173,76 @@ describe("OMP account palette presentation", () => {
     await expect(monitor).resolves.toBe(true);
   });
 
+  it("keeps manual code login usable when an embedded browser closes the provider window", async () => {
+    const popup = {
+      closed: false,
+      opener: null,
+      location: { replace: () => undefined },
+      close: () => undefined,
+    };
+    const prepared = prepareOmpLoginBrowserWindow(() => popup);
+    const browserMonitor = new AbortController();
+    let observedClose = false;
+    let monitor: Promise<void> | undefined;
+    let cancelCalls = 0;
+    let responseCalls = 0;
+
+    const result = await completeOmpLoginFlow(
+      {
+        flowId: "login_embedded_browser",
+        provider: "anthropic",
+        kind: "browser",
+        url: "https://accounts.example.test/oauth",
+      },
+      {
+        openBrowser: (url) => {
+          expect(prepared.navigate(url)).toBe(true);
+          monitor = observeOmpLoginBrowserWindowClose(
+            prepared,
+            browserMonitor.signal,
+            () => {
+              observedClose = true;
+            },
+            1,
+          );
+          popup.closed = true;
+        },
+        requestInput: () => "manual-code",
+        respond: async (flowId, response) => {
+          responseCalls += 1;
+          if (responseCalls === 1) {
+            expect(response).toBe("");
+            return {
+              flowId,
+              provider: "anthropic",
+              kind: "input",
+              prompt: "Paste the authorization code.",
+            };
+          }
+          expect(response).toBe("manual-code");
+          return {
+            flowId,
+            provider: "anthropic",
+            kind: "complete",
+            outcome: "success",
+          };
+        },
+        submit: async () => ({ supported: false, accepted: false }),
+        getSubmitSupport: () => false,
+        setSubmitSupported: () => undefined,
+        dismissInput: () => undefined,
+        cancel: async () => {
+          cancelCalls += 1;
+        },
+      },
+    );
+
+    await monitor;
+    expect(observedClose).toBe(true);
+    expect(cancelCalls).toBe(0);
+    expect(result).toMatchObject({ kind: "complete", outcome: "success" });
+  });
+
   it("stops watching an open provider window after the login completes", async () => {
     const popup = {
       closed: false,
@@ -271,6 +342,41 @@ describe("OMP account palette presentation", () => {
     expect(opened).toEqual(["https://example.test/oauth"]);
     expect(responses).toEqual([""]);
     expect(result?.outcome).toBe("success");
+  });
+
+  it("keeps a successful OAuth result when browser-close cancellation finishes later", async () => {
+    let browserCancel: (() => Promise<void>) | undefined;
+    const completed = completeOmpLoginFlow(
+      {
+        flowId: "login_callback_succeeded",
+        provider: "openai",
+        kind: "browser",
+        url: "https://accounts.example.test/oauth",
+      },
+      {
+        openBrowser: (_url, _flowId, cancel) => {
+          browserCancel = cancel;
+        },
+        requestInput: () => null,
+        respond: async () => ({
+          flowId: "login_callback_succeeded",
+          provider: "openai",
+          kind: "complete",
+          outcome: "success",
+        }),
+        submit: async () => ({ supported: false, accepted: false }),
+        getSubmitSupport: () => undefined,
+        setSubmitSupported: () => undefined,
+        dismissInput: () => undefined,
+        cancel: async () => {
+          throw new Error("completed flow is no longer cancelable");
+        },
+      },
+    );
+
+    await expect(completed).resolves.toMatchObject({ outcome: "success" });
+    await expect(browserCancel?.()).rejects.toThrow("completed flow is no longer cancelable");
+    await expect(completed).resolves.toMatchObject({ outcome: "success" });
   });
 
   it("shares one exact-flow cancellation across concurrent browser cancel requests", async () => {

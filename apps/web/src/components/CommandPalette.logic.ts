@@ -3,6 +3,10 @@ import {
   type FilesystemBrowseEntry,
   THREAD_JUMP_KEYBINDING_COMMANDS,
 } from "@t3tools/contracts";
+import type {
+  ScaffoldDeploymentCapabilities,
+  ScaffoldDeploymentCapability,
+} from "@t3tools/contracts";
 import type { SidebarThreadSortOrder } from "@t3tools/contracts/settings";
 import * as Arr from "effect/Array";
 import * as Result from "effect/Result";
@@ -59,6 +63,51 @@ export interface CommandPaletteView {
 export interface ScaffoldNewSessionActionPresentation {
   readonly disabled: boolean;
   readonly description: string;
+}
+
+export function loadScaffoldDeploymentCapabilities(input: {
+  readonly request: () => Promise<ScaffoldDeploymentCapabilities>;
+  readonly setCapabilities: (capabilities: ScaffoldDeploymentCapabilities | null) => void;
+}): () => void {
+  let cancelled = false;
+  input.setCapabilities(null);
+  void input
+    .request()
+    .then((capabilities) => {
+      if (!cancelled) input.setCapabilities(capabilities);
+    })
+    .catch(() => {
+      if (cancelled) return;
+      input.setCapabilities({
+        deployments: (["staging", "production"] as const).map((deployment) => ({
+          deployment,
+          status: "unavailable" as const,
+          description: "Scaffold availability could not be checked",
+        })),
+      });
+    });
+
+  return () => {
+    cancelled = true;
+  };
+}
+
+export function refreshNewSessionPaletteView(
+  views: CommandPaletteView[],
+  groups: CommandPaletteView["groups"],
+): CommandPaletteView[] {
+  const currentView = views.at(-1);
+  if (currentView?.groups[0]?.value !== "session-location") {
+    return views;
+  }
+
+  return [
+    ...views.slice(0, -1),
+    {
+      ...currentView,
+      groups,
+    },
+  ];
 }
 
 function reportDetachedScaffoldDraftError(
@@ -148,10 +197,18 @@ export async function runScaffoldDraftLaunch<TDraftId, TAction>(input: {
 
 export function getScaffoldNewSessionActionPresentation(input: {
   readonly hasContextualProject: boolean;
+  readonly capability: ScaffoldDeploymentCapability | null;
 }): ScaffoldNewSessionActionPresentation {
-  return input.hasContextualProject
-    ? { disabled: false, description: "New Scaffold sandbox" }
-    : { disabled: true, description: "Add or open a local project first" };
+  if (!input.hasContextualProject) {
+    return { disabled: true, description: "Add or open a local project first" };
+  }
+  if (input.capability === null) {
+    return { disabled: true, description: "Checking Scaffold availability…" };
+  }
+  return {
+    disabled: input.capability.status !== "available",
+    description: input.capability.description,
+  };
 }
 
 export function enumerateCommandPaletteItems(

@@ -20,13 +20,37 @@ describe("Scaffold draft controls", () => {
     );
   });
 
+  it("starts one paused-session resume before accepting the queued turn", () => {
+    expect(chatViewSource).toMatch(
+      /resolveScaffoldSendDecision\(\{[\s\S]*?scaffoldPhase: effectiveScaffoldSession\?\.phase[\s\S]*?if \(scaffoldSendDecision\.shouldResume && activeScaffoldSession\) \{[\s\S]*?setPhase\(activeScaffoldSession\.draftId, "resuming"\);[\s\S]*?handleReconnectActiveEnvironment\(activeThread\.environmentId\);[\s\S]*?sendInFlightRef\.current = true;[\s\S]*?enqueuePendingTurn/,
+    );
+    expect(chatViewSource).toMatch(
+      /!activeThread \|\|[\s\S]*?isSendBusy \|\|[\s\S]*?sendInFlightRef\.current/,
+    );
+  });
+
+  it("blocks terminal sessions without offering an environment reconnect on send", () => {
+    expect(chatViewSource).toMatch(
+      /const activeEnvironmentUnavailable =[^;]*activeScaffoldSession\?\.terminal !== true;/s,
+    );
+    expect(chatViewSource).toMatch(
+      /if \(scaffoldSendDecision\.blocked\) \{[\s\S]*?setThreadError\([\s\S]*?return;[\s\S]*?if \(scaffoldSendDecision\.shouldResume/,
+    );
+  });
+
+  it("shows the send control as busy while a paused-session turn is being persisted", () => {
+    expect(chatViewSource).toMatch(/beginLocalDispatch\([\s\S]*?await enqueuePendingTurn/);
+    expect(chatViewSource).toContain("isSendBusy={isSendBusy}");
+  });
+
   it("queues the first prompt without showing the source device reconnect state", () => {
     expect(
       shouldIgnoreSourceEnvironmentForScaffoldDraft({
-        scaffoldEnvironmentId: null,
-        scaffoldPhase: "creating",
+        hasScaffoldDraft: true,
+        boundToTarget: false,
       }),
     ).toBe(true);
+    expect(chatViewSource).toContain("boundToTarget: scaffoldDraftBoundToTarget");
     expect(chatViewSource).toContain(
       "transportConnecting: isConnecting && !ignoreSourceEnvironmentForScaffoldDraft",
     );
@@ -44,7 +68,9 @@ describe("Scaffold draft controls", () => {
       /function isScaffoldDraftBoundToTarget[\s\S]*?routeEnvironmentId === targetEnvironmentId[\s\S]*?threadEnvironmentId === targetEnvironmentId[\s\S]*?projectEnvironmentId === targetEnvironmentId/,
     );
     expect(chatViewSource).toContain("boundToTarget: scaffoldDraftBoundToTarget");
-    expect(chatViewSource).toContain("!scaffoldDraftBoundToTarget ||");
+    expect(chatViewSource).toContain(
+      "const scaffoldDeliveryDeferred = scaffoldSendDecision.deliveryDeferred",
+    );
     expect(chatViewSource).toMatch(
       /effectiveScaffoldSession !== null && !scaffoldDraftBoundToTarget[\s\S]*?scaffold-pending:/,
     );

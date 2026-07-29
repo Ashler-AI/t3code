@@ -9,12 +9,16 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as TestClock from "effect/testing/TestClock";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
+import type * as EffectAcpSchema from "effect-acp/schema";
+import type { AcpSessionModeState, AcpToolCallState } from "./AcpRuntimeModel.ts";
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
@@ -328,6 +332,58 @@ describe("AcpSessionRuntime", () => {
       Effect.scoped,
       Effect.provide(NodeServices.layer),
     ),
+  );
+
+  it.effect("segments consecutive ACP assistant messages when their message IDs change", () =>
+    Effect.gen(function* () {
+      const queue = yield* Queue.unbounded<AcpSessionRuntime.AcpSessionRuntimeEvent>();
+      const modeStateRef = yield* Ref.make<AcpSessionModeState | undefined>(undefined);
+      const configOptionsRef = yield* Ref.make<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>(
+        [],
+      );
+      const toolCallsRef = yield* Ref.make(new Map<string, AcpToolCallState>());
+      const assistantSegmentRef = yield* Ref.make<AcpSessionRuntime.AcpAssistantSegmentState>({
+        nextSegmentIndex: 0,
+      });
+
+      for (const [index, messageId] of ["advisor-1", "advisor-2", "advisor-3"].entries()) {
+        yield* AcpSessionRuntime.handleSessionUpdate({
+          queue,
+          modeStateRef,
+          configOptionsRef,
+          toolCallsRef,
+          assistantSegmentRef,
+          assistantItemRuntimeId: "runtime-1",
+          params: {
+            sessionId: "session-1",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              messageId,
+              content: { type: "text", text: `reply ${index + 1}` },
+            },
+          },
+          sourceSequence: index + 1,
+        });
+      }
+
+      const events = Array.from(yield* Queue.takeAll(queue));
+      expect(events.map((event) => event._tag)).toEqual([
+        "AssistantItemStarted",
+        "ContentDelta",
+        "AssistantItemCompleted",
+        "AssistantItemStarted",
+        "ContentDelta",
+        "AssistantItemCompleted",
+        "AssistantItemStarted",
+        "ContentDelta",
+      ]);
+
+      const starts = events.filter((event) => event._tag === "AssistantItemStarted");
+      const deltas = events.filter((event) => event._tag === "ContentDelta");
+      expect(new Set(starts.map((event) => event.itemId))).toHaveLength(3);
+      expect(deltas.map((event) => event.itemId)).toEqual(starts.map((event) => event.itemId));
+      expect(deltas.map((event) => event.text)).toEqual(["reply 1", "reply 2", "reply 3"]);
+    }),
   );
 
   it.effect("segments OMP reasoning from assistant text and refreshes asynchronous config", () =>

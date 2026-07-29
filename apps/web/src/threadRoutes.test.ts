@@ -98,6 +98,8 @@ describe("threadRoutes", () => {
     expect(
       resolveThreadRouteRenderState({
         bootstrapComplete: true,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: true,
         serverThreadShellExists: true,
         serverThreadDetailExists: false,
         serverThreadDetailDeleted: false,
@@ -110,6 +112,8 @@ describe("threadRoutes", () => {
     expect(
       resolveThreadRouteRenderState({
         bootstrapComplete: true,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: true,
         serverThreadShellExists: true,
         serverThreadDetailExists: true,
         serverThreadDetailDeleted: false,
@@ -119,6 +123,8 @@ describe("threadRoutes", () => {
     expect(
       resolveThreadRouteRenderState({
         bootstrapComplete: true,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: true,
         serverThreadShellExists: false,
         serverThreadDetailExists: false,
         serverThreadDetailDeleted: false,
@@ -131,6 +137,8 @@ describe("threadRoutes", () => {
     expect(
       resolveThreadRouteRenderState({
         bootstrapComplete: false,
+        platformReconciliationComplete: false,
+        routeEnvironmentRegistered: false,
         serverThreadShellExists: false,
         serverThreadDetailExists: false,
         serverThreadDetailDeleted: false,
@@ -140,6 +148,8 @@ describe("threadRoutes", () => {
     expect(
       resolveThreadRouteRenderState({
         bootstrapComplete: true,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: true,
         serverThreadShellExists: false,
         serverThreadDetailExists: false,
         serverThreadDetailDeleted: false,
@@ -152,11 +162,53 @@ describe("threadRoutes", () => {
     expect(
       resolveThreadRouteRenderState({
         bootstrapComplete: true,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: true,
         serverThreadShellExists: true,
         serverThreadDetailExists: false,
         serverThreadDetailDeleted: true,
         draftThreadExists: false,
       }),
     ).toBe("missing");
+  });
+
+  it("redirects an environment missing from authoritative platform reconciliation", () => {
+    expect(
+      resolveThreadRouteRenderState({
+        bootstrapComplete: false,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: false,
+        serverThreadShellExists: false,
+        serverThreadDetailExists: false,
+        serverThreadDetailDeleted: false,
+        draftThreadExists: false,
+      }),
+    ).toBe("missing");
+
+    expect(
+      resolveThreadRouteRenderState({
+        bootstrapComplete: true,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: false,
+        serverThreadShellExists: true,
+        serverThreadDetailExists: true,
+        serverThreadDetailDeleted: false,
+        draftThreadExists: false,
+      }),
+    ).toBe("missing");
+  });
+
+  it("keeps a registered disconnected environment loading while it reconnects", () => {
+    expect(
+      resolveThreadRouteRenderState({
+        bootstrapComplete: false,
+        platformReconciliationComplete: true,
+        routeEnvironmentRegistered: true,
+        serverThreadShellExists: false,
+        serverThreadDetailExists: false,
+        serverThreadDetailDeleted: false,
+        draftThreadExists: false,
+      }),
+    ).toBe("loading");
   });
 });

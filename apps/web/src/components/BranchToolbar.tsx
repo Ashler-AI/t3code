@@ -1,4 +1,5 @@
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import type { EnvironmentId, ScaffoldDeployment, ThreadId } from "@t3tools/contracts";
 import {
   ChevronDownIcon,
@@ -62,7 +63,9 @@ interface BranchToolbarProps {
   scaffoldDraftTarget?: {
     deployment: ScaffoldDeployment;
     phase: ScaffoldDraftPhase;
+    connectionPhase?: EnvironmentConnectionPhase;
     replacementRequired?: boolean;
+    retryable?: boolean;
   };
   scaffoldDraftRetrying?: boolean;
   onRetryScaffoldDraft?: () => void;

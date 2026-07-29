@@ -220,6 +220,17 @@ it.layer(testLayer)("OmpAdapter", (it) => {
       const threadId = ThreadId.make("omp-restart-cursor");
       const wrapperPath = yield* Effect.promise(() => makeMockOmpWrapper());
       const first = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }));
+      const firstEvents: ProviderRuntimeEvent[] = [];
+      const exited = yield* Deferred.make<void>();
+      const firstEventFiber = yield* Stream.runForEach(first.streamEvents, (event) =>
+        Effect.sync(() => firstEvents.push(event)).pipe(
+          Effect.andThen(
+            event.type === "session.exited"
+              ? Deferred.succeed(exited, undefined).pipe(Effect.ignore)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
       yield* first.startSession({
         threadId,
         provider: ProviderDriverKind.make("omp"),
@@ -230,6 +241,27 @@ it.layer(testLayer)("OmpAdapter", (it) => {
       const firstCursor = parseOmpResume(firstTurn.resumeCursor);
       assert.isDefined(firstCursor);
       yield* first.stopSession(threadId);
+      yield* Deferred.await(exited);
+      yield* Fiber.interrupt(firstEventFiber);
+
+      const sessionExited = firstEvents.find((event) => event.type === "session.exited");
+      assert.equal(sessionExited?.type, "session.exited");
+      assert.deepEqual(sessionExited?.resumeCursor, {
+        schemaVersion: 3,
+        sessionId: "mock-session-1",
+        eventSequence: (firstCursor?.eventSequence ?? 0) + 1,
+        acpSequence: firstCursor?.acpSequence ?? 0,
+      });
+      const exitCursor = parseOmpResume(sessionExited?.resumeCursor);
+      assert.deepEqual(exitCursor, {
+        sessionId: "mock-session-1",
+        eventSequence: (firstCursor?.eventSequence ?? 0) + 1,
+        acpSequence: firstCursor?.acpSequence ?? 0,
+      });
+      assert.equal(
+        sessionExited?.eventId,
+        makeOmpEventId("mock-session-1", exitCursor?.eventSequence ?? 0),
+      );
 
       const second = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }));
       const resumedEvents: ProviderRuntimeEvent[] = [];
@@ -241,17 +273,17 @@ it.layer(testLayer)("OmpAdapter", (it) => {
         provider: ProviderDriverKind.make("omp"),
         cwd: process.cwd(),
         runtimeMode: "full-access",
-        resumeCursor: firstTurn.resumeCursor,
+        resumeCursor: sessionExited?.resumeCursor,
       });
       yield* Fiber.interrupt(eventFiber);
 
       const resumedCursor = parseOmpResume(resumed.resumeCursor);
       assert.isDefined(resumedCursor);
-      assert.equal(resumedCursor?.eventSequence, (firstCursor?.eventSequence ?? 0) + 3);
+      assert.equal(resumedCursor?.eventSequence, (exitCursor?.eventSequence ?? 0) + 3);
       assert.deepEqual(
         resumedEvents.map((event) => event.eventId),
         [1, 2, 3].map((offset) =>
-          makeOmpEventId("mock-session-1", (firstCursor?.eventSequence ?? 0) + offset),
+          makeOmpEventId("mock-session-1", (exitCursor?.eventSequence ?? 0) + offset),
         ),
       );
       yield* second.stopSession(threadId);
