@@ -9,6 +9,7 @@ import {
   capabilityCanReadSession,
   isLoopbackSessionFabricRequestUrl,
   makeSessionFabricCapabilityVerifierConfig,
+  websocketCapability,
 } from "@t3tools/shared/sessionFabricCapability";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Clock from "effect/Clock";
@@ -34,6 +35,25 @@ export const normalizeSessionFabricAuthorizationRequestUrl = (requestUrl: string
   /^[A-Za-z][A-Za-z\d+.-]*:/u.test(requestUrl)
     ? requestUrl
     : new URL(requestUrl, "http://127.0.0.1").href;
+
+export const resolveSessionFabricRequestAuthorization = (input: {
+  readonly authorization: string | undefined;
+  readonly upgrade: string | undefined;
+  readonly websocketProtocol: string | undefined;
+}): string | undefined => {
+  const websocketToken =
+    input.upgrade?.toLowerCase() === "websocket"
+      ? websocketCapability(input.websocketProtocol)
+      : null;
+  return websocketToken === null ? input.authorization : `Bearer ${websocketToken}`;
+};
+
+export const finalizeSessionFabricSessionResponse = <Response>(input: {
+  readonly upgrade: string | undefined;
+  readonly response: Response;
+  readonly withCors: (response: Response) => Response;
+}): Response =>
+  input.upgrade?.toLowerCase() === "websocket" ? input.response : input.withCors(input.response);
 
 export const resolveSessionFabricCorsOrigin = (input: {
   readonly requestUrl: string;
@@ -105,7 +125,11 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
     ) {
       return yield* authorizeSessionFabricCapability({
         config: verifierConfig,
-        authorization: request.headers.authorization,
+        authorization: resolveSessionFabricRequestAuthorization({
+          authorization: request.headers.authorization,
+          upgrade: request.headers.upgrade,
+          websocketProtocol: request.headers["sec-websocket-protocol"],
+        }),
         requestUrl: normalizeSessionFabricAuthorizationRequestUrl(request.url),
         nowEpochSeconds: Math.floor((yield* Clock.currentTimeMillis) / 1_000),
       });
@@ -246,9 +270,11 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
             // A 101 response owns immutable upgrade headers in workerd. WebSocket
             // clients do not use CORS response headers, so forward the upgrade
             // untouched and decorate only ordinary HTTP reads.
-            return request.headers.upgrade?.toLowerCase() === "websocket"
-              ? response
-              : withCors(request, response);
+            return finalizeSessionFabricSessionResponse({
+              upgrade: request.headers.upgrade,
+              response,
+              withCors: (sessionResponse) => withCors(request, sessionResponse),
+            });
           }
           case "not-found":
             return withCors(request, HttpServerResponse.empty({ status: 404 }));
