@@ -5,18 +5,26 @@ import {
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  CommandId,
   EnvironmentId,
+  MessageId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ScaffoldLifecycleError,
   ScaffoldObserveInput,
   ScaffoldSessionObservation,
+  ThreadId,
   type ServerProvider,
 } from "@t3tools/contracts";
 import { makeScaffoldLifecycleAction } from "@t3tools/client-runtime/scaffold";
 
 import { DraftId } from "../composerDraftStore";
+import {
+  createMemoryPendingTurnOutboxStorage,
+  enqueuePendingTurn,
+  retargetPendingTurnsForDraft,
+} from "../connection/pendingTurnOutbox";
 import {
   createMemoryScaffoldLifecycleActionStore,
   drainScaffoldLifecycleActions,
@@ -61,6 +69,28 @@ const readyOmpCatalog: ReadonlyArray<ServerProvider> = [
     ],
     slashCommands: [],
     skills: [],
+  },
+];
+
+const readyOmpCatalogWithFableDefault: ReadonlyArray<ServerProvider> = [
+  {
+    ...readyOmpCatalog[0]!,
+    models: [
+      {
+        slug: "anthropic/claude-fable-5",
+        name: "Claude Fable 5",
+        isCustom: false,
+        isDefault: true,
+        capabilities: {},
+      },
+      {
+        slug: "openai/gpt-5.6-sol",
+        name: "GPT-5.6-Sol",
+        isCustom: false,
+        isDefault: false,
+        capabilities: {},
+      },
+    ],
   },
 ];
 
@@ -375,6 +405,75 @@ describe("Scaffold sidebar create failure classification", () => {
         },
       },
     ]);
+  });
+
+  it("binds the accepted pending-turn model instead of a mutable draft selection", async () => {
+    const draftId = DraftId.make("draft-scaffold");
+    const threadId = ThreadId.make("thread-scaffold");
+    const commandId = CommandId.make("command-scaffold");
+    const messageId = MessageId.make("message-scaffold");
+    const storage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(storage, {
+      idempotencyKey: commandId,
+      environmentId: EnvironmentId.make(`scaffold-pending:${draftId}`),
+      threadId,
+      messageId,
+      draftId,
+      createdAt: "2026-07-29T00:00:00.000Z",
+      input: {
+        commandId,
+        threadId,
+        message: {
+          messageId,
+          role: "user",
+          text: "Keep the accepted model",
+          attachments: [],
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("omp"),
+          model: "openai-codex/gpt-5.6-sol",
+          options: [{ id: "reasoning_effort", value: "high" }],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdAt: "2026-07-29T00:00:00.000Z",
+      },
+    });
+
+    const environmentId = EnvironmentId.make("environment-remote");
+    const projectId = ProjectId.make("project-remote");
+    const acceptedTurnSelection = await retargetPendingTurnsForDraft(
+      storage,
+      draftId,
+      environmentId,
+      projectId,
+      readyOmpCatalogWithFableDefault,
+    );
+    const setModelSelection = vi.fn();
+
+    expect(
+      bindScaffoldDraftToRemote({
+        draftId,
+        acceptedTurnSelection,
+        sourceSelection: {
+          instanceId: ProviderInstanceId.make("omp"),
+          model: "anthropic/claude-fable-5",
+        },
+        targetProviders: readyOmpCatalogWithFableDefault,
+        projectRef: { environmentId, projectId },
+        setModelSelection,
+        setDraftThreadContext: vi.fn(),
+      }),
+    ).toBe(true);
+    expect(setModelSelection).toHaveBeenCalledExactlyOnceWith(
+      draftId,
+      {
+        instanceId: "omp",
+        model: "openai/gpt-5.6-sol",
+        options: [{ id: "reasoning_effort", value: "high" }],
+      },
+      { replaceOptions: true },
+    );
   });
 
   it("defers draft retargeting until the destination OMP catalog is hydrated", () => {

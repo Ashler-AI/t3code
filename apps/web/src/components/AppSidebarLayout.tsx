@@ -223,6 +223,7 @@ export function scaffoldRetargetProvidersAreReady(
 
 export function bindScaffoldDraftToRemote(input: {
   readonly draftId: DraftId;
+  readonly acceptedTurnSelection?: ModelSelection | null;
   readonly sourceSelection: ModelSelection | null | undefined;
   readonly targetProviders: ReadonlyArray<ServerProvider>;
   readonly projectRef: ScopedProjectRef;
@@ -242,7 +243,7 @@ export function bindScaffoldDraftToRemote(input: {
 }): boolean {
   const targetSelection = resolveScaffoldDraftModelSelection(
     input.targetProviders,
-    input.sourceSelection,
+    input.acceptedTurnSelection ?? input.sourceSelection,
   );
   if (targetSelection === null) return false;
 
@@ -593,7 +594,7 @@ function ScaffoldSessionCoordinator() {
         remoteProject.id,
         targetProviders,
       )
-        .then(() => {
+        .then((acceptedTurnSelection) => {
           if (disposed) return;
           const composerDraft = draftStore.getComposerDraft(entry.draftId);
           const sourceSelection = composerDraft?.activeProvider
@@ -601,6 +602,7 @@ function ScaffoldSessionCoordinator() {
             : null;
           const bound = bindScaffoldDraftToRemote({
             draftId: entry.draftId,
+            acceptedTurnSelection,
             sourceSelection,
             targetProviders,
             projectRef: scopeProjectRef(remoteProject.environmentId, remoteProject.id),
