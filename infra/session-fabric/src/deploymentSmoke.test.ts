@@ -223,7 +223,6 @@ describe("session fabric deployment smoke", () => {
 
   it("waits for disconnect handling and the retained offline snapshot before succeeding", async () => {
     const urls: URL[] = [];
-    const authorizations: string[] = [];
     let protocols: ReadonlyArray<string> | undefined;
     let socket: TestSocket | undefined;
     let proofPolls = 0;
@@ -239,16 +238,17 @@ describe("session fabric deployment smoke", () => {
       readonly method: string;
       readonly authorization: string;
       readonly origin: string;
+      readonly pathname: string;
     }> = [];
     const fetchClient: typeof fetch = async (input, init) => {
       const url = new URL(input instanceof Request ? input.url : input);
       urls.push(url);
       const headers = new Headers(init?.headers);
-      authorizations.push(headers.get("authorization") ?? "");
       requests.push({
         method: init?.method ?? "GET",
         authorization: headers.get("authorization") ?? "",
         origin: headers.get("origin") ?? "",
+        pathname: url.pathname,
       });
       const gated = requiredAuthGate(input, init);
       if (gated !== null) return gated;
@@ -287,17 +287,37 @@ describe("session fabric deployment smoke", () => {
     ]);
     expect(socket?.readyState).toBe(3);
     expect(socket?.closeCalls).toBe(1);
-    expect(
-      authorizations
-        .filter(Boolean)
-        .every((authorization) => authorization === `Bearer ${VIEWER_CAPABILITY}`),
-    ).toBe(true);
     expect(requests.slice(0, 4)).toEqual([
-      { method: "GET", authorization: "", origin: "" },
-      { method: "GET", authorization: "", origin: "" },
-      { method: "OPTIONS", authorization: "", origin: SCAFFOLD_ORIGIN },
-      { method: "GET", authorization: `Bearer ${VIEWER_CAPABILITY}`, origin: "" },
+      {
+        method: "GET",
+        authorization: "",
+        origin: "",
+        pathname: "/base/v1/session-fabric/sessions",
+      },
+      {
+        method: "GET",
+        authorization: "",
+        origin: "",
+        pathname: "/base/v1/session-fabric/sessions/deployment-smoke-empty-v1/snapshot",
+      },
+      {
+        method: "OPTIONS",
+        authorization: "",
+        origin: SCAFFOLD_ORIGIN,
+        pathname: "/base/v1/session-fabric/sessions",
+      },
+      {
+        method: "GET",
+        authorization: `Bearer ${VIEWER_CAPABILITY}`,
+        origin: "",
+        pathname: "/base/v1/session-fabric/sessions/deployment-smoke-empty-v1/snapshot",
+      },
     ]);
+    expect(
+      requests
+        .filter((request) => request.method === "GET" && request.pathname.endsWith("/snapshot"))
+        .map((request) => request.authorization),
+    ).toEqual(["", ...Array.from({ length: 5 }, () => `Bearer ${VIEWER_CAPABILITY}`)]);
     expect(protocols).toEqual([
       "t3.session-fabric.v1",
       "t3.session-fabric.capability.runner.header.signature",

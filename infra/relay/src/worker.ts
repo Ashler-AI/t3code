@@ -101,6 +101,32 @@ const decodeSessionPathSegment = (value: string): string | null => {
   }
 };
 
+export const resolveRelaySessionFabricRequestAuthorization = (
+  request: HttpServerRequest.HttpServerRequest,
+): string | undefined => {
+  const websocketToken =
+    request.headers.upgrade?.toLowerCase() === "websocket"
+      ? websocketCapability(request.headers["sec-websocket-protocol"])
+      : null;
+  return websocketToken === null ? request.headers.authorization : `Bearer ${websocketToken}`;
+};
+
+export const forwardRelaySessionFabricRequest = (input: {
+  readonly request: HttpServerRequest.HttpServerRequest;
+  readonly rawRequest: globalThis.Request;
+  readonly resolvedAuthorization: string | undefined;
+}): HttpServerRequest.HttpServerRequest => {
+  if (input.request.headers.upgrade?.toLowerCase() === "websocket") return input.request;
+
+  const headers = new Headers(input.rawRequest.headers);
+  if (input.resolvedAuthorization === undefined) {
+    headers.delete("authorization");
+  } else {
+    headers.set("authorization", input.resolvedAuthorization);
+  }
+  return HttpServerRequest.fromWeb(new Request(input.rawRequest, { headers }));
+};
+
 const relayApiLayer = Layer.mergeAll(
   healthApi,
   metadataApi,
@@ -278,15 +304,11 @@ export default class Api extends Cloudflare.Worker<Api>()(
 
     const authorizeSessionFabricRequest = Effect.fn("relay.session_fabric.authorize")(function* (
       request: HttpServerRequest.HttpServerRequest,
+      resolvedAuthorization: string | undefined,
     ) {
-      const websocketToken =
-        request.headers.upgrade?.toLowerCase() === "websocket"
-          ? websocketCapability(request.headers["sec-websocket-protocol"])
-          : null;
       return yield* authorizeSessionFabricCapability({
         config: sessionFabricVerifierConfig,
-        authorization:
-          websocketToken === null ? request.headers.authorization : `Bearer ${websocketToken}`,
+        authorization: resolvedAuthorization,
         requestUrl: request.url,
         nowEpochSeconds: Math.floor((yield* Clock.currentTimeMillis) / 1_000),
       });
@@ -319,7 +341,11 @@ export default class Api extends Cloudflare.Worker<Api>()(
       "/v1/session-fabric/sessions/*",
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
-        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        const resolvedAuthorization = resolveRelaySessionFabricRequestAuthorization(request);
+        const authorized = yield* authorizeSessionFabricRequest(
+          request,
+          resolvedAuthorization,
+        ).pipe(Effect.result);
         if (authorized._tag === "Failure") {
           return sessionFabricAuthorizationFailure(authorized.failure.reason);
         }
@@ -335,7 +361,10 @@ export default class Api extends Cloudflare.Worker<Api>()(
         if (decodedSessionId === null) {
           return HttpServerResponse.text("Invalid session id", { status: 400 });
         }
-        return yield* sessionStreams.getByName(decodedSessionId).fetch(request);
+        const rawRequest = yield* Cloudflare.Request;
+        return yield* sessionStreams
+          .getByName(decodedSessionId)
+          .fetch(forwardRelaySessionFabricRequest({ request, rawRequest, resolvedAuthorization }));
       }),
     );
 
@@ -344,7 +373,11 @@ export default class Api extends Cloudflare.Worker<Api>()(
       "/v1/session-fabric/sessions",
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
-        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        const resolvedAuthorization = resolveRelaySessionFabricRequestAuthorization(request);
+        const authorized = yield* authorizeSessionFabricRequest(
+          request,
+          resolvedAuthorization,
+        ).pipe(Effect.result);
         if (authorized._tag === "Failure") {
           return sessionFabricAuthorizationFailure(authorized.failure.reason);
         }
@@ -367,7 +400,11 @@ export default class Api extends Cloudflare.Worker<Api>()(
       "/v1/session-fabric/search",
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
-        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        const resolvedAuthorization = resolveRelaySessionFabricRequestAuthorization(request);
+        const authorized = yield* authorizeSessionFabricRequest(
+          request,
+          resolvedAuthorization,
+        ).pipe(Effect.result);
         if (authorized._tag === "Failure") {
           return sessionFabricAuthorizationFailure(authorized.failure.reason);
         }
@@ -397,7 +434,11 @@ export default class Api extends Cloudflare.Worker<Api>()(
       "/v1/session-fabric/context",
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
-        const authorized = yield* authorizeSessionFabricRequest(request).pipe(Effect.result);
+        const resolvedAuthorization = resolveRelaySessionFabricRequestAuthorization(request);
+        const authorized = yield* authorizeSessionFabricRequest(
+          request,
+          resolvedAuthorization,
+        ).pipe(Effect.result);
         if (authorized._tag === "Failure") {
           return sessionFabricAuthorizationFailure(authorized.failure.reason);
         }

@@ -11,9 +11,11 @@ import {
 } from "@t3tools/shared/sessionFabricCapability";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 
 import {
   finalizeSessionFabricSessionResponse,
+  forwardSessionFabricRequest,
   normalizeSessionFabricAuthorizationRequestUrl,
   resolveSessionFabricCorsOrigin,
   resolveSessionFabricRequestAuthorization,
@@ -101,6 +103,100 @@ describe("session fabric API authorization URL portability", () => {
       }),
     ).toBeNull();
   });
+});
+
+describe("session fabric API session forwarding", () => {
+  it.effect("forwards canonical HTTP authorization through the real Web request conversion", () =>
+    Effect.gen(function* () {
+      const url =
+        "https://fabric.example/v1/session-fabric/sessions/sf%3Aenv%3Athread/snapshot?cursor=7";
+      const capability = yield* signSessionFabricCapability({
+        privateKey: keys.privateKey,
+        keyId: "current",
+        claims: runnerClaims,
+      });
+      const protocol = sessionFabricWebSocketProtocols(capability).join(", ");
+      const canonicalAuthorization = `Bearer ${capability}`;
+
+      for (const rawAuthorization of [undefined, "Bearer decoy-capability"]) {
+        const headers = new Headers({
+          "sec-websocket-protocol": protocol,
+        });
+        if (rawAuthorization !== undefined) headers.set("authorization", rawAuthorization);
+        const rawRequest = new Request(url, { method: "GET", headers });
+        const sourceRequest = HttpServerRequest.fromWeb(rawRequest);
+        const outerRequest = sourceRequest.modify({
+          headers: { ...sourceRequest.headers, authorization: canonicalAuthorization },
+        });
+        const resolvedAuthorization = resolveSessionFabricRequestAuthorization({
+          authorization: outerRequest.headers.authorization,
+          upgrade: outerRequest.headers.upgrade,
+          websocketProtocol: outerRequest.headers["sec-websocket-protocol"],
+        });
+
+        const forwarded = yield* HttpServerRequest.toWeb(
+          forwardSessionFabricRequest({
+            request: outerRequest,
+            rawRequest,
+            resolvedAuthorization,
+          }),
+        );
+
+        expect(resolvedAuthorization).toBe(canonicalAuthorization);
+        expect(forwarded).not.toBe(rawRequest);
+        expect(forwarded.url).toBe(url);
+        expect(forwarded.method).toBe("GET");
+        expect(forwarded.headers.get("authorization")).toBe(canonicalAuthorization);
+        expect(forwarded.headers.get("sec-websocket-protocol")).toBe(protocol);
+        expect(
+          yield* authorizeSessionFabricCapability({
+            config: verifierConfig,
+            authorization: forwarded.headers.get("authorization") ?? undefined,
+            requestUrl: forwarded.url,
+            nowEpochSeconds: NOW,
+          }),
+        ).toEqual(runnerClaims);
+      }
+    }),
+  );
+
+  it.effect("keeps WebSocket forwarding on the original request source", () =>
+    Effect.gen(function* () {
+      const capability = yield* signSessionFabricCapability({
+        privateKey: keys.privateKey,
+        keyId: "current",
+        claims: runnerClaims,
+      });
+      const protocol = sessionFabricWebSocketProtocols(capability).join(", ");
+      const rawRequest = new Request(
+        "https://fabric.example/v1/session-fabric/sessions/sf%3Aenv%3Athread/connect",
+        {
+          method: "GET",
+          headers: { upgrade: "websocket", "sec-websocket-protocol": protocol },
+        },
+      );
+      const request = HttpServerRequest.fromWeb(rawRequest);
+      const resolvedAuthorization = resolveSessionFabricRequestAuthorization({
+        authorization: request.headers.authorization,
+        upgrade: request.headers.upgrade,
+        websocketProtocol: request.headers["sec-websocket-protocol"],
+      });
+
+      const forwardedRequest = forwardSessionFabricRequest({
+        request,
+        rawRequest,
+        resolvedAuthorization,
+      });
+      const forwarded = yield* HttpServerRequest.toWeb(forwardedRequest);
+
+      expect(resolvedAuthorization).toBe(`Bearer ${capability}`);
+      expect(forwardedRequest).toBe(request);
+      expect(forwarded).toBe(rawRequest);
+      expect(forwarded.headers.get("authorization")).toBeNull();
+      expect(forwarded.headers.get("sec-websocket-protocol")).toBe(protocol);
+      expect(forwarded.headers.get("upgrade")).toBe("websocket");
+    }),
+  );
 });
 
 describe("session fabric API WebSocket authorization", () => {
