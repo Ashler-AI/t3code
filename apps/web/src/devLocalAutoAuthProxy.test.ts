@@ -17,6 +17,13 @@ const combinedEnv = {
   PORT: "5733",
 } as const;
 
+const singleOriginEnv = {
+  ...combinedEnv,
+  T3CODE_SINGLE_ORIGIN_DEV: "1",
+  T3CODE_PORT: "13773",
+  VITE_HTTP_URL: undefined,
+} as const;
+
 type Middleware = ReturnType<typeof createLocalDevAutoAuthMiddleware>;
 
 function createTestMiddleware(fetch: typeof globalThis.fetch): Middleware {
@@ -79,11 +86,40 @@ function invokeMiddleware(input: {
 }
 
 describe("resolveLocalDevAutoAuthConfig", () => {
+  it("derives the internal backend URL without baking one into single-origin dev", () => {
+    expect(resolveLocalDevAutoAuthConfig(singleOriginEnv)).toMatchObject({
+      backendUrl: new URL("http://127.0.0.1:13773/api/auth/browser-session"),
+      bootstrapToken: "internal-secret",
+      sessionCookieNamePrefix: "t3_session_13773",
+      webPort: "5733",
+    });
+
+    expect(
+      resolveLocalDevAutoAuthConfig({
+        ...singleOriginEnv,
+        VITE_HTTP_URL: "https://remote.example.com",
+      }),
+    ).toMatchObject({
+      backendUrl: new URL("http://127.0.0.1:13773/api/auth/browser-session"),
+    });
+  });
+
+  it("uses an explicitly configured loopback backend host in single-origin dev", () => {
+    expect(
+      resolveLocalDevAutoAuthConfig({
+        ...singleOriginEnv,
+        T3CODE_HOST: "::1",
+      }),
+    ).toMatchObject({
+      backendUrl: new URL("http://[::1]:13773/api/auth/browser-session"),
+    });
+  });
+
   it("enables only the combined loopback runner boundary", () => {
     expect(resolveLocalDevAutoAuthConfig(combinedEnv)).toMatchObject({
       backendUrl: new URL("http://localhost:13773/api/auth/browser-session"),
       bootstrapToken: "internal-secret",
-      sessionCookieName: "t3_session_13773",
+      sessionCookieNamePrefix: "t3_session_13773",
       webPort: "5733",
     });
 
@@ -96,6 +132,12 @@ describe("resolveLocalDevAutoAuthConfig", () => {
       { ...combinedEnv, VITE_HTTP_URL: "http://dev.example.com:13773" },
       { ...combinedEnv, VITE_DEV_SERVER_URL: "http://127.attacker.example:5733" },
       { ...combinedEnv, VITE_DEV_SERVER_URL: "https://localhost:5733" },
+      { ...singleOriginEnv, T3CODE_PORT: undefined },
+      { ...singleOriginEnv, T3CODE_PORT: "0" },
+      { ...singleOriginEnv, T3CODE_PORT: "65536" },
+      { ...singleOriginEnv, T3CODE_PORT: "13773.example" },
+      { ...singleOriginEnv, T3CODE_HOST: "dev.example.com" },
+      { ...singleOriginEnv, VITE_DEV_SERVER_URL: "http://dev.example.com:5733" },
     ]) {
       expect(resolveLocalDevAutoAuthConfig(env)).toBeNull();
     }
@@ -103,6 +145,32 @@ describe("resolveLocalDevAutoAuthConfig", () => {
 });
 
 describe("createLocalDevAutoAuthMiddleware", () => {
+  it("accepts the backend's isolated development session cookie", async () => {
+    const fetch = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 200,
+          headers: {
+            "set-cookie":
+              "t3_session_13773_a1b2c3d4e5f6=isolated-session; HttpOnly; SameSite=Strict; Path=/",
+          },
+        }),
+    );
+
+    const result = await invokeMiddleware({ fetch });
+
+    expect(result).toEqual({
+      statusCode: 204,
+      headers: {
+        "cache-control": "no-store",
+        "set-cookie": [
+          "t3_session_13773_a1b2c3d4e5f6=isolated-session; HttpOnly; SameSite=Strict; Path=/",
+        ],
+      },
+      nextCalled: false,
+    });
+  });
+
   it("exchanges the internal token server-side and forwards only the session cookie", async () => {
     const fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       expect(JSON.parse(String(init?.body))).toEqual({ credential: "internal-secret" });
