@@ -4,6 +4,7 @@ import type {
   ScaffoldLifecycleAction,
   ScaffoldLifecycleActionStore,
 } from "@t3tools/client-runtime/scaffold";
+import { mapScaffoldLifecycleError } from "@t3tools/client-runtime/scaffold";
 import {
   ConnectionBlockedError,
   ConnectionTransientError,
@@ -13,6 +14,7 @@ import { Atom } from "effect/unstable/reactivity";
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
   type CSSProperties,
@@ -50,22 +52,33 @@ import { ThreadAttentionNotifications } from "./ThreadAttentionNotifications";
 import {
   SCAFFOLD_DEPLOYMENT_MISMATCH_MESSAGE,
   SCAFFOLD_LEGACY_CREATE_MISSING_AUTHORITY_MESSAGE,
+  SCAFFOLD_SESSION_FAILED_MESSAGE,
+  SCAFFOLD_SESSION_STOPPED_MESSAGE,
   scaffoldSessionUiEntryFromCreateAction,
   scaffoldSessionUiEntryMatchesCreateAction,
   scaffoldSessionUiEntryMatchesPendingCreateAction,
   useScaffoldSessionUiStore,
 } from "../scaffoldSessionUiStore";
 import type { ScaffoldSessionUiEntry } from "../scaffoldSessionUiStore";
-import { useComposerDraftStore } from "../composerDraftStore";
+import { DraftId, useComposerDraftStore } from "../composerDraftStore";
 import { readThreadShell, useProjects } from "../state/entities";
 import { useEnvironments } from "../state/environments";
 import { threadEnvironment } from "../state/threads";
-import { scopeProjectRef } from "@t3tools/client-runtime/environment";
-import type { EnvironmentId, ServerProvider } from "@t3tools/contracts";
+import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import {
+  ScaffoldLifecycleError,
+  ScaffoldObserveInput,
+  type ScaffoldSessionObservation,
+  type EnvironmentId,
+  type ModelSelection,
+  type ScopedProjectRef,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import { environmentCatalog } from "../connection/catalog";
 import { environmentShell } from "../state/shell";
 import { useAtomCommand } from "../state/use-atom-command";
 import { connectScaffoldEnvironment } from "../connection/scaffoldOnboarding";
+import { requestScaffoldSessionObservation } from "../connection/scaffold";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import {
   browserScaffoldLifecycleActionStore,
@@ -82,6 +95,7 @@ import {
   subscribePendingTurnDrain,
 } from "../connection/pendingTurnOutbox";
 import { resolveScaffoldDraftModelSelection } from "../hooks/useHandleNewThread";
+import { SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE } from "./BranchToolbar.logic";
 
 const MACOS_TRAFFIC_LIGHTS_LEFT_INSET = "90px";
 const notifiedTerminalPendingTurns = new Set<string>();
@@ -102,17 +116,69 @@ const environmentProviderCatalogsAtom = Atom.make(
 
 const isConnectionBlockedError = Schema.is(ConnectionBlockedError);
 const isConnectionTransientError = Schema.is(ConnectionTransientError);
+const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
 
 export function classifyScaffoldCreateFailure(error: unknown): {
   readonly result:
     | { readonly _tag: "blocked"; readonly errorCode: string }
+    | {
+        readonly _tag: "wait";
+        readonly retryAfterMs: number;
+        readonly errorCode: string;
+        readonly observation?: {
+          readonly sessionId: string;
+          readonly lifecycleEpoch: number;
+        };
+      }
     | { readonly _tag: "retry"; readonly retryAfterMs: number; readonly errorCode: string };
   readonly detail?: string;
+  readonly terminalObservation?: {
+    readonly sessionId: string;
+    readonly lifecycleEpoch: number;
+    readonly status: "stopped" | "failed";
+  };
 } {
+  if (isScaffoldLifecycleError(error)) {
+    if (error.code === "scaffold_preparation_pending") {
+      return {
+        result: {
+          _tag: "wait",
+          retryAfterMs: error.retryAfterMs ?? 1_000,
+          errorCode: error.code,
+          ...(error.observation
+            ? {
+                observation: {
+                  sessionId: error.observation.sessionId,
+                  lifecycleEpoch: error.observation.lifecycleEpoch,
+                },
+              }
+            : {}),
+        },
+      };
+    }
+    if (
+      (error.reason === "terminal" || error.reason === "not_found") &&
+      (error.observation?.status === "stopped" || error.observation?.status === "failed")
+    ) {
+      return {
+        result: { _tag: "blocked", errorCode: error.code },
+        detail:
+          error.observation.status === "stopped"
+            ? SCAFFOLD_SESSION_STOPPED_MESSAGE
+            : SCAFFOLD_SESSION_FAILED_MESSAGE,
+        terminalObservation: {
+          sessionId: error.observation.sessionId,
+          lifecycleEpoch: error.observation.lifecycleEpoch,
+          status: error.observation.status,
+        },
+      };
+    }
+    return classifyScaffoldCreateFailure(mapScaffoldLifecycleError(error));
+  }
   if (isConnectionBlockedError(error)) {
     return {
       result: { _tag: "blocked", errorCode: error.reason },
-      detail: error.detail,
+      detail: error.reason === "unsupported" ? SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE : error.detail,
     };
   }
   if (isConnectionTransientError(error)) {
@@ -146,7 +212,7 @@ function blockedScaffoldCreateDetail(errorCode: string | null): string {
     case "permission":
       return "Scaffold access is not permitted.";
     case "unsupported":
-      return "This Scaffold session cannot be prepared.";
+      return SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE;
     default:
       return "Scaffold session could not be created.";
   }
@@ -162,6 +228,40 @@ export function scaffoldRetargetProvidersAreReady(
   providers: ReadonlyArray<ServerProvider> | null,
 ): providers is ReadonlyArray<ServerProvider> {
   return providers !== null && resolveScaffoldDraftModelSelection(providers, null) !== null;
+}
+
+export function bindScaffoldDraftToRemote(input: {
+  readonly draftId: DraftId;
+  readonly sourceSelection: ModelSelection | null | undefined;
+  readonly targetProviders: ReadonlyArray<ServerProvider>;
+  readonly projectRef: ScopedProjectRef;
+  readonly setModelSelection: (
+    draftId: DraftId,
+    selection: ModelSelection,
+    options: { readonly replaceOptions: true },
+  ) => void;
+  readonly setDraftThreadContext: (
+    draftId: DraftId,
+    context: {
+      readonly projectRef: ScopedProjectRef;
+      readonly envMode: "local";
+      readonly worktreePath: null;
+    },
+  ) => void;
+}): boolean {
+  const targetSelection = resolveScaffoldDraftModelSelection(
+    input.targetProviders,
+    input.sourceSelection,
+  );
+  if (targetSelection === null) return false;
+
+  input.setModelSelection(input.draftId, targetSelection, { replaceOptions: true });
+  input.setDraftThreadContext(input.draftId, {
+    projectRef: input.projectRef,
+    envMode: "local",
+    worktreePath: null,
+  });
+  return true;
 }
 
 export function scaffoldCreateConnectionRequest(
@@ -196,6 +296,7 @@ export async function reconcileScaffoldLifecycleStartup(input: {
   readonly store: ScaffoldLifecycleActionStore;
   readonly entriesByDraftId: Readonly<Record<string, ScaffoldSessionUiEntry>>;
   readonly recover: (entry: ScaffoldSessionUiEntry) => void;
+  readonly rebind?: (entry: ScaffoldSessionUiEntry) => void;
   readonly fail: (draftId: ScaffoldSessionUiEntry["draftId"], error: string) => void;
 }): Promise<void> {
   const actions = await input.store.list();
@@ -222,6 +323,12 @@ export async function reconcileScaffoldLifecycleStartup(input: {
         // create by its immutable action identity; Scaffold may have minted a
         // different session id than the provisional request used.
         await input.store.remove(action.actionId);
+      } else if (
+        matchingEntry.sessionId !== action.sessionId ||
+        matchingEntry.lifecycleEpoch !== action.expectedLifecycleEpoch
+      ) {
+        const rebound = scaffoldSessionUiEntryFromCreateAction(action);
+        if (rebound) (input.rebind ?? input.recover)(rebound);
       }
       continue;
     }
@@ -257,11 +364,103 @@ function readViewportWidth(): number {
   return window.innerWidth;
 }
 
+const LEGACY_SCAFFOLD_PREPARE_FAILURE = "Scaffold session cannot be prepared.";
+
+export function commitLegacyFailedScaffoldObservation(input: {
+  readonly entry: ScaffoldSessionUiEntry | undefined;
+  readonly observation: {
+    readonly sessionId: string;
+    readonly lifecycleEpoch: number;
+    readonly status: "stopped" | "failed";
+  };
+  readonly terminal: (
+    draftId: DraftId,
+    observation: {
+      readonly sessionId: string;
+      readonly lifecycleEpoch: number;
+      readonly status: "stopped" | "failed";
+    },
+  ) => void;
+}): boolean {
+  const entry = input.entry;
+  if (
+    entry === undefined ||
+    entry.phase !== "failed" ||
+    entry.error !== LEGACY_SCAFFOLD_PREPARE_FAILURE ||
+    entry.sessionId !== input.observation.sessionId
+  ) {
+    return false;
+  }
+  input.terminal(entry.draftId, input.observation);
+  return true;
+}
+
+export async function reconcileLegacyFailedScaffoldSessions(input: {
+  readonly entriesByDraftId: Readonly<Record<string, ScaffoldSessionUiEntry>>;
+  readonly attemptedDraftIds: Set<string>;
+  readonly observe: (input: ScaffoldObserveInput) => Promise<ScaffoldSessionObservation>;
+  readonly terminal: (
+    draftId: DraftId,
+    observation: {
+      readonly sessionId: string;
+      readonly lifecycleEpoch: number;
+      readonly status: "stopped" | "failed";
+    },
+  ) => void;
+}): Promise<void> {
+  for (const entry of Object.values(input.entriesByDraftId)) {
+    if (
+      entry.phase !== "failed" ||
+      entry.error !== LEGACY_SCAFFOLD_PREPARE_FAILURE ||
+      entry.sessionId === null ||
+      input.attemptedDraftIds.has(entry.draftId)
+    ) {
+      continue;
+    }
+    // Fence before awaiting so a concurrent hydration/render cannot schedule
+    // the same draft twice during this coordinator mount.
+    input.attemptedDraftIds.add(entry.draftId);
+    let observation: ScaffoldSessionObservation;
+    try {
+      observation = await input.observe(
+        new ScaffoldObserveInput({ deployment: entry.deployment, sessionId: entry.sessionId }),
+      );
+    } catch {
+      // Observation is best-effort and read-only. Network/auth/not-found errors
+      // leave the saved projection untouched for an explicit user action.
+      continue;
+    }
+    if (observation.status !== "stopped" && observation.status !== "failed") continue;
+    input.terminal(entry.draftId, {
+      sessionId: observation.sessionId,
+      lifecycleEpoch: observation.lifecycleEpoch,
+      status: observation.status,
+    });
+  }
+}
+
 function ScaffoldSessionCoordinator() {
   const entriesByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
   const projects = useProjects();
   const providerCatalogs = useAtomValue(environmentProviderCatalogsAtom);
   const connectScaffold = useAtomCommand(connectScaffoldEnvironment, { reportFailure: false });
+  const attemptedLegacyDraftIds = useRef(new Set<string>());
+
+  useEffect(() => {
+    void reconcileLegacyFailedScaffoldSessions({
+      entriesByDraftId,
+      attemptedDraftIds: attemptedLegacyDraftIds.current,
+      observe: requestScaffoldSessionObservation,
+      terminal: (draftId, observation) => {
+        const scaffoldUi = useScaffoldSessionUiStore.getState();
+        commitLegacyFailedScaffoldObservation({
+          entry: scaffoldUi.entriesByDraftId[draftId],
+          observation,
+          terminal: scaffoldUi.terminal,
+        });
+      },
+    });
+  }, [entriesByDraftId]);
 
   useEffect(() => {
     let disposed = false;
@@ -287,6 +486,15 @@ function ScaffoldSessionCoordinator() {
             });
           },
           fail: initialUi.fail,
+          rebind: (entry) => {
+            if (entry.sessionId === null) return;
+            initialUi.rebindCreating(
+              entry.draftId,
+              entry.actionId,
+              entry.sessionId,
+              entry.lifecycleEpoch,
+            );
+          },
         });
         await drainScaffoldLifecycleActions({
           store: browserScaffoldLifecycleActionStore,
@@ -309,7 +517,11 @@ function ScaffoldSessionCoordinator() {
             if (result._tag === "Failure") {
               const error = squashAtomCommandFailure(result);
               const failure = classifyScaffoldCreateFailure(error);
-              if (failure.detail) scaffoldUi.fail(entry.draftId, failure.detail);
+              if (failure.terminalObservation) {
+                scaffoldUi.terminal(entry.draftId, failure.terminalObservation);
+              } else if (failure.result._tag === "blocked" && failure.detail) {
+                scaffoldUi.fail(entry.draftId, failure.detail);
+              }
               return failure.result;
             }
             scaffoldUi.connected(entry.draftId, result.value.binding);
@@ -317,6 +529,17 @@ function ScaffoldSessionCoordinator() {
               return { _tag: "blocked", errorCode: "scaffold_binding_deployment_mismatch" };
             }
             return { _tag: "acknowledged" };
+          },
+          onWait: (action) => {
+            if (action.kind !== "create" || action.draftId === undefined) return;
+            useScaffoldSessionUiStore
+              .getState()
+              .rebindCreating(
+                DraftId.make(action.draftId),
+                action.actionId,
+                action.sessionId,
+                action.expectedLifecycleEpoch,
+              );
           },
           onBlocked: (action) => {
             const scaffoldUi = useScaffoldSessionUiStore.getState();
@@ -390,11 +613,27 @@ function ScaffoldSessionCoordinator() {
       )
         .then(() => {
           if (disposed) return;
-          draftStore.setDraftThreadContext(entry.draftId, {
+          const composerDraft = draftStore.getComposerDraft(entry.draftId);
+          const sourceSelection = composerDraft?.activeProvider
+            ? composerDraft.modelSelectionByProvider[composerDraft.activeProvider]
+            : null;
+          const bound = bindScaffoldDraftToRemote({
+            draftId: entry.draftId,
+            sourceSelection,
+            targetProviders,
             projectRef: scopeProjectRef(remoteProject.environmentId, remoteProject.id),
-            envMode: "local",
-            worktreePath: null,
+            setModelSelection: draftStore.setModelSelection,
+            setDraftThreadContext: draftStore.setDraftThreadContext,
           });
+          if (!bound) return;
+          // A Scaffold server owns the same stable thread id in a fresh
+          // environment. Record that cross-environment promotion explicitly
+          // so the draft route can converge as soon as the remote shell
+          // materializes instead of depending on a reload-time inference.
+          draftStore.markDraftThreadPromoting(
+            entry.draftId,
+            scopeThreadRef(remoteProject.environmentId, draft.threadId),
+          );
         })
         .catch((error: unknown) => {
           console.error("Could not route the pending turn to its Scaffold project.", error);

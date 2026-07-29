@@ -1,4 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useAtomValue } from "@effect/atom-react";
 import { useEffect } from "react";
 
 import ChatView from "../components/ChatView";
@@ -7,14 +8,10 @@ import { finalizePromotedDraftThreadByRef, useComposerDraftStore } from "../comp
 import { resolveThreadRouteRef, resolveThreadRouteRenderState } from "../threadRoutes";
 import { resolveThreadSyncPhase } from "../threadSync";
 import { SidebarInset } from "~/components/ui/sidebar";
-import {
-  useEnvironmentThreadRefs,
-  useThreadDetail,
-  useThreadShell,
-  useThreadStatus,
-} from "../state/entities";
+import { useThreadDetail, useThreadShell, useThreadStatus } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
 import { environmentShell } from "../state/shell";
+import { environmentCatalog } from "../connection/catalog";
 
 function ChatThreadRouteView() {
   const navigate = useNavigate();
@@ -24,26 +21,25 @@ function ChatThreadRouteView() {
   const shell = useEnvironmentQuery(
     threadRef === null ? null : environmentShell.stateAtom(threadRef.environmentId),
   );
+  const environmentCatalogState = useAtomValue(environmentCatalog.catalogValueAtom);
+  const platformReconciliationComplete = useAtomValue(
+    environmentCatalog.platformReconciledValueAtom,
+  );
   const serverThreadShell = useThreadShell(threadRef);
   const serverThreadDetail = useThreadDetail(threadRef);
   const serverThreadStatus = useThreadStatus(threadRef);
-  const environmentThreadRefs = useEnvironmentThreadRefs(threadRef?.environmentId ?? null);
   const bootstrapComplete = shell.data?.snapshot._tag === "Some";
-  const environmentHasServerThreads = environmentThreadRefs.length > 0;
   const draftThreadExists = useComposerDraftStore((store) =>
     threadRef ? store.getDraftThreadByRef(threadRef) !== null : false,
   );
   const draftThread = useComposerDraftStore((store) =>
     threadRef ? store.getDraftThreadByRef(threadRef) : null,
   );
-  const environmentHasDraftThreads = useComposerDraftStore((store) => {
-    if (!threadRef) {
-      return false;
-    }
-    return store.hasDraftThreadsInEnvironment(threadRef.environmentId);
-  });
   const renderState = resolveThreadRouteRenderState({
     bootstrapComplete,
+    platformReconciliationComplete,
+    routeEnvironmentRegistered:
+      threadRef !== null && environmentCatalogState.entries.has(threadRef.environmentId),
     serverThreadShellExists: serverThreadShell !== null,
     serverThreadDetailExists: serverThreadDetail !== null,
     serverThreadDetailDeleted: serverThreadStatus === "deleted",
@@ -55,17 +51,16 @@ function ChatThreadRouteView() {
     status: serverThreadStatus,
   });
   const serverThreadStarted = threadHasStarted(serverThreadDetail);
-  const environmentHasAnyThreads = environmentHasServerThreads || environmentHasDraftThreads;
 
   useEffect(() => {
-    if (!threadRef || !bootstrapComplete) {
+    if (!threadRef) {
       return;
     }
 
-    if (renderState === "missing" && environmentHasAnyThreads) {
+    if (renderState === "missing") {
       void navigate({ to: "/", replace: true });
     }
-  }, [bootstrapComplete, environmentHasAnyThreads, navigate, renderState, threadRef]);
+  }, [navigate, renderState, threadRef]);
 
   useEffect(() => {
     if (!threadRef || !serverThreadStarted || !draftThread) {

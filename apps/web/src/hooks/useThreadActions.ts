@@ -457,8 +457,9 @@ export function useThreadActions() {
           ),
         );
       }
-      // Settle is a high-frequency lifecycle action and stays silent — no
-      // toast.
+      // Settlement is authoritative orchestration state. Persist it before the
+      // optional Scaffold lifecycle side effect so a pause conflict can never
+      // roll the thread back to active.
       const result = await settleThreadMutation({
         environmentId: target.environmentId,
         input: { threadId: target.threadId },

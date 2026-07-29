@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   ScaffoldCreateAndPrepareInput,
+  ScaffoldObserveInput,
   ScaffoldPauseInput,
   ScaffoldResumeAndPrepareInput,
   ScaffoldSessionObservation,
@@ -16,7 +17,7 @@ import { makeScaffoldLifecycleService } from "./ScaffoldLifecycleService.ts";
 const ENVIRONMENT_ID = EnvironmentId.make("env_scaffold_1");
 const GLOBAL_SESSION_ID = SessionFabricSessionId.make("session_global_scaffold_1");
 const THREAD_ID = ThreadId.make("thread_scaffold_1");
-const observation = (status: "starting" | "ready" | "paused" | "stopped", epoch = 1) =>
+const observation = (status: "starting" | "ready" | "paused" | "stopped" | "failed", epoch = 1) =>
   new ScaffoldSessionObservation({ sessionId: "ses_1", status, lifecycleEpoch: epoch });
 
 const executionIdentity = (binding: {
@@ -35,6 +36,7 @@ function fakeClient(
   return {
     deployment: "staging",
     baseUrl: "https://scaffold-staging.example.com/",
+    probeSessionCollection: async () => {},
     createSession: async () => observation("starting"),
     getSession: async () => observation("ready"),
     resumeSession: async () => observation("ready"),
@@ -65,6 +67,85 @@ function fakeClient(
 }
 
 describe("ScaffoldLifecycleService", () => {
+  it("observes a session with one read and no lifecycle or transport mutation", async () => {
+    const current = observation("stopped", 4);
+    const getSession = vi.fn(async () => current);
+    const createSession = vi.fn(async () => observation("starting"));
+    const resumeSession = vi.fn(async () => observation("ready"));
+    const pauseSession = vi.fn(async () => observation("paused"));
+    const issueT3Transport = vi.fn(async () => {
+      throw new Error("transport must not be issued while observing");
+    });
+    const service = makeScaffoldLifecycleService({
+      client: () =>
+        fakeClient({ getSession, createSession, resumeSession, pauseSession, issueT3Transport }),
+    });
+
+    await expect(
+      service.observe(new ScaffoldObserveInput({ deployment: "staging", sessionId: "ses_1" })),
+    ).resolves.toBe(current);
+    expect(getSession).toHaveBeenCalledExactlyOnceWith("ses_1");
+    expect(createSession).not.toHaveBeenCalled();
+    expect(resumeSession).not.toHaveBeenCalled();
+    expect(pauseSession).not.toHaveBeenCalled();
+    expect(issueT3Transport).not.toHaveBeenCalled();
+  });
+
+  it("projects collection support per deployment without exposing control-plane responses", async () => {
+    const stagingProbe = vi.fn(async () => {});
+    const productionProbe = vi.fn(async () => {
+      throw new ScaffoldLifecycleError({
+        reason: "not_found",
+        message: "Scaffold lifecycle request failed.",
+        status: 404,
+        code: "remote_code_sandbox_not_found",
+      });
+    });
+    const service = makeScaffoldLifecycleService({
+      client: (deployment) =>
+        fakeClient({
+          deployment,
+          probeSessionCollection: deployment === "staging" ? stagingProbe : productionProbe,
+        }),
+    });
+
+    await expect(service.deploymentCapabilities()).resolves.toEqual({
+      deployments: [
+        {
+          deployment: "staging",
+          status: "available",
+          description: "New Scaffold sandbox",
+        },
+        {
+          deployment: "production",
+          status: "unsupported",
+          description: "Agent sessions are not available in this deployment",
+        },
+      ],
+    });
+    expect(stagingProbe).toHaveBeenCalledOnce();
+    expect(productionProbe).toHaveBeenCalledOnce();
+  });
+
+  it("reports missing deployment configuration without probing the network", async () => {
+    const service = makeScaffoldLifecycleService({ environment: {} });
+
+    await expect(service.deploymentCapabilities()).resolves.toEqual({
+      deployments: [
+        {
+          deployment: "staging",
+          status: "unavailable",
+          description: "Scaffold is not configured",
+        },
+        {
+          deployment: "production",
+          status: "unavailable",
+          description: "Scaffold is not configured",
+        },
+      ],
+    });
+  });
+
   it("uses the sole configured deployment and propagates viewer/controller policy", async () => {
     const issueSessionFabricCapability = vi.fn(async (input) => ({
       capability: "header.payload.signature",
@@ -303,6 +384,43 @@ describe("ScaffoldLifecycleService", () => {
     ).resolves.toMatchObject({ binding: { lifecycleEpoch: 2, status: "ready" } });
   });
 
+  it.each(["stopped", "failed"] as const)(
+    "reports the current %s observation when a resume conflicts with an external stop",
+    async (status) => {
+      const conflict = new ScaffoldLifecycleError({
+        reason: "conflict",
+        message: "changed",
+        status: 409,
+        code: "sandbox_lifecycle_changed",
+      });
+      const current = observation(status, 3);
+      const service = makeScaffoldLifecycleService({
+        client: () =>
+          fakeClient({
+            resumeSession: async () => Promise.reject(conflict),
+            getSession: async () => current,
+          }),
+      });
+
+      await expect(
+        service.prepare(
+          new ScaffoldResumeAndPrepareInput({
+            deployment: "staging",
+            operationId: `op_resume_${status}`,
+            environmentId: ENVIRONMENT_ID,
+            sessionId: "ses_1",
+            expectedLifecycleEpoch: 2,
+          }),
+        ),
+      ).rejects.toMatchObject({
+        reason: "terminal",
+        status: 409,
+        code: `scaffold_session_${status}`,
+        observation: current,
+      });
+    },
+  );
+
   it("reconciles an ambiguous create response by reading the preallocated session", async () => {
     const unavailable = new ScaffoldLifecycleError({
       reason: "network",
@@ -340,7 +458,7 @@ describe("ScaffoldLifecycleService", () => {
     });
   });
 
-  it("treats pause 409 with paused or stopped state as converged", async () => {
+  it("treats pause 409 with stopped state as converged", async () => {
     const conflict = new ScaffoldLifecycleError({
       reason: "conflict",
       message: "changed",
@@ -365,5 +483,33 @@ describe("ScaffoldLifecycleService", () => {
         }),
       ),
     ).resolves.toMatchObject({ environmentId: ENVIRONMENT_ID, status: "stopped" });
+  });
+
+  it("treats pause 409 with paused state as converged", async () => {
+    const conflict = new ScaffoldLifecycleError({
+      reason: "conflict",
+      message: "changed",
+      status: 409,
+      code: "sandbox_lifecycle_changed",
+    });
+    const service = makeScaffoldLifecycleService({
+      client: () =>
+        fakeClient({
+          pauseSession: async () => Promise.reject(conflict),
+          getSession: async () => observation("paused", 3),
+        }),
+    });
+
+    await expect(
+      service.pause(
+        new ScaffoldPauseInput({
+          deployment: "staging",
+          operationId: "op_pause_converged",
+          environmentId: ENVIRONMENT_ID,
+          sessionId: "ses_1",
+          expectedLifecycleEpoch: 2,
+        }),
+      ),
+    ).resolves.toMatchObject({ environmentId: ENVIRONMENT_ID, status: "paused" });
   });
 });

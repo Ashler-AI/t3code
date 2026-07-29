@@ -930,15 +930,20 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-        sessions.delete(ctx.threadId);
         yield* offerRuntimeEvent({
           type: "session.exited",
           ...(yield* makeEventStamp(ctx.threadId)),
           provider: PROVIDER,
           threadId: ctx.threadId,
           payload: { exitKind: "graceful" },
-        });
-        eventSequences.delete(ctx.threadId);
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              sessions.delete(ctx.threadId);
+              eventSequences.delete(ctx.threadId);
+            }),
+          ),
+        );
       });
 
     const startSession: OmpAdapterShape["startSession"] = (input) =>

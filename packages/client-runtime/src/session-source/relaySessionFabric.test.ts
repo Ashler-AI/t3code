@@ -899,6 +899,91 @@ describe("Relay session fabric UI source", () => {
     }),
   );
 
+  it.effect("uses an exact local controller binding for a public local session", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      const capabilityBodies: unknown[] = [];
+      const localSnapshot: SessionFabricSnapshot = {
+        ...snapshot,
+        session: {
+          ...snapshot.session,
+          location: {
+            ...snapshot.session.location,
+            environmentKind: "local",
+            scaffoldSessionId: null,
+            scaffoldSessionUrl: null,
+            scaffoldLifecycleEpoch: null,
+          },
+        },
+      };
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "https://t3.example/api/session-fabric/capabilities",
+        fetch: (async (_input, init) => {
+          const body = JSON.parse(String(init?.body)) as { role: string };
+          capabilityBodies.push(body);
+          return Response.json({
+            capability: `${body.role}.local.token`,
+            tokenType: "Bearer",
+            role: body.role,
+            scopes:
+              body.role === "viewer"
+                ? ["directory:read", "session:read"]
+                : ["session:read", "session:command"],
+            expiresAt: "2026-07-24T21:00:00.000Z",
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings:
+              body.role === "viewer"
+                ? {}
+                : {
+                    fabricSessionId: SESSION_ID,
+                    environmentKind: "local",
+                    environmentId: ENVIRONMENT_ID,
+                    threadId: THREAD_ID,
+                    actorId: "user-1",
+                  },
+          });
+        }) as typeof fetch,
+      });
+      const source = makeRelaySessionFabricUiSessionSource({
+        relayBaseUrl: "https://relay.example.test/",
+        sessionId: SESSION_ID,
+        clientId: SessionFabricClientId.make("client-local-controller"),
+        environmentId: ENVIRONMENT_ID,
+        environmentLabel: "Local relay test",
+        authorization,
+        fetch: (() => Promise.resolve(Response.json(localSnapshot))) as typeof fetch,
+        webSocketConstructor: relay.construct,
+      });
+
+      yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID);
+      const dispatched = yield* Effect.forkChild(
+        source
+          .dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("command-local-authorized"),
+            threadId: THREAD_ID,
+            title: "Local authorized",
+          })
+          .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
+      );
+      yield* awaitSocketCount(relay, 1);
+      relay.sockets[0]!.open();
+      expect(yield* Fiber.join(dispatched)).toEqual({ sequence: 8 });
+      expect(capabilityBodies).toEqual([
+        { role: "viewer" },
+        {
+          role: "controller",
+          fabricSessionId: SESSION_ID,
+          environmentKind: "local",
+          environmentId: ENVIRONMENT_ID,
+          threadId: THREAD_ID,
+        },
+      ]);
+    }),
+  );
+
   it.effect("refreshes an expired viewer websocket capability once", () =>
     Effect.gen(function* () {
       const relay = new TestRelay();

@@ -30,6 +30,37 @@ const parseAllowedOrigins = (value: string | undefined): ReadonlySet<string> =>
       .filter((origin) => origin.length > 0),
   );
 
+export const normalizeSessionFabricAuthorizationRequestUrl = (requestUrl: string): string =>
+  /^[A-Za-z][A-Za-z\d+.-]*:/u.test(requestUrl)
+    ? requestUrl
+    : new URL(requestUrl, "http://127.0.0.1").href;
+
+export const resolveSessionFabricCorsOrigin = (input: {
+  readonly requestUrl: string;
+  readonly origin: string | undefined;
+  readonly authDisabled: boolean;
+  readonly allowedOrigins: ReadonlySet<string>;
+}): string | null => {
+  const origin = input.origin?.replace(/\/+$/gu, "");
+  if (origin === undefined) return null;
+  if (input.authDisabled) {
+    if (
+      !isLoopbackSessionFabricRequestUrl(
+        normalizeSessionFabricAuthorizationRequestUrl(input.requestUrl),
+      )
+    ) {
+      return null;
+    }
+    try {
+      const url = new URL(origin);
+      return url.hostname === "localhost" || url.hostname === "127.0.0.1" ? origin : null;
+    } catch {
+      return null;
+    }
+  }
+  return input.allowedOrigins.has(origin) ? origin : null;
+};
+
 export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi>()(
   "SessionFabricApi",
   {
@@ -75,25 +106,18 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
       return yield* authorizeSessionFabricCapability({
         config: verifierConfig,
         authorization: request.headers.authorization,
-        requestUrl: request.url,
+        requestUrl: normalizeSessionFabricAuthorizationRequestUrl(request.url),
         nowEpochSeconds: Math.floor((yield* Clock.currentTimeMillis) / 1_000),
       });
     });
 
-    const corsOrigin = (request: HttpServerRequest.HttpServerRequest): string | null => {
-      const origin = request.headers.origin?.replace(/\/+$/gu, "");
-      if (origin === undefined) return null;
-      if (verifierConfig?.mode === "disabled") {
-        if (!isLoopbackSessionFabricRequestUrl(request.url)) return null;
-        try {
-          const url = new URL(origin);
-          return url.hostname === "localhost" || url.hostname === "127.0.0.1" ? origin : null;
-        } catch {
-          return null;
-        }
-      }
-      return allowedOrigins.has(origin) ? origin : null;
-    };
+    const corsOrigin = (request: HttpServerRequest.HttpServerRequest): string | null =>
+      resolveSessionFabricCorsOrigin({
+        requestUrl: request.url,
+        origin: request.headers.origin,
+        authDisabled: verifierConfig?.mode === "disabled",
+        allowedOrigins,
+      });
 
     const withCors = (
       request: HttpServerRequest.HttpServerRequest,

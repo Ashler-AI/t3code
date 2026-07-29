@@ -1,6 +1,10 @@
 import { autoAnimate } from "@formkit/auto-animate";
 import { useAtomValue } from "@effect/atom-react";
 import {
+  makeSessionFabricDirectoryClient,
+  readDefaultSessionFabricAuthorization,
+} from "@t3tools/client-runtime/session-source";
+import {
   canSnooze,
   effectiveSettled,
   effectiveSnoozed,
@@ -13,6 +17,7 @@ import {
   scopedThreadKey,
 } from "@t3tools/client-runtime/environment";
 import type { ScopedThreadRef, SidebarProjectGroupingMode } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
 import {
   AlarmClockIcon,
   AlarmClockOffIcon,
@@ -112,12 +117,14 @@ import {
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
   resolveAdjacentThreadId,
+  resolveProvisionalDraftPresentation,
   resolveSettledTimestamp,
   resolveSidebarV2Status,
   searchSidebarThreadsByTitle,
   resolveAshlerSidebarIndicator,
   isScaffoldEnvironmentLabel,
   resolveWorkingStartedAt,
+  selectScaffoldDraftRows,
   selectProvisionalDraftRows,
   shouldNavigateAfterProjectRemoval,
   sortLogicalProjectsForSidebar,
@@ -161,10 +168,28 @@ import { Popover, PopoverPopup, PopoverTrigger } from "./ui/popover";
 import { Tooltip, TooltipPopup, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { useComposerDraftStore } from "../composerDraftStore";
 import {
+  browserPendingTurnOutbox,
+  subscribePendingTurnDrain,
+} from "../connection/pendingTurnOutbox";
+import {
   scaffoldSessionForEnvironment,
   type ScaffoldSessionUiEntry,
   useScaffoldSessionUiStore,
 } from "../scaffoldSessionUiStore";
+import { readRuntimeBasePath } from "../runtimeBasePath";
+import {
+  configuredSessionFabricRelayUrl,
+  sessionFabricRoutePath,
+} from "../connection/sessionFabricBootstrap";
+import {
+  selectPublicLocalSidebarSessions,
+  selectShadowedSessionFabricThreadKeys,
+  selectVisibleSessionFabricSidebarSessions,
+  sessionFabricRunnerStateLabel,
+  startSessionFabricSidebarDiscovery,
+  type SessionFabricSidebarDirectoryState,
+  type SessionFabricSidebarSession,
+} from "./sessionFabricSidebar";
 
 // Settled-tail paging: recent history is the common lookup; the deep tail
 // stays behind an explicit Show more.
@@ -1077,14 +1102,77 @@ export default function SidebarV2() {
   const threads = useThreadShells();
   const scaffoldSessionsByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
   const draftThreadsByDraftId = useComposerDraftStore((state) => state.draftThreadsByThreadKey);
+  const materializedThreadKeys = useMemo(
+    () =>
+      new Set(
+        threads.map((thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
+      ),
+    [threads],
+  );
+  const [pendingDraftIds, setPendingDraftIds] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    let disposed = false;
+    const refresh = () => {
+      void browserPendingTurnOutbox
+        .list()
+        .then((entries) => {
+          if (disposed) return;
+          setPendingDraftIds(
+            new Set(
+              entries.flatMap((entry) =>
+                entry.draftId !== null && entry.status !== "terminal" ? [entry.draftId] : [],
+              ),
+            ),
+          );
+        })
+        .catch((error: unknown) => {
+          console.error("Could not read pending turns for sidebar drafts.", error);
+        });
+    };
+    const unsubscribe = subscribePendingTurnDrain(refresh);
+    refresh();
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, []);
   const scaffoldDraftRows = useMemo(
     () =>
-      Object.values(scaffoldSessionsByDraftId)
-        .filter((entry) => draftThreadsByDraftId[entry.draftId] !== undefined)
-        .toSorted((left, right) => left.createdAt.localeCompare(right.createdAt)),
-    [draftThreadsByDraftId, scaffoldSessionsByDraftId],
+      selectScaffoldDraftRows({
+        entries: Object.values(scaffoldSessionsByDraftId),
+        draftThreadsByDraftId,
+        materializedThreadKeys,
+      }).toSorted((left, right) => left.createdAt.localeCompare(right.createdAt)),
+    [draftThreadsByDraftId, materializedThreadKeys, scaffoldSessionsByDraftId],
   );
   const router = useRouter();
+  const [fabricDirectoryState, setFabricDirectoryState] =
+    useState<SessionFabricSidebarDirectoryState | null>(null);
+  const refreshFabricDirectoryRef = useRef<(() => Promise<void>) | null>(null);
+  useEffect(() => {
+    const relayBaseUrl = configuredSessionFabricRelayUrl(
+      import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
+    );
+    if (relayBaseUrl === null) return undefined;
+    const discovery = startSessionFabricSidebarDiscovery({
+      eventTarget: window,
+      load: async (signal) => {
+        const client = makeSessionFabricDirectoryClient({
+          relayBaseUrl,
+          authorization: readDefaultSessionFabricAuthorization(),
+          fetch: (input, init) => globalThis.fetch(input, { ...init, signal }),
+        });
+        const directory = await Effect.runPromise(client.list());
+        return selectPublicLocalSidebarSessions(directory.sessions);
+      },
+      onState: setFabricDirectoryState,
+    });
+    refreshFabricDirectoryRef.current = discovery.refresh;
+    return () => {
+      refreshFabricDirectoryRef.current = null;
+      discovery.dispose();
+    };
+  }, []);
   const { isMobile, setOpenMobile } = useSidebar();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const autoSettleAfterDays = useClientSettings((s) => s.sidebarAutoSettleAfterDays);
@@ -1282,17 +1370,42 @@ export default function SidebarV2() {
           ),
     [scopedProjectGroup],
   );
+  const connectedThreadKeys = useMemo(
+    () => new Set(threads.map((thread) => `${thread.environmentId}:${thread.id}`)),
+    [threads],
+  );
+  const publicLocalFabricSessions = useMemo(
+    () =>
+      selectVisibleSessionFabricSidebarSessions(fabricDirectoryState?.sessions ?? [], {
+        connectedThreadKeys,
+        scopedProjectKeys,
+      }),
+    [connectedThreadKeys, fabricDirectoryState?.sessions, scopedProjectKeys],
+  );
+  const shadowedSessionFabricThreadKeys = useMemo(
+    () =>
+      selectShadowedSessionFabricThreadKeys(
+        fabricDirectoryState?.sessions ?? [],
+        connectedThreadKeys,
+      ),
+    [connectedThreadKeys, fabricDirectoryState?.sessions],
+  );
   const provisionalDraftRows = useMemo(
     () =>
       selectProvisionalDraftRows({
         draftThreadsByDraftId,
         scaffoldDraftIds: new Set(Object.keys(scaffoldSessionsByDraftId)),
-        materializedThreadKeys: new Set(
-          threads.map((thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
-        ),
+        materializedThreadKeys,
+        pendingDraftIds,
         scopedProjectKeys,
       }),
-    [draftThreadsByDraftId, scaffoldSessionsByDraftId, scopedProjectKeys, threads],
+    [
+      draftThreadsByDraftId,
+      materializedThreadKeys,
+      pendingDraftIds,
+      scaffoldSessionsByDraftId,
+      scopedProjectKeys,
+    ],
   );
   useEffect(() => {
     if (projectScopeKey !== null && scopedProjectGroup === null) {
@@ -1458,9 +1571,9 @@ export default function SidebarV2() {
   );
 
   // Settled threads stay in the live shell stream (settled ≠ archived), so
-  // the partition works directly off live shells: no archived-snapshot
-  // merging, no optimistic holds. Archived threads remain hidden here —
-  // archive keeps its original "remove from sidebar" meaning.
+  // the partition works directly off authoritative live shells. Archived
+  // threads remain hidden here — archive keeps its original "remove from
+  // sidebar" meaning.
   const serverConfigs = useAtomValue(environmentServerConfigsAtom);
   const { activeThreads, snoozedThreads, settledThreads, snoozeNow } = useMemo(() => {
     const now = `${nowMinute}:00.000Z`;
@@ -1473,6 +1586,9 @@ export default function SidebarV2() {
     const visible = threads.filter(
       (thread) =>
         thread.archivedAt === null &&
+        !shadowedSessionFabricThreadKeys.has(
+          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+        ) &&
         (scopedProjectKeys === null ||
           scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
     );
@@ -1480,25 +1596,27 @@ export default function SidebarV2() {
     const snoozed: EnvironmentThreadShell[] = [];
     const settled: EnvironmentThreadShell[] = [];
     for (const thread of visible) {
-      // Threads on servers without the settlement capability (old server,
-      // or descriptor not loaded yet) never classify as settled: the user
-      // could neither un-settle nor pin them, so auto-settling them would
-      // strand rows in a tail with no working affordances.
+      // Servers without the capability never classify as settled. The durable
+      // thread projection is the sole settlement authority for every runner.
       const supportsSettlement =
         serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement === true;
       const supportsSnooze =
         serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true;
       const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
       const changeRequestState = changeRequestStateByKey.get(threadKey) ?? null;
+      const threadIsSettled =
+        supportsSettlement &&
+        effectiveSettled(thread, {
+          now,
+          autoSettleAfterDays,
+          changeRequestState,
+        });
       // Snooze outranks settled classification: an explicitly snoozed thread
       // belongs to the shelf even if it would also auto-settle (the shelf's
       // wake time is a stronger statement about when it matters again).
       if (supportsSnooze && effectiveSnoozed(thread, { now: preciseNow })) {
         snoozed.push(thread);
-      } else if (
-        supportsSettlement &&
-        effectiveSettled(thread, { now, autoSettleAfterDays, changeRequestState })
-      ) {
+      } else if (threadIsSettled) {
         settled.push(thread);
       } else {
         active.push(thread);
@@ -1521,6 +1639,7 @@ export default function SidebarV2() {
     nowMinute,
     scopedProjectKeys,
     serverConfigs,
+    shadowedSessionFabricThreadKeys,
     snoozeWakeTick,
     threads,
   ]);
@@ -1773,6 +1892,20 @@ export default function SidebarV2() {
       selectThreadSearchResult,
       threadSearchResults,
     ],
+  );
+
+  const navigateToFabricSession = useCallback(
+    (session: SessionFabricSidebarSession) => {
+      if (isMobile) setOpenMobile(false);
+      window.location.assign(
+        sessionFabricRoutePath({
+          sessionId: session.sessionId,
+          threadId: session.threadId,
+          runtimeBasePath: readRuntimeBasePath(),
+        }),
+      );
+    },
+    [isMobile, setOpenMobile],
   );
 
   const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
@@ -2824,7 +2957,68 @@ export default function SidebarV2() {
                     );
                   });
                   items.push(
-                    ...provisionalDraftRows.map(({ draftId, draftThread }) => {
+                    ...publicLocalFabricSessions.map((session) => (
+                      <li key={`session-fabric:${session.sessionId}`} className="list-none py-px">
+                        <button
+                          type="button"
+                          className="group/v2-row w-full cursor-pointer rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-sidebar-row-hover"
+                          onClick={() => navigateToFabricSession(session)}
+                        >
+                          <div className="flex h-6 min-w-0 items-center gap-2">
+                            <span
+                              aria-hidden
+                              className={cn(
+                                "size-2 shrink-0 rounded-full",
+                                session.runnerState === "online"
+                                  ? "bg-emerald-500"
+                                  : "bg-muted-foreground/30",
+                              )}
+                            />
+                            <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                              {session.title}
+                            </span>
+                          </div>
+                          <div className="ml-4 flex h-4 min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground/65">
+                            <ServerIcon aria-hidden className="size-3 shrink-0" />
+                            <span>Local · {sessionFabricRunnerStateLabel(session.runnerState)}</span>
+                          </div>
+                        </button>
+                      </li>
+                    )),
+                  );
+                  if (fabricDirectoryState?.status === "loading") {
+                    items.push(
+                      <li
+                        key="session-fabric:loading"
+                        role="status"
+                        className="list-none px-2.5 py-2 text-xs text-muted-foreground"
+                      >
+                        Loading shared local sessions…
+                      </li>,
+                    );
+                  } else if (fabricDirectoryState?.status === "error") {
+                    items.push(
+                      <li
+                        key="session-fabric:error"
+                        role="alert"
+                        className="flex list-none items-center gap-2 px-2.5 py-2 text-xs text-destructive"
+                      >
+                        <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
+                        <span className="min-w-0 flex-1">Couldn’t load shared local sessions.</span>
+                        <button
+                          type="button"
+                          className="shrink-0 font-medium text-foreground hover:underline"
+                          onClick={() => void refreshFabricDirectoryRef.current?.()}
+                        >
+                          Retry
+                        </button>
+                      </li>,
+                    );
+                  }
+                  items.push(
+                    ...provisionalDraftRows.map((row) => {
+                      const { draftId } = row;
+                      const presentation = resolveProvisionalDraftPresentation(row);
                       const isActive =
                         routeTarget?.kind === "draft" && routeTarget.draftId === draftId;
                       return (
@@ -2853,11 +3047,13 @@ export default function SidebarV2() {
                           >
                             <div className="flex h-6 min-w-0 items-center gap-2">
                               <span className="inline-flex size-2 shrink-0 items-center justify-center">
-                                <span
-                                  role="status"
-                                  aria-label="Local session is starting"
-                                  className="animate-status-pulse size-2 rounded-full bg-amber-400 motion-reduce:animate-none"
-                                />
+                                {presentation.statusLabel ? (
+                                  <span
+                                    role="status"
+                                    aria-label={presentation.statusLabel}
+                                    className="animate-status-pulse size-2 rounded-full bg-amber-400 motion-reduce:animate-none"
+                                  />
+                                ) : null}
                               </span>
                               <span className="min-w-0 flex-1 truncate text-sm font-medium">
                                 New thread
@@ -2865,11 +3061,7 @@ export default function SidebarV2() {
                             </div>
                             <div className="ml-4 flex h-4 min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground/65">
                               <FolderIcon aria-hidden className="size-3 shrink-0" />
-                              <span className="truncate">
-                                {draftThread.envMode === "worktree"
-                                  ? "Preparing worktree..."
-                                  : "Starting local session..."}
-                              </span>
+                              <span className="truncate">{presentation.detail}</span>
                             </div>
                           </div>
                         </li>
@@ -2972,8 +3164,10 @@ export default function SidebarV2() {
             snoozedThreads.length +
             settledThreads.length +
             scaffoldDraftRows.length +
-            provisionalDraftRows.length ===
-          0 ? (
+            provisionalDraftRows.length +
+            publicLocalFabricSessions.length ===
+            0 &&
+          (fabricDirectoryState === null || fabricDirectoryState.status === "ready") ? (
             <div className="flex flex-col items-center gap-2 px-2 py-6 text-center text-xs text-muted-foreground/60">
               {projects.length === 0 ? (
                 <>

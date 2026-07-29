@@ -268,6 +268,39 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(testApi.calls.session).toBe(2);
   });
 
+  it("replaces a stale local dev session cookie after the initial session fetch returns 401", async () => {
+    const invalidSession = new EnvironmentAuthInvalidError({
+      code: "auth_invalid",
+      reason: "invalid_credential",
+      traceId: "trace-stale-session-cookie",
+    });
+    let sessionAttempts = 0;
+    const runner: PrimaryHttpEffectRunner = async <A>() => {
+      sessionAttempts += 1;
+      if (sessionAttempts === 1) {
+        throw invalidSession;
+      }
+      return authenticatedSession(LOOPBACK_AUTH) as A;
+    };
+    __setPrimaryHttpRunnerForTests(runner);
+    vi.stubEnv("VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED", "true");
+    const fetchSpy = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { resolveInitialServerAuthGateState } = await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+    expect(fetchSpy).toHaveBeenCalledWith("/__t3/local-dev/browser-session", {
+      method: "POST",
+      credentials: "include",
+      headers: { "x-t3-local-dev-bootstrap": "1" },
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(sessionAttempts).toBe(2);
+  });
+
   it("retries transient auth session bootstrap failures after restart", async () => {
     vi.useFakeTimers();
     let attempts = 0;
@@ -504,6 +537,39 @@ describe("resolveInitialServerAuthGateState", () => {
       status: "authenticated",
     });
     expect(testApi.calls.session).toBe(1);
+  });
+
+  it("revalidates a memoized local session before reconnecting and replaces a stale cookie", async () => {
+    const invalidSession = new EnvironmentAuthInvalidError({
+      code: "auth_invalid",
+      reason: "invalid_credential",
+      traceId: "trace-stale-reconnect-cookie",
+    });
+    let sessionAttempts = 0;
+    const runner: PrimaryHttpEffectRunner = async <A>() => {
+      sessionAttempts += 1;
+      if (sessionAttempts === 1 || sessionAttempts === 3) {
+        return authenticatedSession(LOOPBACK_AUTH) as A;
+      }
+      throw invalidSession;
+    };
+    __setPrimaryHttpRunnerForTests(runner);
+    vi.stubEnv("VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED", "true");
+    const fetchSpy = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { reauthenticatePrimaryEnvironment, resolveInitialServerAuthGateState } =
+      await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+    await expect(reauthenticatePrimaryEnvironment()).resolves.toEqual({
+      status: "authenticated",
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(sessionAttempts).toBe(3);
   });
 
   it("creates a pairing credential from the authenticated auth endpoint", async () => {

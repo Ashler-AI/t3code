@@ -50,6 +50,19 @@ export function createEnvironmentCatalogAtoms<R, E>(
     Option.getOrElse(AsyncResult.value(get(catalogAtom)), () => EMPTY_ENVIRONMENT_CATALOG_STATE),
   ).pipe(Atom.withLabel("environment-catalog-value"));
 
+  const platformReconciledAtom = runtime.atom(
+    Stream.unwrap(
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.map((registry) => SubscriptionRef.changes(registry.platformReconciled)),
+      ),
+    ),
+    { initialValue: false },
+  );
+
+  const platformReconciledValueAtom = Atom.make((get) =>
+    Option.getOrElse(AsyncResult.value(get(platformReconciledAtom)), () => false),
+  ).pipe(Atom.withLabel("environment-platform-reconciled-value"));
+
   const networkStatusAtom = runtime.atom(
     Stream.unwrap(
       EnvironmentRegistry.EnvironmentRegistry.pipe(
@@ -119,6 +132,8 @@ export function createEnvironmentCatalogAtoms<R, E>(
   return {
     catalogAtom,
     catalogValueAtom,
+    platformReconciledAtom,
+    platformReconciledValueAtom,
     networkStatusAtom,
     networkStatusValueAtom,
     stateAtom,

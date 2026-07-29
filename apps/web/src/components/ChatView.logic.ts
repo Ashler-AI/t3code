@@ -373,7 +373,11 @@ export function deriveLockedProvider(input: {
   thread: Thread | null | undefined;
   selectedProvider: string | null;
   threadProvider: string | null;
+  forcedProvider?: string | null;
 }): ProviderDriverKind | null {
+  if (input.forcedProvider && isProviderDriverKind(input.forcedProvider)) {
+    return input.forcedProvider;
+  }
   if (!threadHasStarted(input.thread)) {
     return null;
   }

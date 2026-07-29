@@ -28,9 +28,13 @@ function resultFromReconciliation(
       return { _tag: "acknowledged" };
     case "wait":
       return {
-        _tag: "retry",
+        _tag: "wait",
         retryAfterMs: reconciliation.retryAfterMs,
         errorCode: `session_${reconciliation.observation.status}`,
+        observation: {
+          sessionId: reconciliation.observation.sessionId,
+          lifecycleEpoch: reconciliation.observation.lifecycleEpoch,
+        },
       };
     case "stale":
       return {

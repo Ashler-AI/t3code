@@ -143,6 +143,19 @@ export function isLoopbackHostname(hostname: string): boolean {
   return LOOPBACK_HOSTNAMES.has(normalizeHostname(hostname));
 }
 
+function isSameDevServerOrigin(currentUrl: URL, devServerUrl: URL): boolean {
+  if (currentUrl.origin === devServerUrl.origin) {
+    return true;
+  }
+
+  return (
+    currentUrl.protocol === devServerUrl.protocol &&
+    currentUrl.port === devServerUrl.port &&
+    isLoopbackHostname(currentUrl.hostname) &&
+    isLoopbackHostname(devServerUrl.hostname)
+  );
+}
+
 function resolveHttpRequestBaseUrl(primaryTarget: PrimaryEnvironmentTarget): string {
   const httpBaseUrl = primaryTarget.target.httpBaseUrl;
   const configuredDevServerUrl = import.meta.env.VITE_DEV_SERVER_URL?.trim();
@@ -169,7 +182,7 @@ function resolveHttpRequestBaseUrl(primaryTarget: PrimaryEnvironmentTarget): str
 
   const isCurrentOriginDevServer =
     (currentUrl.protocol === "http:" || currentUrl.protocol === "https:") &&
-    currentUrl.origin === devServerUrl.origin;
+    isSameDevServerOrigin(currentUrl, devServerUrl);
 
   if (
     !isCurrentOriginDevServer ||
@@ -292,9 +305,19 @@ export function resolvePrimaryEnvironmentHttpUrl(
 }
 
 export function readPrimaryEnvironmentTarget(): PrimaryEnvironmentTarget {
-  return (
+  const primaryTarget =
     resolveDesktopPrimaryTarget() ??
     resolveConfiguredPrimaryTarget() ??
-    resolveWindowOriginPrimaryTarget()
-  );
+    resolveWindowOriginPrimaryTarget();
+  const httpBaseUrl = resolveHttpRequestBaseUrl(primaryTarget);
+  if (httpBaseUrl === primaryTarget.target.httpBaseUrl) {
+    return primaryTarget;
+  }
+  return {
+    ...primaryTarget,
+    target: {
+      ...primaryTarget.target,
+      httpBaseUrl,
+    },
+  };
 }

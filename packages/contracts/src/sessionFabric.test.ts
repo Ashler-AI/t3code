@@ -88,6 +88,57 @@ describe("session fabric contracts", () => {
     ).toThrow();
   });
 
+  it("accepts an exact local authority binding and rejects mixed Scaffold fields", () => {
+    const rawLocal = {
+      v: 1,
+      iss: "https://scaffold.example",
+      aud: "ashler-session-fabric",
+      sub: "user-1",
+      jti: "runner-local-1",
+      iat: 100,
+      nbf: 100,
+      exp: 200,
+      role: "runner",
+      scopes: ["session:publish", "session:execute"],
+      fabricSessionId: "sf:environment-1:thread-1",
+      environmentKind: "local",
+      environmentId: "environment-1",
+      threadId: "thread-1",
+      runnerId: "runner:environment-1",
+      actorId: "user-1",
+    } as const;
+    const local = decodeCapabilityClaims(rawLocal);
+    expect(local).toMatchObject({
+      role: "runner",
+      environmentKind: "local",
+      environmentId: "environment-1",
+      runnerId: "runner:environment-1",
+      actorId: "user-1",
+    });
+    expect(() =>
+      decodeCapabilityClaims({
+        ...rawLocal,
+        scaffoldSessionId: "ses_mixed",
+        scaffoldLifecycleEpoch: 1,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeCapabilityClaims({
+        ...rawLocal,
+        role: "controller",
+        scopes: ["session:read", "session:command"],
+      }),
+    ).toThrow();
+    const { runnerId: _runnerId, ...localController } = rawLocal;
+    expect(
+      decodeCapabilityClaims({
+        ...localController,
+        role: "controller",
+        scopes: ["session:read", "session:command"],
+      }),
+    ).toMatchObject({ role: "controller", actorId: "user-1", threadId: "thread-1" });
+  });
+
   it("carries the original idempotent orchestration command", () => {
     const frame = decodeClientFrame({
       type: "command.submit",

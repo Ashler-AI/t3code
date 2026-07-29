@@ -337,7 +337,7 @@ export const ApiLive = Api.make(
         }
         const url = new URL(request.url);
         const match = url.pathname.match(
-          /^\/v1\/session-fabric\/sessions\/([^/]+)\/(?:connect|snapshot|events|context)$/,
+          /^\/v1\/session-fabric\/sessions\/([^/]+)\/(?:authority|connect|snapshot|events|context)$/,
         );
         const encodedSessionId = match?.[1];
         if (encodedSessionId === undefined) {

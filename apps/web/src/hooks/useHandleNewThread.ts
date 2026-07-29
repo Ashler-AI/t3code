@@ -164,8 +164,10 @@ export function resolveScaffoldDraftModelSelection(
     return sourceSelection;
   }
 
-  if (sourceSelection?.instanceId === ompProvider.instanceId) {
-    const routePayload = sourceSelection.model.split("/").slice(1).join("/");
+  if (sourceSelection) {
+    const routeSegments = sourceSelection.model.split("/");
+    const routePayload =
+      routeSegments.length === 1 ? sourceSelection.model : routeSegments.slice(1).join("/");
     if (routePayload.length > 0) {
       const matchingModels = ompProvider.models.filter(
         (model) => model.slug.split("/").slice(1).join("/") === routePayload,

@@ -108,6 +108,26 @@ const ScaffoldWorkspaceMigrationUnsupportedFilesystemCases = Schema.Array(
 export const ScaffoldDeployment = Schema.Literals(["staging", "production"]);
 export type ScaffoldDeployment = typeof ScaffoldDeployment.Type;
 
+export const ScaffoldDeploymentCapabilityStatus = Schema.Literals([
+  "available",
+  "unsupported",
+  "unavailable",
+]);
+export type ScaffoldDeploymentCapabilityStatus = typeof ScaffoldDeploymentCapabilityStatus.Type;
+
+export class ScaffoldDeploymentCapability extends Schema.Class<ScaffoldDeploymentCapability>(
+  "ScaffoldDeploymentCapability",
+)({
+  deployment: ScaffoldDeployment,
+  status: ScaffoldDeploymentCapabilityStatus,
+  description: TrimmedNonEmptyString,
+}) {}
+
+export const ScaffoldDeploymentCapabilities = Schema.Struct({
+  deployments: Schema.Array(ScaffoldDeploymentCapability),
+});
+export type ScaffoldDeploymentCapabilities = typeof ScaffoldDeploymentCapabilities.Type;
+
 export const ScaffoldAgentEffort = Schema.Literals([
   "off",
   "auto",
@@ -234,6 +254,14 @@ export const ScaffoldPrepareConnectionInput = Schema.Union([
   ScaffoldResumeAndPrepareInput,
 ]);
 export type ScaffoldPrepareConnectionInput = typeof ScaffoldPrepareConnectionInput.Type;
+
+/** Read-only lookup used to reconcile a saved UI projection with Scaffold. */
+export class ScaffoldObserveInput extends Schema.Class<ScaffoldObserveInput>(
+  "ScaffoldObserveInput",
+)({
+  deployment: ScaffoldDeployment,
+  sessionId: TrimmedNonEmptyString,
+}) {}
 
 export class ScaffoldPauseInput extends Schema.Class<ScaffoldPauseInput>("ScaffoldPauseInput")({
   deployment: ScaffoldDeployment,

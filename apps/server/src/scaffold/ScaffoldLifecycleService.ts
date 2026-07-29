@@ -1,7 +1,10 @@
 import {
   type ScaffoldDeployment,
+  ScaffoldDeploymentCapability,
+  type ScaffoldDeploymentCapabilities,
   ScaffoldEnvironmentBinding,
   ScaffoldLifecycleError,
+  type ScaffoldObserveInput,
   type ScaffoldPauseInput,
   ScaffoldPreparedConnection,
   ScaffoldSessionLinks,
@@ -22,6 +25,7 @@ import * as Schema from "effect/Schema";
 const DEFAULT_READINESS_TIMEOUT_MS = 60_000;
 const DEFAULT_READINESS_INTERVAL_MS = 1_000;
 const isScaffoldLifecycleError = Schema.is(ScaffoldLifecycleError);
+const SCAFFOLD_DEPLOYMENTS = ["staging", "production"] as const;
 
 export interface ScaffoldLifecycleServiceOptions {
   readonly environment?: Readonly<Record<string, string | undefined>>;
@@ -136,13 +140,10 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
     } catch (error) {
       if (!isScaffoldLifecycleError(error) || error.status !== 409) throw error;
       const current = await client.getSession(input.sessionId);
-      if (
-        current.lifecycleEpoch < input.expectedLifecycleEpoch ||
-        current.status === "failed" ||
-        current.status === "stopped"
-      ) {
-        throw error;
+      if (current.status === "failed" || current.status === "stopped") {
+        throw terminalError(current);
       }
+      if (current.lifecycleEpoch < input.expectedLifecycleEpoch) throw error;
       return current;
     }
   };
@@ -247,6 +248,9 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
     });
   };
 
+  const observe = async (input: ScaffoldObserveInput): Promise<ScaffoldSessionObservation> =>
+    clientFor(input.deployment).getSession(input.sessionId);
+
   const issueSessionFabricCapability = async (input: {
     readonly deployment?: ScaffoldDeployment;
     readonly capability: ScaffoldSessionFabricCapabilityInput;
@@ -255,7 +259,58 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
     return clientFor(deployment).issueSessionFabricCapability(input.capability);
   };
 
-  return { prepare, pause, issueSessionFabricCapability };
+  const deploymentCapabilities = async (): Promise<ScaffoldDeploymentCapabilities> => ({
+    deployments: await Promise.all(
+      SCAFFOLD_DEPLOYMENTS.map(async (deployment) => {
+        try {
+          await clientFor(deployment).probeSessionCollection();
+          return new ScaffoldDeploymentCapability({
+            deployment,
+            status: "available",
+            description: "New Scaffold sandbox",
+          });
+        } catch (error) {
+          if (error instanceof ScaffoldConfigurationError) {
+            return new ScaffoldDeploymentCapability({
+              deployment,
+              status: "unavailable",
+              description: "Scaffold is not configured",
+            });
+          }
+          if (isScaffoldLifecycleError(error)) {
+            if (error.reason === "configuration") {
+              return new ScaffoldDeploymentCapability({
+                deployment,
+                status: "unavailable",
+                description: "Scaffold is not configured",
+              });
+            }
+            if (error.reason === "not_found") {
+              return new ScaffoldDeploymentCapability({
+                deployment,
+                status: "unsupported",
+                description: "Agent sessions are not available in this deployment",
+              });
+            }
+            if (error.reason === "authentication") {
+              return new ScaffoldDeploymentCapability({
+                deployment,
+                status: "unavailable",
+                description: "Scaffold sign-in is required",
+              });
+            }
+          }
+          return new ScaffoldDeploymentCapability({
+            deployment,
+            status: "unavailable",
+            description: "Scaffold is temporarily unavailable",
+          });
+        }
+      }),
+    ),
+  });
+
+  return { prepare, observe, pause, issueSessionFabricCapability, deploymentCapabilities };
 }
 
 export type ScaffoldLifecycleService = ReturnType<typeof makeScaffoldLifecycleService>;

@@ -10,7 +10,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
-import { RelayConnectionTarget } from "../connection/model.ts";
+import {
+  ConnectionBlockedError,
+  ConnectionTransientError,
+  RelayConnectionTarget,
+} from "../connection/model.ts";
 import { prepareManagedScaffoldConnection } from "./managedConnection.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("env_scaffold_1");
@@ -29,6 +33,238 @@ const binding = new ScaffoldEnvironmentBinding({
 });
 
 describe("prepareManagedScaffoldConnection", () => {
+  it.effect("re-prepares once when the direct descriptor rejects a stale attach grant", () =>
+    Effect.gen(function* () {
+      let authorizeCount = 0;
+      let prepareCount = 0;
+      const remote = RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
+        authorizeBearer: () => Effect.die("not used"),
+        authorizeDpop: (input) =>
+          Effect.gen(function* () {
+            authorizeCount += 1;
+            const bootstrap = yield* input.obtainBootstrap;
+            if (authorizeCount === 1) {
+              return yield* new ConnectionTransientError({
+                reason: "remote-unavailable",
+                detail:
+                  "Remote environment endpoint https://sandbox.example.com/.well-known/t3/environment returned undeclared status 409.",
+              });
+            }
+            return {
+              environmentId: ENVIRONMENT_ID,
+              label: "Scaffold sandbox",
+              httpBaseUrl: bootstrap.endpoint.httpBaseUrl,
+              socketUrl: "wss://sandbox.example.com/ws?wsTicket=fresh",
+              httpAuthorization: {
+                _tag: "Dpop" as const,
+                accessToken: "ephemeral-access",
+              },
+              ...(bootstrap.attachCredential
+                ? { scaffoldAttachCredential: bootstrap.attachCredential }
+                : {}),
+            };
+          }),
+      });
+      const result = yield* prepareManagedScaffoldConnection({
+        targetForBinding: (preparedBinding) =>
+          new RelayConnectionTarget({
+            environmentId: preparedBinding.environmentId,
+            label: `Scaffold epoch ${preparedBinding.lifecycleEpoch}`,
+          }),
+        prepare: Effect.sync(() => {
+          prepareCount += 1;
+          return new ScaffoldPreparedConnection({
+            binding: new ScaffoldEnvironmentBinding({
+              ...binding,
+              lifecycleEpoch: prepareCount + 1,
+            }),
+            httpBaseUrl: "https://sandbox.example.com/",
+            wsBaseUrl: "wss://sandbox.example.com/",
+            bootstrapCredential: `secret-${prepareCount}`,
+            attachCredential: `attach-${prepareCount}`,
+            expiresAt: "9999-12-31T23:59:59.999Z",
+          });
+        }),
+      }).pipe(
+        Effect.provide(
+          Layer.succeed(RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization, remote),
+        ),
+      );
+
+      expect(prepareCount).toBe(2);
+      expect(authorizeCount).toBe(2);
+      expect(result.binding.lifecycleEpoch).toBe(3);
+      expect(result.connection.scaffoldAttachCredential).toBe("attach-2");
+      expect(result.connection.target.label).toBe("Scaffold epoch 3");
+    }),
+  );
+
+  it.effect("does not re-prepare for a non-descriptor authorization failure", () =>
+    Effect.gen(function* () {
+      let prepareCount = 0;
+      const failure = new ConnectionTransientError({
+        reason: "remote-unavailable",
+        detail:
+          "Remote environment endpoint https://sandbox.example.com/oauth/token returned undeclared status 409.",
+      });
+      const result = yield* Effect.result(
+        prepareManagedScaffoldConnection({
+          targetForBinding: (preparedBinding) =>
+            new RelayConnectionTarget({
+              environmentId: preparedBinding.environmentId,
+              label: "Scaffold sandbox",
+            }),
+          prepare: Effect.sync(() => {
+            prepareCount += 1;
+            return new ScaffoldPreparedConnection({
+              binding,
+              httpBaseUrl: "https://sandbox.example.com/",
+              wsBaseUrl: "wss://sandbox.example.com/",
+              bootstrapCredential: "secret",
+              attachCredential: "attach",
+              expiresAt: "9999-12-31T23:59:59.999Z",
+            });
+          }),
+        }).pipe(
+          Effect.provide(
+            Layer.succeed(
+              RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
+              RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
+                authorizeBearer: () => Effect.die("not used"),
+                authorizeDpop: () => Effect.fail(failure),
+              }),
+            ),
+          ),
+        ),
+      );
+
+      expect(prepareCount).toBe(1);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toMatchObject({
+          _tag: failure._tag,
+          reason: failure.reason,
+          detail: failure.detail,
+        });
+      }
+    }),
+  );
+
+  it.effect("stops automatic retries when a refreshed attach grant receives the same 409", () =>
+    Effect.gen(function* () {
+      let authorizeCount = 0;
+      let prepareCount = 0;
+      const descriptorFailure = new ConnectionTransientError({
+        reason: "remote-unavailable",
+        detail:
+          "Remote environment endpoint https://sandbox.example.com/.well-known/t3/environment returned undeclared status 409.",
+      });
+      const result = yield* Effect.result(
+        prepareManagedScaffoldConnection({
+          targetForBinding: (preparedBinding) =>
+            new RelayConnectionTarget({
+              environmentId: preparedBinding.environmentId,
+              label: "Scaffold sandbox",
+            }),
+          prepare: Effect.sync(() => {
+            prepareCount += 1;
+            return new ScaffoldPreparedConnection({
+              binding: new ScaffoldEnvironmentBinding({
+                ...binding,
+                lifecycleEpoch: prepareCount + 1,
+              }),
+              httpBaseUrl: "https://sandbox.example.com/",
+              wsBaseUrl: "wss://sandbox.example.com/",
+              bootstrapCredential: `secret-${prepareCount}`,
+              attachCredential: `attach-${prepareCount}`,
+              expiresAt: "9999-12-31T23:59:59.999Z",
+            });
+          }),
+        }).pipe(
+          Effect.provide(
+            Layer.succeed(
+              RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization,
+              RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
+                authorizeBearer: () => Effect.die("not used"),
+                authorizeDpop: () => {
+                  authorizeCount += 1;
+                  return Effect.fail(descriptorFailure);
+                },
+              }),
+            ),
+          ),
+        ),
+      );
+
+      expect(prepareCount).toBe(2);
+      expect(authorizeCount).toBe(2);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toBeInstanceOf(ConnectionBlockedError);
+        expect(result.failure).toMatchObject({
+          reason: "remote-unavailable",
+          detail:
+            "Scaffold could not attach this saved session after refreshing its connection. Try reconnecting later or start a new session.",
+        });
+      }
+    }),
+  );
+
+  it.effect("renews an expired transport grant before direct authorization", () =>
+    Effect.gen(function* () {
+      const receivedCredentials: string[] = [];
+      let prepareCount = 0;
+      const remote = RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
+        authorizeBearer: () => Effect.die("not used"),
+        authorizeDpop: (input) =>
+          input.obtainBootstrap.pipe(
+            Effect.map((bootstrap) => {
+              receivedCredentials.push(bootstrap.credential);
+              return {
+                environmentId: ENVIRONMENT_ID,
+                label: "Scaffold sandbox",
+                httpBaseUrl: bootstrap.endpoint.httpBaseUrl,
+                socketUrl: "wss://sandbox.example.com/ws?wsTicket=fresh",
+                httpAuthorization: {
+                  _tag: "Dpop" as const,
+                  accessToken: "ephemeral-access",
+                },
+                ...(bootstrap.attachCredential
+                  ? { scaffoldAttachCredential: bootstrap.attachCredential }
+                  : {}),
+              };
+            }),
+          ),
+      });
+      const result = yield* prepareManagedScaffoldConnection({
+        targetForBinding: (preparedBinding) =>
+          new RelayConnectionTarget({
+            environmentId: preparedBinding.environmentId,
+            label: "Scaffold sandbox",
+          }),
+        prepare: Effect.sync(() => {
+          prepareCount += 1;
+          return new ScaffoldPreparedConnection({
+            binding,
+            httpBaseUrl: "https://sandbox.example.com/",
+            wsBaseUrl: "wss://sandbox.example.com/",
+            bootstrapCredential: prepareCount === 1 ? "expired-secret" : "fresh-secret",
+            attachCredential: prepareCount === 1 ? "expired-attach" : "fresh-attach",
+            expiresAt: prepareCount === 1 ? "1970-01-01T00:00:00.000Z" : "9999-12-31T23:59:59.999Z",
+          });
+        }),
+      }).pipe(
+        Effect.provide(
+          Layer.succeed(RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization, remote),
+        ),
+      );
+
+      expect(prepareCount).toBe(2);
+      expect(receivedCredentials).toEqual(["fresh-secret"]);
+      expect(result.connection.scaffoldAttachCredential).toBe("fresh-attach");
+    }),
+  );
+
   it.effect("exchanges bootstrap authority in memory and returns only the safe binding", () =>
     Effect.gen(function* () {
       let receivedCredential: string | undefined;

@@ -5,3 +5,14 @@ The session-fabric work remains additive where it owns a complete module: packed
 Core patches are limited to seams that upstream currently owns statically: CLI and DPoP bootstrap, web routing and asset initialization, client-runtime transport and snapshot loading, shared HTTP observability, and their focused tests. The observability slice crosses the upstream server config, metric registry, OTLP exporter layer, OMP adapter, and session-fabric runner so exporter credentials remain env-only while runtime measurements are recorded at their authoritative lifecycle boundaries. Session transfer additionally crosses the upstream migration registry, provider session directory, HTTP capability proxy, root command-palette composition, and shared-package export map. Local combined Vite development crosses upstream auth/session bootstrap and dev-runner seams to mint an isolated loopback-only browser session without weakening remote modes. The local project-grouping picker also must connect to upstream-owned sidebar and environment-grouping code, while new worktrees intentionally start from the repository's checked-out HEAD through the upstream branch toolbar. Branch and title generation share an upstream prompt builder, so Ashler hardens that builder to treat the original request as untrusted source data and place the structured-output contract last.
 
 The failed additive alternative was to wrap these systems from new Ashler-only modules. It could not replace entrypoint registration, router/bootstrap ordering, protocol URL construction, persisted snapshot hydration, migration registration, durable provider cursor enforcement, capability export/proxy wiring, loopback auth-cookie isolation, picker integration, checked-out-branch selection, or the shared prompt construction used by every provider without either leaving the new behavior unreachable, duplicating upstream runtime state, or allowing raw user instructions to override the JSON-only helper contract. These exact paths remain enumerated so future upstream seams can retire the patches individually.
+
+The current fork also enumerates a second, deliberately bounded core slice for provider
+parity and provisional-session UX. The provider driver/cache/Codex launch files preserve
+authenticated native Codex and Claude status while OMP is unavailable; the project setup
+runner and contract git helpers keep local worktree creation deterministic; the web
+command-palette, sidebar, model-selection, route, and IndexedDB seams are required to
+create provisional local/Scaffold sessions without blocking navigation; and the
+effect-codex-app-server files preserve the native Codex transport contract used by the
+explicit local-native harness. These are upstream-owned composition points rather than
+parallel Ashler implementations, so they are listed in the core allowlist and must be
+re-audited on every upstream sync.

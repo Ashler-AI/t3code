@@ -257,6 +257,21 @@ export function makeRelaySessionFabricUiSessionSource(
   const controllerBinding = Effect.fn("relay_session_fabric.controller_binding")(function* () {
     const snapshot = latestKnownSnapshot ?? Option.getOrNull(yield* loadSnapshot());
     const location = snapshot?.session.location;
+    if (location?.environmentKind === "local") {
+      if (
+        location.scaffoldSessionId !== null ||
+        location.scaffoldSessionUrl !== null ||
+        (location.scaffoldLifecycleEpoch !== null && location.scaffoldLifecycleEpoch !== undefined)
+      ) {
+        return yield* unavailable("The shared local session has a mixed execution binding.");
+      }
+      return {
+        fabricSessionId: options.sessionId,
+        environmentKind: "local",
+        environmentId: location.environmentId,
+        threadId: location.threadId,
+      } satisfies SessionFabricControllerBinding;
+    }
     if (
       location?.environmentKind !== "scaffold" ||
       location.scaffoldSessionId === null ||

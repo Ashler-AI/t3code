@@ -42,6 +42,23 @@ function createAction() {
 }
 
 describe("executeScaffoldLifecycleAction", () => {
+  it("maps an in-progress lifecycle observation to a non-budget wait", async () => {
+    const client = makeScaffoldControlPlaneClient({
+      deployment: "staging",
+      baseUrl: "https://scaffold.example.com",
+      fetch: async () => jsonResponse(observation("creating", 0)),
+    });
+
+    await expect(
+      executeScaffoldLifecycleAction({ client, action: createAction() }),
+    ).resolves.toEqual({
+      _tag: "wait",
+      retryAfterMs: 1_000,
+      errorCode: "session_creating",
+      observation: { sessionId: "session-1", lifecycleEpoch: 0 },
+    });
+  });
+
   it("reuses stable create and operation ids after an ambiguous timeout", async () => {
     const posts: Array<Record<string, unknown>> = [];
     let request = 0;

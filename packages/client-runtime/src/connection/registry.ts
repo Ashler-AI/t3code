@@ -65,6 +65,7 @@ export class EnvironmentRegistry extends Context.Service<
     readonly entries: SubscriptionRef.SubscriptionRef<
       ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>
     >;
+    readonly platformReconciled: SubscriptionRef.SubscriptionRef<boolean>;
     readonly networkStatus: SubscriptionRef.SubscriptionRef<NetworkStatus>;
     readonly start: Effect.Effect<void>;
     readonly register: (
@@ -155,6 +156,7 @@ export const make = Effect.gen(function* () {
   );
   const entries =
     yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(initialEntries);
+  const platformReconciled = yield* SubscriptionRef.make(false);
   const networkStatus = yield* SubscriptionRef.make(yield* connectivity.status);
   const serviceScopes = yield* SubscriptionRef.make<
     ReadonlyMap<EnvironmentId, EnvironmentServiceScope>
@@ -539,6 +541,7 @@ export const make = Effect.gen(function* () {
       { discard: true },
     );
     yield* Effect.forEach(platformRegistrations, installPlatformRegistration, { discard: true });
+    yield* SubscriptionRef.set(platformReconciled, true);
   });
 
   const remove = Effect.fn("EnvironmentRegistry.remove")(function* (environmentId: EnvironmentId) {
@@ -659,6 +662,7 @@ export const make = Effect.gen(function* () {
 
   return EnvironmentRegistry.of({
     entries,
+    platformReconciled,
     networkStatus,
     start,
     register,

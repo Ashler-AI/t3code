@@ -18,6 +18,15 @@ export interface ScaffoldLifecycleActionStore {
 
 export type ScaffoldOutboxExecutionResult =
   | { readonly _tag: "acknowledged" }
+  | {
+      readonly _tag: "wait";
+      readonly retryAfterMs: number;
+      readonly errorCode: string;
+      readonly observation?: {
+        readonly sessionId: string;
+        readonly lifecycleEpoch: number;
+      };
+    }
   | { readonly _tag: "retry"; readonly retryAfterMs: number; readonly errorCode: string }
   | { readonly _tag: "blocked"; readonly errorCode: string };
 
@@ -26,6 +35,7 @@ export interface ScaffoldLifecycleOutboxOptions {
   readonly execute: (action: ScaffoldLifecycleAction) => Promise<ScaffoldOutboxExecutionResult>;
   readonly now?: () => number;
   readonly maxAttempts?: number;
+  readonly onWait?: (action: ScaffoldLifecycleAction) => void;
   readonly onBlocked?: (action: ScaffoldLifecycleAction) => void;
 }
 
@@ -77,6 +87,24 @@ export function makeScaffoldLifecycleOutbox(options: ScaffoldLifecycleOutboxOpti
         case "acknowledged":
           await withStoreLock(() => options.store.remove(action.actionId));
           break;
+        case "wait":
+          {
+            const updated = updateScaffoldLifecycleAction(action, {
+              attempt: action.attempt,
+              nextAttemptAt: now() + Math.max(0, result.retryAfterMs),
+              lastErrorCode: result.errorCode,
+              blocked: false,
+              ...(action.kind === "create" && result.observation
+                ? {
+                    sessionId: result.observation.sessionId,
+                    expectedLifecycleEpoch: result.observation.lifecycleEpoch,
+                  }
+                : {}),
+            });
+            await withStoreLock(() => options.store.put(updated));
+            options.onWait?.(updated);
+          }
+          break;
         case "retry":
           {
             const attempt = action.attempt + 1;
@@ -122,7 +150,8 @@ export function makeScaffoldLifecycleOutbox(options: ScaffoldLifecycleOutboxOpti
 
 function updateScaffoldLifecycleAction(
   action: ScaffoldLifecycleAction,
-  update: Pick<ScaffoldLifecycleAction, "attempt" | "nextAttemptAt" | "lastErrorCode" | "blocked">,
+  update: Pick<ScaffoldLifecycleAction, "attempt" | "nextAttemptAt" | "lastErrorCode" | "blocked"> &
+    Partial<Pick<ScaffoldLifecycleAction, "sessionId" | "expectedLifecycleEpoch">>,
 ): ScaffoldLifecycleAction {
   switch (action.kind) {
     case "create":

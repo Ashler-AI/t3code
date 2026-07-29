@@ -2,8 +2,10 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  EnvironmentId,
   ScaffoldLifecycleError,
   SessionFabricSessionId,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
@@ -87,7 +89,7 @@ describe("session fabric capability proxy", () => {
     expect(sessionFabricCapabilityProxyScope("controller")).toBe(AuthOrchestrationOperateScope);
   });
 
-  it("accepts only the canonical Scaffold lifecycle binding in controller bodies", () => {
+  it("accepts the canonical Scaffold and local controller bindings", () => {
     const fabricSessionId = SessionFabricSessionId.make("global-session-1");
     expect(
       decodeSessionFabricCapabilityProxyBody({
@@ -102,12 +104,52 @@ describe("session fabric capability proxy", () => {
       scaffoldSessionId: "ses_1",
       scaffoldLifecycleEpoch: 7,
     });
+    expect(
+      decodeSessionFabricCapabilityProxyBody({
+        role: "controller",
+        fabricSessionId,
+        environmentKind: "local",
+        environmentId: EnvironmentId.make("env_1"),
+        threadId: ThreadId.make("thread_1"),
+      }),
+    ).toEqual({
+      role: "controller",
+      fabricSessionId,
+      environmentKind: "local",
+      environmentId: "env_1",
+      threadId: "thread_1",
+    });
+  });
+
+  it("rejects mixed, aliased, and excess controller bindings", () => {
+    const fabricSessionId = SessionFabricSessionId.make("global-session-1");
     expect(() =>
       decodeSessionFabricCapabilityProxyBody({
         role: "controller",
         fabricSessionId,
         scaffoldSessionId: "ses_1",
         lifecycleEpoch: 7,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeSessionFabricCapabilityProxyBody({
+        role: "controller",
+        fabricSessionId,
+        environmentKind: "local",
+        environmentId: "env_1",
+        threadId: "thread_1",
+        scaffoldSessionId: "ses_1",
+        scaffoldLifecycleEpoch: 7,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeSessionFabricCapabilityProxyBody({
+        role: "controller",
+        fabricSessionId,
+        environmentKind: "local",
+        environmentId: "env_1",
+        threadId: "thread_1",
+        unexpected: true,
       }),
     ).toThrow();
   });

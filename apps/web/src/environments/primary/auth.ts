@@ -338,12 +338,29 @@ function isTransientBootstrapError(error: unknown): boolean {
 
 async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
   const bootstrapCredential = getDesktopBootstrapCredential();
-  const currentSession = await fetchSessionState();
+  const localDevAutoAuthEnabled =
+    !bootstrapCredential && import.meta.env.VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED === "true";
+  let currentSession: AuthSessionState;
+  try {
+    currentSession = await fetchSessionState();
+  } catch (error) {
+    if (
+      !localDevAutoAuthEnabled ||
+      !isPrimaryEnvironmentRequestError(error) ||
+      error.status !== 401
+    ) {
+      throw error;
+    }
+
+    await exchangeLocalDevBrowserSession();
+    await waitForAuthenticatedSessionAfterBootstrap();
+    return { status: "authenticated" };
+  }
   if (currentSession.authenticated) {
     return { status: "authenticated" };
   }
 
-  if (!bootstrapCredential && import.meta.env.VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED === "true") {
+  if (localDevAutoAuthEnabled) {
     try {
       await exchangeLocalDevBrowserSession();
       await waitForAuthenticatedSessionAfterBootstrap();
@@ -565,13 +582,16 @@ export async function resolveInitialServerAuthGateState(): Promise<ServerAuthGat
     });
 }
 
-// Used by the WSL backend swap: invalidate the cached authenticated state
-// (the new backend signs sessions with a different key) and re-bootstrap
-// against the desktop bootstrap credential so the next WS reconnect doesn't
-// hit 401 and start a reauth loop in the renderer.
+// Revalidate before a primary connection attempt. Backend swaps and local
+// server restarts can both replace the signing key while a renderer still
+// holds a memoized authenticated state and an old cookie.
 export async function reauthenticatePrimaryEnvironment(): Promise<ServerAuthGateState> {
   resolvedAuthenticatedGateState = null;
-  bootstrapPromise = null;
+  // Preserve an in-flight bootstrap so concurrent connection retries share the
+  // same browser-session exchange instead of racing multiple cookie writes.
+  if (bootstrapPromise) {
+    return bootstrapPromise;
+  }
   return resolveInitialServerAuthGateState();
 }
 

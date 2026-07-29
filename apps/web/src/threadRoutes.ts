@@ -22,11 +22,16 @@ export type ThreadRouteRenderState = "loading" | "ready" | "missing";
 
 export function resolveThreadRouteRenderState(input: {
   bootstrapComplete: boolean;
+  platformReconciliationComplete: boolean;
+  routeEnvironmentRegistered: boolean;
   serverThreadShellExists: boolean;
   serverThreadDetailExists: boolean;
   serverThreadDetailDeleted: boolean;
   draftThreadExists: boolean;
 }): ThreadRouteRenderState {
+  if (input.platformReconciliationComplete && !input.routeEnvironmentRegistered) {
+    return "missing";
+  }
   if (!input.bootstrapComplete) {
     return "loading";
   }
