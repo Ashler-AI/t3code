@@ -125,26 +125,78 @@ export function makeRelaySessionFabricUiSessionSource(
   const webSocketLayer = Layer.succeed(Socket.WebSocketConstructor, webSocketConstructor);
   const socketUrl = makeRelaySessionFabricWebSocketUrl(options.relayBaseUrl, options.sessionId);
   let latestKnownSnapshot: SessionFabricSnapshot | null = null;
+  let latestSessionSet: Extract<
+    OrchestrationEvent,
+    { readonly type: "thread.session-set" }
+  > | null = null;
 
   const sessionRecordDominates = (
     candidate: SessionFabricSessionRecord,
     current: SessionFabricSessionRecord,
   ): boolean => {
-    const candidateEpoch = candidate.location.scaffoldLifecycleEpoch ?? -1;
-    const currentEpoch = current.location.scaffoldLifecycleEpoch ?? -1;
-    return (
+    const sameScaffoldSession =
+      candidate.location.environmentKind === "scaffold" &&
+      current.location.environmentKind === "scaffold" &&
+      candidate.location.scaffoldSessionId !== null &&
+      candidate.location.scaffoldSessionId === current.location.scaffoldSessionId;
+    const lifecycleDominates =
+      !sameScaffoldSession ||
+      (candidate.location.scaffoldLifecycleEpoch ?? -1) >=
+        (current.location.scaffoldLifecycleEpoch ?? -1);
+    const cursorDominates =
       candidate.cursor.eventSequence >= current.cursor.eventSequence &&
-      candidate.cursor.snapshotSequence >= current.cursor.snapshotSequence &&
-      candidateEpoch >= currentEpoch &&
-      candidate.updatedAt >= current.updatedAt
-    );
+      candidate.cursor.snapshotSequence >= current.cursor.snapshotSequence;
+    if (!cursorDominates || !lifecycleDominates) return false;
+    const cursorAdvanced =
+      candidate.cursor.eventSequence > current.cursor.eventSequence ||
+      candidate.cursor.snapshotSequence > current.cursor.snapshotSequence;
+    return cursorAdvanced || candidate.updatedAt >= current.updatedAt;
   };
+
+  const applySessionSetToThread = <
+    A extends Pick<
+      SessionFabricSnapshot["thread"]["thread"],
+      "id" | "latestTurn" | "session" | "updatedAt"
+    >,
+  >(
+    candidate: A,
+    snapshotSequence: number,
+  ): A => {
+    const event = latestSessionSet;
+    if (
+      event === null ||
+      event.payload.threadId !== candidate.id ||
+      event.sequence <= snapshotSequence
+    ) {
+      return candidate;
+    }
+    return {
+      ...candidate,
+      session: event.payload.session,
+      latestTurn: latestTurnAfterSessionSet(candidate.latestTurn, event.payload.session),
+      updatedAt: event.occurredAt,
+    };
+  };
+
+  const applySessionSetOverlay = (candidate: SessionFabricSnapshot): SessionFabricSnapshot => ({
+    ...candidate,
+    shell: {
+      ...candidate.shell,
+      threads: candidate.shell.threads.map((thread) =>
+        applySessionSetToThread(thread, candidate.shell.snapshotSequence),
+      ),
+    },
+    thread: {
+      ...candidate.thread,
+      thread: applySessionSetToThread(candidate.thread.thread, candidate.thread.snapshotSequence),
+    },
+  });
 
   const rememberSnapshot = (candidate: SessionFabricSnapshot): SessionFabricSnapshot => {
     const current = latestKnownSnapshot;
     if (current === null) {
       latestKnownSnapshot = candidate;
-      return candidate;
+      return applySessionSetOverlay(candidate);
     }
 
     latestKnownSnapshot = {
@@ -164,46 +216,15 @@ export function makeRelaySessionFabricUiSessionSource(
         current.compactedThroughEventSequence,
       ),
     };
-    return latestKnownSnapshot;
-  };
-
-  const rememberShell = (candidate: SessionFabricSnapshot["shell"]) => {
-    if (
-      latestKnownSnapshot === null ||
-      candidate.snapshotSequence <= latestKnownSnapshot.shell.snapshotSequence
-    ) {
-      return latestKnownSnapshot?.shell ?? candidate;
-    }
-    latestKnownSnapshot = { ...latestKnownSnapshot, shell: candidate };
-    return candidate;
+    return applySessionSetOverlay(latestKnownSnapshot);
   };
 
   const rememberSessionSet = (
     event: Extract<OrchestrationEvent, { readonly type: "thread.session-set" }>,
   ) => {
-    const current = latestKnownSnapshot;
-    if (current === null) return;
-
-    const cachedThread = current.thread.thread;
-    if (
-      cachedThread.id !== event.payload.threadId ||
-      event.sequence <= current.thread.snapshotSequence
-    ) {
-      return;
+    if (latestSessionSet === null || event.sequence > latestSessionSet.sequence) {
+      latestSessionSet = event;
     }
-
-    latestKnownSnapshot = {
-      ...current,
-      thread: {
-        snapshotSequence: event.sequence,
-        thread: {
-          ...cachedThread,
-          session: event.payload.session,
-          latestTurn: latestTurnAfterSessionSet(cachedThread.latestTurn, event.payload.session),
-          updatedAt: event.occurredAt,
-        },
-      },
-    };
   };
 
   const unavailable = (message: string) =>
@@ -415,7 +436,9 @@ export function makeRelaySessionFabricUiSessionSource(
     );
 
   const makeProjectShellFrame = () => {
-    let shellSnapshot = latestKnownSnapshot?.shell ?? null;
+    let shellSnapshot =
+      latestKnownSnapshot === null ? null : applySessionSetOverlay(latestKnownSnapshot).shell;
+    let hasSeenSnapshot = latestKnownSnapshot !== null;
 
     return (
       frame: SessionFabricServerFrameType,
@@ -427,7 +450,10 @@ export function makeRelaySessionFabricUiSessionSource(
           return Ref.modify(localSequence, (sequence) => {
             const remembered = rememberSnapshot(frame.snapshot).shell;
             const snapshotSequence = remembered.snapshotSequence;
-            if (snapshotSequence <= sequence) {
+            const acceptColdSequenceZero =
+              !hasSeenSnapshot && sequence === 0 && snapshotSequence === 0;
+            hasSeenSnapshot = true;
+            if (!acceptColdSequenceZero && snapshotSequence <= sequence) {
               return [Option.none(), sequence];
             }
             shellSnapshot = remembered;
@@ -469,7 +495,6 @@ export function makeRelaySessionFabricUiSessionSource(
               ),
               updatedAt: event.occurredAt,
             };
-            shellSnapshot = rememberShell(shellSnapshot);
             rememberSessionSet(event);
             return [
               Option.some({
@@ -496,8 +521,9 @@ export function makeRelaySessionFabricUiSessionSource(
   const makeProjectThreadFrame = (threadId: ThreadId) => {
     let threadSnapshot =
       latestKnownSnapshot !== null && isThreadSnapshot(latestKnownSnapshot, threadId)
-        ? latestKnownSnapshot.thread
+        ? applySessionSetOverlay(latestKnownSnapshot).thread
         : null;
+    let hasSeenSnapshot = latestKnownSnapshot !== null;
 
     return (
       frame: SessionFabricServerFrameType,
@@ -512,7 +538,10 @@ export function makeRelaySessionFabricUiSessionSource(
           }
           return Ref.modify(localSequence, (sequence) => {
             const snapshotSequence = remembered.thread.snapshotSequence;
-            if (snapshotSequence <= sequence) {
+            const acceptColdSequenceZero =
+              !hasSeenSnapshot && sequence === 0 && snapshotSequence === 0;
+            hasSeenSnapshot = true;
+            if (!acceptColdSequenceZero && snapshotSequence <= sequence) {
               return [Option.none(), sequence];
             }
             threadSnapshot = remembered.thread;
