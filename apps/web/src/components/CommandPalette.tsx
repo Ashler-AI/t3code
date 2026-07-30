@@ -34,7 +34,6 @@ import { useNavigate, useParams } from "@tanstack/react-router";
 import * as Option from "effect/Option";
 import {
   ArrowLeftIcon,
-  ArrowUpIcon,
   CloudIcon,
   Clock3Icon,
   CornerLeftUpIcon,
@@ -102,7 +101,7 @@ import { useAtomQueryRunner } from "../state/use-atom-query-runner";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
 import { useProjects, useThreadShells } from "../state/entities";
 import { useThreadSearch } from "../state/queries";
-import { resolveThreadActionProjectRef, startNewThreadFromContext } from "../lib/chatThreadActions";
+import { resolveThreadActionProjectRef } from "../lib/chatThreadActions";
 import type { Project } from "../types";
 import {
   appendBrowsePathSegment,
@@ -135,6 +134,7 @@ import {
   buildBrowseGroups,
   buildProjectActionItems,
   buildRootGroups,
+  buildThreadActionItems,
   enumerateCommandPaletteItems,
   type CommandPaletteActionItem,
   type CommandPaletteOpenIntent,
@@ -793,6 +793,7 @@ function OpenCommandPaletteDialog(props: {
   readonly setOmpLoginAuthorization: Dispatch<SetStateAction<OmpLoginAuthorization | null>>;
   readonly startSessionCopy: StartSessionCopy | undefined;
 }) {
+  const composerHandleRef = useComposerHandleContext();
   const navigate = useNavigate();
   const {
     acquireOmpLoginFlow,
@@ -1747,28 +1748,6 @@ function OpenCommandPaletteDialog(props: {
     ],
   );
   const recentThreadItems = allThreadItems.slice(0, RECENT_THREAD_LIMIT);
-  const newLocalSessionProjectItems = useMemo(
-    () =>
-      enumerateCommandPaletteItems(
-        buildProjectActionItems({
-          projects: pickerProjects,
-          valuePrefix: "new-local-session-in",
-          searchTerms: (project) => {
-            const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
-            return (
-              group?.memberProjects.flatMap((member) => [member.title, member.workspaceRoot]) ?? []
-            );
-          },
-          icon: renderProjectFavicon,
-          runProject: async (project) => {
-            await handleNewThread(scopeProjectRef(project.environmentId, project.id), {
-              forceNew: true,
-            });
-          },
-        }),
-      ),
-    [handleNewThread, pickerProjects, projectGroupByTargetKey],
-  );
   const pushPaletteView = useCallback(
     (view: CommandPaletteView): void => {
       browseNavigation.invalidate();

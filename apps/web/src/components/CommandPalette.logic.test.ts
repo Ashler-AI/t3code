@@ -72,6 +72,11 @@ describe("reduceCommandPaletteUiState", () => {
       mode: "command",
       openIntent: { kind: "add-project" },
     });
+    expect(reduceCommandPaletteUiState(filesOpen, { _tag: "OpenNewSession" })).toEqual({
+      open: true,
+      mode: "command",
+      openIntent: { kind: "new-session" },
+    });
     expect(reduceCommandPaletteUiState(filesOpen, { _tag: "OpenNewThreadIn" })).toEqual({
       open: true,
       mode: "command",
