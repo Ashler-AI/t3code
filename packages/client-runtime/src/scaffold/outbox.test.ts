@@ -1,4 +1,4 @@
-import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ScaffoldLifecycleAction } from "./model.ts";
@@ -26,7 +26,13 @@ function action(actionId: string, kind: "create" | "resume" | "pause" = "resume"
         sourceEnvironmentId: EnvironmentId.make("source-environment-1"),
         sourceProjectId: ProjectId.make("source-project-1"),
       })
-    : makeScaffoldLifecycleAction({ ...base, kind });
+    : kind === "pause"
+      ? makeScaffoldLifecycleAction({
+          ...base,
+          kind,
+          sourceThreadId: ThreadId.make(`thread-${actionId}`),
+        })
+      : makeScaffoldLifecycleAction({ ...base, kind });
 }
 
 function memoryStore(initial: ReadonlyArray<ScaffoldLifecycleAction> = []) {
@@ -142,6 +148,7 @@ describe("Scaffold lifecycle outbox", () => {
     const blocked = makeScaffoldLifecycleAction({
       actionId: "blocked",
       kind: "pause",
+      sourceThreadId: ThreadId.make("thread-blocked"),
       environmentId: EnvironmentId.make("env-1"),
       connectionId: "connection-1",
       sessionId: "session-blocked",

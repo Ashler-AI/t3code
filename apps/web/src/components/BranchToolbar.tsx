@@ -66,6 +66,7 @@ interface BranchToolbarProps {
     connectionPhase?: EnvironmentConnectionPhase;
     replacementRequired?: boolean;
     retryable?: boolean;
+    error?: string | null;
   };
   scaffoldDraftRetrying?: boolean;
   onRetryScaffoldDraft?: () => void;
@@ -351,6 +352,11 @@ export const BranchToolbar = memo(function BranchToolbar({
           >
             {scaffoldDraftPresentation.statusLabel}
           </span>
+          {scaffoldDraftPresentation.detailLabel ? (
+            <span className="max-w-72 truncate text-destructive/80">
+              {scaffoldDraftPresentation.detailLabel}
+            </span>
+          ) : null}
           {scaffoldDraftPresentation.actionLabel && scaffoldDraftAction ? (
             <Button
               type="button"

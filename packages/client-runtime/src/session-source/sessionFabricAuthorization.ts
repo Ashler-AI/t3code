@@ -93,19 +93,42 @@ const DEFAULT_CAPABILITY_REQUEST_TIMEOUT_MS = 10_000;
 const isCapabilityGrant = Schema.is(SessionFabricCapabilityGrantSchema);
 const isAuthorizationError = Schema.is(SessionFabricAuthorizationError);
 
-function capabilityError(status: number, detail: string): SessionFabricAuthorizationError {
+function capabilityError(
+  status: number,
+  detail: string,
+  reason?: SessionFabricAuthorizationError["reason"],
+): SessionFabricAuthorizationError {
   return new SessionFabricAuthorizationError({
     reason:
-      status === 401
+      reason ??
+      (status === 401
         ? "authentication"
         : status === 403
           ? "permission"
           : status === 409
             ? "offline"
-            : "network",
+            : "network"),
     status,
     detail,
   });
+}
+
+function responseErrorCode(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const error = Reflect.get(value, "error");
+  return typeof error === "string" ? error.trim().toLowerCase() : undefined;
+}
+
+function isRemoteCodeWriteCredentialDenial(status: number, code: string | undefined): boolean {
+  if (status !== 403 || code === undefined) return false;
+  return (
+    code === "remote_code_token_forbidden" ||
+    code === "remote_code_insufficient_scope" ||
+    code === "oauth_insufficient_scope" ||
+    (code.includes("remote_code") &&
+      code.includes("write") &&
+      (code.includes("forbidden") || code.includes("missing") || code.includes("required")))
+  );
 }
 
 function hasExactScopes(actual: ReadonlyArray<string>, expected: ReadonlyArray<string>): boolean {
@@ -143,9 +166,7 @@ function decodeGrant(
       bindings.environmentKind !== "local" ||
       bindings.fabricSessionId !== binding.fabricSessionId ||
       bindings.environmentId !== binding.environmentId ||
-      bindings.threadId !== binding.threadId ||
-      bindings.actorId.length === 0 ||
-      "runnerId" in bindings
+      bindings.threadId !== binding.threadId
     ) {
       return null;
     }
@@ -225,15 +246,20 @@ export function makeSessionFabricCapabilityAuthorization(
             }),
           });
           if (!response.ok) {
+            const code = responseErrorCode(await response.json().catch(() => undefined));
+            const credentialDenied = isRemoteCodeWriteCredentialDenial(response.status, code);
             throw capabilityError(
               response.status,
-              response.status === 401
-                ? "Session fabric authentication is required."
-                : response.status === 403
-                  ? "This session is available as read-only."
-                  : response.status === 409
-                    ? "The session runner is offline or stale."
-                    : "Session fabric authorization is unavailable.",
+              credentialDenied
+                ? "Session fabric authentication is required. Reconnect Scaffold to continue."
+                : response.status === 401
+                  ? "Session fabric authentication is required."
+                  : response.status === 403
+                    ? "This session is available as read-only."
+                    : response.status === 409
+                      ? "The session runner is offline or stale."
+                      : "Session fabric authorization is unavailable.",
+              credentialDenied ? "authentication" : undefined,
             );
           }
           const decoded = decodeGrant(await response.json(), role, binding);

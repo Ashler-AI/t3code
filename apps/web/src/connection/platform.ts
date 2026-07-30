@@ -69,6 +69,7 @@ import { scaffoldLifecycleGatewayLayer } from "./scaffold";
 import {
   configuredSessionFabricRelayUrl,
   sessionFabricRegistrationFromRoute,
+  subscribeSessionFabricRouteChanges,
 } from "./sessionFabricBootstrap";
 
 let nextObservedRpcRequestId = 0;
@@ -505,17 +506,33 @@ export function secondaryRegistrationsToRetainAfterTopologyRead(
 const platformConnectionSourceLayer = Layer.effect(
   PlatformConnectionSource,
   Effect.gen(function* () {
-    const fabricRegistration = sessionFabricRegistrationFromRoute({
-      pathname: window.location.pathname,
-      runtimeBasePath: readRuntimeBasePath(),
-      relayBaseUrl: configuredSessionFabricRelayUrl(
-        import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
-      ),
-      clientId: sessionFabricPageClientId,
-    });
+    const currentFabricRegistrations = (): ReadonlyArray<PlatformConnectionRegistration> => {
+      const registration = sessionFabricRegistrationFromRoute({
+        pathname: window.location.pathname,
+        runtimeBasePath: readRuntimeBasePath(),
+        relayBaseUrl: configuredSessionFabricRelayUrl(
+          import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
+        ),
+        clientId: sessionFabricPageClientId,
+      });
+      return registration === null ? [] : [registration];
+    };
+    const routeChanges = Stream.callback<void>((queue) =>
+      Effect.acquireRelease(
+        Effect.sync(() =>
+          subscribeSessionFabricRouteChanges({
+            eventTarget: window,
+            onChange: () => Queue.offerUnsafe(queue, undefined),
+          }),
+        ),
+        (unsubscribe) => Effect.sync(unsubscribe),
+      ).pipe(Effect.asVoid),
+    );
     if (isHostedStaticApp()) {
       return PlatformConnectionSource.of({
-        registrations: Stream.succeed(fabricRegistration === null ? [] : [fabricRegistration]),
+        registrations: Stream.concat(Stream.succeed(undefined), routeChanges).pipe(
+          Stream.map(currentFabricRegistrations),
+        ),
       });
     }
     const cacheRef = yield* Ref.make(new Map<string, CachedPlatformRegistration>());
@@ -528,8 +545,9 @@ const platformConnectionSourceLayer = Layer.effect(
       const previous = yield* Ref.get(cacheRef);
       const nowEpochMs = yield* Clock.currentTimeMillis;
       const next = new Map<string, CachedPlatformRegistration>();
-      const registrations: Array<PlatformConnectionRegistration> =
-        fabricRegistration === null ? [] : [fabricRegistration];
+      const registrations: Array<PlatformConnectionRegistration> = [
+        ...currentFabricRegistrations(),
+      ];
 
       const primaryTopologyRead = readPrimaryEnvironmentTargetResult();
       const retainedPrimary = primaryRegistrationToRetainAfterTopologyRead(
@@ -624,7 +642,7 @@ const platformConnectionSourceLayer = Layer.effect(
     }).pipe(Effect.provide(FetchHttpClient.layer));
 
     return PlatformConnectionSource.of({
-      registrations: Stream.tick(PLATFORM_POLL_INTERVAL).pipe(
+      registrations: Stream.merge(Stream.tick(PLATFORM_POLL_INTERVAL), routeChanges).pipe(
         Stream.mapEffect(() => buildPlatformRegistrations),
       ),
     });

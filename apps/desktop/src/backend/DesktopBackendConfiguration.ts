@@ -1,5 +1,6 @@
 import * as NodeOS from "node:os";
 
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -19,6 +20,11 @@ import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopServerExposure from "./DesktopServerExposure.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
+
+declare const __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__: string | undefined;
+declare const __T3CODE_BUILD_SCAFFOLD_STAGING_URL__: string | undefined;
+declare const __T3CODE_BUILD_SCAFFOLD_PRODUCTION_URL__: string | undefined;
+declare const __T3CODE_BUILD_SCAFFOLD_DEFAULT_DEPLOYMENT__: string | undefined;
 
 export class DesktopBackendObservabilitySettingsReadError extends Schema.TaggedErrorClass<DesktopBackendObservabilitySettingsReadError>()(
   "DesktopBackendObservabilitySettingsReadError",
@@ -84,18 +90,152 @@ const DESKTOP_BACKEND_ENV_NAMES = [
   "T3CODE_DESKTOP_HTTPS_ENDPOINTS",
   "T3CODE_TAILSCALE_SERVE",
   "T3CODE_TAILSCALE_SERVE_PORT",
+  "T3CODE_SESSION_FABRIC_RELAY_URL",
+  "T3CODE_SESSION_FABRIC_AUTH_MODE",
+  "T3CODE_SCAFFOLD_STAGING_URL",
+  "T3CODE_SCAFFOLD_STAGING_AUTH_MODE",
+  "T3CODE_SCAFFOLD_PRODUCTION_URL",
+  "T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE",
+  "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT",
 ] as const;
 
-// Sensitive env vars that the WSL backend needs but Windows process.env won't
-// forward across the wsl.exe boundary without WSLENV. The dev-server URL is
-// handled separately via a `--dev-url` CLI flag because WSLENV translation of
-// URL-shaped values (colons / slashes) is unreliable.
+// Sensitive account env vars that the WSL backend needs but Windows process.env
+// won't forward across the wsl.exe boundary without WSLENV. Desktop-owned
+// public runtime configuration is appended separately after validation below.
 const WSL_FORWARDED_ENV_NAMES = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"] as const;
 
 const WSL_SERVER_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 const backendChildEnvPatch = (): Record<string, string | undefined> =>
   Object.fromEntries(DESKTOP_BACKEND_ENV_NAMES.map((name) => [name, undefined]));
+
+const buildValue = (value: string | undefined): string => value?.trim() ?? "";
+const LOOPBACK_HTTP_RELAY_PREFIX =
+  /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]+)?(?:\/+|$)/u;
+
+const normalizeLoopbackRelayUrl = (value: string): string | null => {
+  try {
+    const configured = value.trim();
+    const url = new URL(configured);
+    if (
+      !LOOPBACK_HTTP_RELAY_PREFIX.test(configured) ||
+      url.protocol !== "http:" ||
+      !new Set(["localhost", "127.0.0.1", "[::1]"]).has(url.hostname) ||
+      url.username.length > 0 ||
+      url.password.length > 0 ||
+      url.search.length > 0 ||
+      url.hash.length > 0 ||
+      !/^\/+$/u.test(url.pathname)
+    ) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+};
+
+const configuredRelayUrl = (
+  embeddedValue: string | undefined,
+  environmentValue: string | undefined,
+): string | undefined => {
+  const runtimeCandidate = environmentValue?.trim();
+  if (runtimeCandidate) {
+    return (
+      normalizeSecureRelayUrl(runtimeCandidate) ??
+      normalizeLoopbackRelayUrl(runtimeCandidate) ??
+      undefined
+    );
+  }
+
+  const embeddedCandidate = buildValue(embeddedValue);
+  return embeddedCandidate ? (normalizeSecureRelayUrl(embeddedCandidate) ?? undefined) : undefined;
+};
+
+const configuredScaffoldUrl = (
+  embeddedValue: string | undefined,
+  environmentValue: string | undefined,
+): string | undefined => {
+  const candidate = environmentValue?.trim() || buildValue(embeddedValue);
+  if (candidate.length === 0) return undefined;
+
+  try {
+    const url = new URL(candidate);
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      (url.pathname !== "" && url.pathname !== "/")
+    ) {
+      return undefined;
+    }
+    return `${url.origin}/`;
+  } catch {
+    return undefined;
+  }
+};
+
+const configuredScaffoldDeployment = (
+  embeddedValue: string | undefined,
+  environmentValue: string | undefined,
+): "staging" | "production" | undefined => {
+  const candidate = (environmentValue?.trim() || buildValue(embeddedValue)).toLowerCase();
+  return candidate === "staging" || candidate === "production" ? candidate : undefined;
+};
+
+const desktopPublicBackendEnv = (): Record<string, string> => {
+  const relayUrl = configuredRelayUrl(
+    typeof __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__ === "undefined"
+      ? undefined
+      : __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__,
+    process.env.T3CODE_SESSION_FABRIC_RELAY_URL,
+  );
+  const stagingUrl = configuredScaffoldUrl(
+    typeof __T3CODE_BUILD_SCAFFOLD_STAGING_URL__ === "undefined"
+      ? undefined
+      : __T3CODE_BUILD_SCAFFOLD_STAGING_URL__,
+    process.env.T3CODE_SCAFFOLD_STAGING_URL,
+  );
+  const productionUrl = configuredScaffoldUrl(
+    typeof __T3CODE_BUILD_SCAFFOLD_PRODUCTION_URL__ === "undefined"
+      ? undefined
+      : __T3CODE_BUILD_SCAFFOLD_PRODUCTION_URL__,
+    process.env.T3CODE_SCAFFOLD_PRODUCTION_URL,
+  );
+  const defaultDeployment = configuredScaffoldDeployment(
+    typeof __T3CODE_BUILD_SCAFFOLD_DEFAULT_DEPLOYMENT__ === "undefined"
+      ? undefined
+      : __T3CODE_BUILD_SCAFFOLD_DEFAULT_DEPLOYMENT__,
+    process.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT,
+  );
+
+  return {
+    ...(relayUrl
+      ? {
+          T3CODE_SESSION_FABRIC_RELAY_URL: relayUrl,
+          // Desktop sessions publish to a shared remote relay. They must use the
+          // signed viewer/runner capability path even though their T3 backend is
+          // local to the user.
+          T3CODE_SESSION_FABRIC_AUTH_MODE: "required",
+        }
+      : {}),
+    ...(stagingUrl
+      ? {
+          T3CODE_SCAFFOLD_STAGING_URL: stagingUrl,
+          T3CODE_SCAFFOLD_STAGING_AUTH_MODE: "oauth",
+        }
+      : {}),
+    ...(productionUrl
+      ? {
+          T3CODE_SCAFFOLD_PRODUCTION_URL: productionUrl,
+          T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE: "oauth",
+        }
+      : {}),
+    ...(defaultDeployment ? { T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT: defaultDeployment } : {}),
+  };
+};
 
 const getWslEnvEntryName = (entry: string): string => {
   const slashIndex = entry.indexOf("/");
@@ -401,6 +541,7 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       cwd: environment.backendCwd,
       env: {
         ...backendChildEnvPatch(),
+        ...desktopPublicBackendEnv(),
         ELECTRON_RUN_AS_NODE: "1",
       },
       // Primary wants process.env (PATH, dev-runner's T3CODE_HOME, etc.).
@@ -510,8 +651,8 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
   const httpBaseUrl = new URL(`http://${rendererHost}:${input.port}`);
 
   const distroArgs = distroForConfig ? ["-d", distroForConfig] : [];
-  const forwardedEnv: Record<string, string> = {};
-  const forwardedEnvNames: string[] = [];
+  const forwardedEnv: Record<string, string> = desktopPublicBackendEnv();
+  const forwardedEnvNames: string[] = Object.keys(forwardedEnv);
   for (const name of WSL_FORWARDED_ENV_NAMES) {
     const value = process.env[name];
     if (value !== undefined && value.length > 0) {

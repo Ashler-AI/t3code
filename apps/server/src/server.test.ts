@@ -714,6 +714,7 @@ const buildAppUnderTest = (options?: {
           dispatch: () => Effect.succeed({ sequence: 0 }),
           streamDomainEvents: Stream.empty,
           latestSequence: Effect.succeed(0),
+          getAuthoritativeThreadById: () => Effect.succeed(Option.none()),
           ...options?.layers?.orchestrationEngine,
         }),
       ),
@@ -7228,7 +7229,17 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const threadId = ThreadId.make("thread-bootstrap-project-conflict");
       yield* buildAppUnderTest({
         layers: {
-          orchestrationEngine: { dispatch },
+          orchestrationEngine: {
+            dispatch,
+            getAuthoritativeThreadById: () =>
+              Effect.succeed(
+                Option.some({
+                  ...makeDefaultOrchestrationReadModel().threads[0]!,
+                  id: threadId,
+                  projectId: ProjectId.make("different-project"),
+                }),
+              ),
+          },
           gitVcsDriver: { createWorktree },
           projectionSnapshotQuery: {
             getThreadShellById: () =>
@@ -7305,11 +7316,18 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
       const threadId = ThreadId.make("thread-bootstrap-durable-replay");
       const parentCommandId = CommandId.make("cmd-bootstrap-durable-replay");
+      const authoritativeThread = {
+        ...makeDefaultOrchestrationReadModel().threads[0]!,
+        id: threadId,
+        branch: "t3code/bootstrap-durable-replay",
+        worktreePath: "/tmp/bootstrap-durable-replay",
+      };
       yield* buildAppUnderTest({
         layers: {
           gitVcsDriver: { createWorktree },
           projectSetupScriptRunner: { runForThread },
           orchestrationEngine: {
+            getAuthoritativeThreadById: () => Effect.succeed(Option.some(authoritativeThread)),
             dispatch: (command) =>
               Effect.sync(() => {
                 dispatchedCommands.push(command);
@@ -7317,17 +7335,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               }),
           },
           projectionSnapshotQuery: {
-            getThreadShellById: () =>
-              Effect.succeed(
-                Option.some(
-                  makeDefaultOrchestrationThreadShell({
-                    id: threadId,
-                    projectId: defaultProjectId,
-                    branch: "t3code/bootstrap-durable-replay",
-                    worktreePath: "/tmp/bootstrap-durable-replay",
-                  }),
-                ),
-              ),
+            getThreadShellById: () => Effect.succeed(Option.none()),
           },
         },
       });

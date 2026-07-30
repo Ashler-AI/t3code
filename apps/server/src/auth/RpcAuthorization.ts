@@ -57,6 +57,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.ompAccountsCancelLogin]: AuthOrchestrationOperateScope,
   [WS_METHODS.ompAccountsRemove]: AuthOrchestrationOperateScope,
   [WS_METHODS.scaffoldPause]: AuthOrchestrationOperateScope,
+  [WS_METHODS.scaffoldRename]: AuthOrchestrationOperateScope,
   [WS_METHODS.cloudGetRelayClientStatus]: AuthRelayReadScope,
   [WS_METHODS.cloudInstallRelayClient]: AuthRelayWriteScope,
   [WS_METHODS.sourceControlLookupRepository]: AuthOrchestrationReadScope,

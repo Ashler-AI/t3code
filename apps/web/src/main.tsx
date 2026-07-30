@@ -21,11 +21,15 @@ import {
   syncDocumentWindowControlsOverlayClass,
 } from "./lib/windowControlsOverlay";
 import { AppRoot } from "./AppRoot";
+import { notifySessionFabricRouteChanged } from "./connection/sessionFabricBootstrap";
 
 // Electron loads the app from a file-backed shell, so hash history avoids path resolution issues.
 const history = isElectron ? createHashHistory() : createBrowserHistory();
 
 const router = getRouter(history, isElectron ? "/" : readRuntimeBasePath() || "/");
+router.subscribe("onResolved", ({ pathChanged }) => {
+  if (pathChanged) notifySessionFabricRouteChanged(window);
+});
 
 if (isElectron) {
   syncDocumentElectronPlatformClasses(navigator.platform);

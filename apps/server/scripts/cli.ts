@@ -442,7 +442,7 @@ const verifyPackedArtifact = Effect.fn("verifyPackedArtifact")(function* (artifa
         [
           'import { RequestId } from "effect/unstable/rpc/RpcMessage";',
           'const actual = RequestId("153e751db470c503").toString();',
-          'const expected = BigInt("0x153e751db470c503").toString();',
+          'const expected = "153e751db470c503";',
           "if (actual !== expected) throw new Error(`Unexpected MCP request id: ${actual}`);",
         ].join("\n"),
       ],

@@ -44,6 +44,23 @@ function oauthTokenFile(
   );
 }
 
+export function invalidateScaffoldOauthCredential(
+  deployment: ScaffoldDeployment,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): void {
+  const prefix =
+    deployment === "staging" ? "T3CODE_SCAFFOLD_STAGING" : "T3CODE_SCAFFOLD_PRODUCTION";
+  const configuredMode = environment[`${prefix}_AUTH_MODE`]?.trim().toLowerCase();
+  const rawAuthorization = environment[`${prefix}_AUTHORIZATION`]?.trim();
+  const authMode = configuredMode || (rawAuthorization ? "iap" : "oauth");
+  if (authMode !== "oauth") return;
+  try {
+    NodeFS.rmSync(oauthTokenFile(deployment, environment), { force: true });
+  } catch {
+    // A failed invalidation must not hide the upstream authentication failure.
+  }
+}
+
 function oauthAuthorization(
   deployment: ScaffoldDeployment,
   baseUrl: string,

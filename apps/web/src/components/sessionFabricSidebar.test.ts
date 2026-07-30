@@ -9,6 +9,7 @@ import {
   selectPublicLocalSidebarSessions,
   selectShadowedSessionFabricThreadKeys,
   selectVisibleSessionFabricSidebarSessions,
+  sessionFabricScaffoldLinks,
   startSessionFabricSidebarDiscovery,
   type SessionFabricSidebarDirectoryState,
 } from "./sessionFabricSidebar";
@@ -22,6 +23,8 @@ function record(input: {
   readonly environmentId?: string;
   readonly projectId?: string;
   readonly threadId?: string;
+  readonly createdAt?: string;
+  readonly updatedAt?: string;
 }): SessionFabricSessionRecordType {
   return decodeRecord({
     sessionId: input.sessionId,
@@ -57,13 +60,13 @@ function record(input: {
     summary: null,
     cursor: { eventSequence: 0, snapshotSequence: 0 },
     lastEventAt: null,
-    createdAt: "2026-07-28T00:00:00.000Z",
-    updatedAt: "2026-07-28T00:00:00.000Z",
+    createdAt: input.createdAt ?? "2026-07-28T00:00:00.000Z",
+    updatedAt: input.updatedAt ?? "2026-07-28T00:00:00.000Z",
   });
 }
 
 describe("session fabric sidebar", () => {
-  it("shows public local sessions and excludes private or Scaffold sessions", () => {
+  it("shows every public local and Scaffold session and excludes private sessions", () => {
     const sessions = selectPublicLocalSidebarSessions([
       record({ sessionId: "public-local", publication: "public", environmentKind: "local" }),
       record({
@@ -77,13 +80,79 @@ describe("session fabric sidebar", () => {
     expect(sessions).toEqual([
       {
         sessionId: "public-local",
+        environmentKind: "local",
         environmentId: "local-environment",
         projectId: "project-1",
         threadId: "thread-1",
         title: "public-local",
         runnerState: "online",
+        scaffoldSessionId: null,
+        scaffoldSessionUrl: null,
+      },
+      {
+        sessionId: "public-scaffold",
+        environmentKind: "scaffold",
+        environmentId: "scaffold-environment",
+        projectId: "project-1",
+        threadId: "thread-1",
+        title: "public-scaffold",
+        runnerState: "online",
+        scaffoldSessionId: "ses_scaffold",
+        scaffoldSessionUrl: "https://scaffold.example/sessions/ses_scaffold",
       },
     ]);
+  });
+
+  it("keeps session rows in creation order when opening a session updates activity", () => {
+    const sessions = selectPublicLocalSidebarSessions([
+      record({
+        sessionId: "newer-session",
+        publication: "public",
+        environmentKind: "local",
+        createdAt: "2026-07-29T00:00:00.000Z",
+        updatedAt: "2026-07-29T00:00:00.000Z",
+      }),
+      record({
+        sessionId: "older-session-opened-now",
+        publication: "public",
+        environmentKind: "local",
+        createdAt: "2026-07-28T00:00:00.000Z",
+        updatedAt: "2026-07-30T00:00:00.000Z",
+      }),
+    ]);
+
+    expect(sessions.map((session) => session.sessionId)).toEqual([
+      "newer-session",
+      "older-session-opened-now",
+    ]);
+  });
+
+  it("derives Scaffold destinations only from authoritative location metadata", () => {
+    const [session] = selectPublicLocalSidebarSessions([
+      record({ sessionId: "public-scaffold", publication: "public", environmentKind: "scaffold" }),
+    ]);
+
+    expect(sessionFabricScaffoldLinks(session!)).toEqual({
+      sessionUrl: "https://scaffold.example/sessions/ses_scaffold",
+      webUrl: "https://scaffold.example/sessions/ses_scaffold/web",
+      tiltUrl: "https://scaffold.example/sessions/ses_scaffold/tilt",
+    });
+  });
+
+  it("fails closed when Scaffold link metadata is absent or unsafe", () => {
+    const [local] = selectPublicLocalSidebarSessions([
+      record({ sessionId: "public-local", publication: "public", environmentKind: "local" }),
+    ]);
+
+    expect(sessionFabricScaffoldLinks(local!)).toBeNull();
+    expect(
+      sessionFabricScaffoldLinks({
+        ...local!,
+        environmentKind: "scaffold",
+        scaffoldSessionId: "ses_scaffold",
+        scaffoldSessionUrl: "javascript:alert(1)",
+      }),
+    ).toBeNull();
   });
 
   it("recovers from an initial discovery failure after auth and network changes", async () => {
@@ -355,7 +424,30 @@ describe("session fabric sidebar", () => {
     ).toEqual(["project-two"]);
   });
 
-  it("hides the relay shell when its shared session is already connected directly", () => {
+  it("keeps the catalog row stable while its relay shell is mounted", () => {
+    const sessions = selectPublicLocalSidebarSessions([
+      record({
+        sessionId: "shared-session",
+        publication: "public",
+        environmentKind: "local",
+        environmentId: "direct-environment",
+        threadId: "shared-thread",
+      }),
+    ]);
+    const connectedThreadKeys = new Set(["session-fabric:shared-session:shared-thread"]);
+
+    expect(selectShadowedSessionFabricThreadKeys(sessions, connectedThreadKeys)).toEqual(
+      new Set(["session-fabric:shared-session:shared-thread"]),
+    );
+    expect(
+      selectVisibleSessionFabricSidebarSessions(sessions, {
+        connectedThreadKeys,
+        scopedProjectKeys: null,
+      }),
+    ).toEqual(sessions);
+  });
+
+  it("prefers a connected direct row over both the catalog row and a mounted relay shell", () => {
     const sessions = selectPublicLocalSidebarSessions([
       record({
         sessionId: "shared-session",
@@ -376,12 +468,6 @@ describe("session fabric sidebar", () => {
     expect(
       selectVisibleSessionFabricSidebarSessions(sessions, {
         connectedThreadKeys,
-        scopedProjectKeys: null,
-      }),
-    ).toEqual([]);
-    expect(
-      selectVisibleSessionFabricSidebarSessions(sessions, {
-        connectedThreadKeys: new Set(["session-fabric:shared-session:shared-thread"]),
         scopedProjectKeys: null,
       }),
     ).toEqual([]);

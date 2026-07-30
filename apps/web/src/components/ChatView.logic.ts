@@ -38,6 +38,17 @@ export function startNewThreadForProject(
   return true;
 }
 
+export type FailedScaffoldDraftRetryMode = "none" | "reconnect" | "recreate";
+
+export function resolveFailedScaffoldDraftRetryMode(input: {
+  phase: "creating" | "ready" | "resuming" | "paused" | "failed";
+  terminal?: boolean;
+  environmentId: EnvironmentId | null;
+}): FailedScaffoldDraftRetryMode {
+  if (input.phase !== "failed" || input.terminal === true) return "none";
+  return input.environmentId === null ? "recreate" : "reconnect";
+}
+
 export function resolveThreadMetadataUpdateForNextTurn(input: {
   currentModelSelection: ModelSelection;
   nextModelSelection?: ModelSelection;

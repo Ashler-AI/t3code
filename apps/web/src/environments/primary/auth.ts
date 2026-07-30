@@ -7,7 +7,11 @@ import type {
   AuthSessionId,
   AuthSessionState,
 } from "@t3tools/contracts";
-import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
+import {
+  AuthStandardClientScopes,
+  EnvironmentHttpCommonError,
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+} from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -356,7 +360,11 @@ async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
     await waitForAuthenticatedSessionAfterBootstrap();
     return { status: "authenticated" };
   }
-  if (currentSession.authenticated) {
+  if (
+    currentSession.authenticated &&
+    (!localDevAutoAuthEnabled ||
+      AuthStandardClientScopes.every((scope) => currentSession.scopes?.includes(scope) === true))
+  ) {
     return { status: "authenticated" };
   }
 

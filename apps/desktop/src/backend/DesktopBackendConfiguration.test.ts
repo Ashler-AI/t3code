@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import desktopViteConfig from "../../vite.config.ts";
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopServerExposure from "./DesktopServerExposure.ts";
@@ -93,6 +94,15 @@ const restoreEnv = (name: string, value: string | undefined) => {
   }
 };
 
+const restoreGlobal = (name: string, value: unknown) => {
+  const globals = globalThis as Record<string, unknown>;
+  if (value === undefined) {
+    delete globals[name];
+  } else {
+    globals[name] = value;
+  }
+};
+
 const withHarness = <A, E, R>(
   effect: Effect.Effect<
     A,
@@ -122,6 +132,23 @@ const withHarness = <A, E, R>(
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("DesktopBackendConfiguration", () => {
+  it("defines every packaged public backend setting in the main and preload bundles", () => {
+    const packEntries = desktopViteConfig.pack as ReadonlyArray<{
+      readonly define?: Readonly<Record<string, string>>;
+    }>;
+    const expectedDefinitions = [
+      "__T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__",
+      "__T3CODE_BUILD_SCAFFOLD_STAGING_URL__",
+      "__T3CODE_BUILD_SCAFFOLD_PRODUCTION_URL__",
+      "__T3CODE_BUILD_SCAFFOLD_DEFAULT_DEPLOYMENT__",
+    ];
+
+    for (const definition of expectedDefinitions) {
+      assert.property(packEntries[0]?.define, definition);
+      assert.equal(packEntries[1]?.define?.[definition], packEntries[0]?.define?.[definition]);
+    }
+  });
+
   it.effect("resolvePrimary produces a stable scoped bootstrap token", () =>
     withHarness(
       Effect.gen(function* () {
@@ -164,6 +191,245 @@ describe("DesktopBackendConfiguration", () => {
         assert.equal(wsl.bootstrap.desktopBootstrapToken, primary.bootstrap.desktopBootstrapToken);
       }),
     ),
+  );
+
+  it.effect("forwards packaged public configuration to native and WSL backends", () =>
+    Effect.gen(function* () {
+      const globals = globalThis as Record<string, unknown>;
+      const buildConfig = {
+        __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__: "https://fabric.example.test///",
+        __T3CODE_BUILD_SCAFFOLD_STAGING_URL__: "https://staging.scaffold.example.test",
+        __T3CODE_BUILD_SCAFFOLD_PRODUCTION_URL__: "https://scaffold.example.test/",
+        __T3CODE_BUILD_SCAFFOLD_DEFAULT_DEPLOYMENT__: "production",
+      } as const;
+      const previousBuildConfig = Object.fromEntries(
+        Object.keys(buildConfig).map((name) => [name, globals[name]]),
+      );
+      const runtimeNames = [
+        "T3CODE_SESSION_FABRIC_RELAY_URL",
+        "T3CODE_SCAFFOLD_STAGING_URL",
+        "T3CODE_SCAFFOLD_PRODUCTION_URL",
+        "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT",
+      ];
+      const previousRuntimeConfig = Object.fromEntries(
+        runtimeNames.map((name) => [name, process.env[name]]),
+      );
+      const previousWslEnv = process.env.WSLENV;
+      try {
+        Object.assign(globals, buildConfig);
+        for (const name of runtimeNames) delete process.env[name];
+        process.env.WSLENV = "EXISTING_VALUE";
+
+        yield* withHarness(
+          Effect.gen(function* () {
+            const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+            const primary = yield* configuration.resolvePrimary;
+            const wsl = yield* configuration.resolveWsl({ port: 5000, distro: null });
+
+            for (const config of [primary, wsl]) {
+              assert.equal(
+                config.env.T3CODE_SESSION_FABRIC_RELAY_URL,
+                "https://fabric.example.test",
+              );
+              assert.equal(config.env.T3CODE_SESSION_FABRIC_AUTH_MODE, "required");
+              assert.equal(
+                config.env.T3CODE_SCAFFOLD_STAGING_URL,
+                "https://staging.scaffold.example.test/",
+              );
+              assert.equal(config.env.T3CODE_SCAFFOLD_STAGING_AUTH_MODE, "oauth");
+              assert.equal(
+                config.env.T3CODE_SCAFFOLD_PRODUCTION_URL,
+                "https://scaffold.example.test/",
+              );
+              assert.equal(config.env.T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE, "oauth");
+              assert.equal(config.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT, "production");
+            }
+            assert.equal(
+              wsl.env.WSLENV,
+              [
+                "EXISTING_VALUE",
+                "T3CODE_SESSION_FABRIC_RELAY_URL",
+                "T3CODE_SESSION_FABRIC_AUTH_MODE",
+                "T3CODE_SCAFFOLD_STAGING_URL",
+                "T3CODE_SCAFFOLD_STAGING_AUTH_MODE",
+                "T3CODE_SCAFFOLD_PRODUCTION_URL",
+                "T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE",
+                "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT",
+              ].join(":"),
+            );
+          }),
+        );
+      } finally {
+        for (const [name, value] of Object.entries(previousBuildConfig)) {
+          restoreGlobal(name, value);
+        }
+        for (const [name, value] of Object.entries(previousRuntimeConfig)) {
+          restoreEnv(name, value);
+        }
+        restoreEnv("WSLENV", previousWslEnv);
+      }
+    }),
+  );
+
+  it.effect("lets runtime public configuration override packaged defaults", () =>
+    Effect.gen(function* () {
+      const globals = globalThis as Record<string, unknown>;
+      const buildName = "__T3CODE_BUILD_SCAFFOLD_DEFAULT_DEPLOYMENT__";
+      const previousBuildValue = globals[buildName];
+      const previousRuntimeValue = process.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT;
+      try {
+        globals[buildName] = "staging";
+        process.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT = "production";
+
+        yield* withHarness(
+          Effect.gen(function* () {
+            const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+            const primary = yield* configuration.resolvePrimary;
+
+            assert.equal(primary.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT, "production");
+          }),
+        );
+      } finally {
+        restoreGlobal(buildName, previousBuildValue);
+        restoreEnv("T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT", previousRuntimeValue);
+      }
+    }),
+  );
+
+  it.effect("allows an explicit loopback HTTP relay only at desktop runtime", () =>
+    Effect.gen(function* () {
+      const globals = globalThis as Record<string, unknown>;
+      const buildName = "__T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__";
+      const previousBuildValue = globals[buildName];
+      const previousRuntimeValue = process.env.T3CODE_SESSION_FABRIC_RELAY_URL;
+      try {
+        globals[buildName] = "https://embedded.example.test";
+
+        for (const [value, expected] of [
+          ["http://localhost:8788///", "http://localhost:8788"],
+          ["http://127.0.0.1:8788/", "http://127.0.0.1:8788"],
+          ["http://[::1]:8788/", "http://[::1]:8788"],
+        ] as const) {
+          process.env.T3CODE_SESSION_FABRIC_RELAY_URL = value;
+          yield* withHarness(
+            Effect.gen(function* () {
+              const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+              const primary = yield* configuration.resolvePrimary;
+
+              assert.equal(primary.env.T3CODE_SESSION_FABRIC_RELAY_URL, expected);
+              assert.equal(primary.env.T3CODE_SESSION_FABRIC_AUTH_MODE, "required");
+            }),
+          );
+        }
+      } finally {
+        restoreGlobal(buildName, previousBuildValue);
+        restoreEnv("T3CODE_SESSION_FABRIC_RELAY_URL", previousRuntimeValue);
+      }
+    }),
+  );
+
+  it.effect("does not accept loopback HTTP from packaged desktop configuration", () =>
+    Effect.gen(function* () {
+      const globals = globalThis as Record<string, unknown>;
+      const buildName = "__T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__";
+      const previousBuildValue = globals[buildName];
+      const previousRuntimeValue = process.env.T3CODE_SESSION_FABRIC_RELAY_URL;
+      try {
+        globals[buildName] = "http://127.0.0.1:8788";
+        delete process.env.T3CODE_SESSION_FABRIC_RELAY_URL;
+
+        yield* withHarness(
+          Effect.gen(function* () {
+            const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+            const primary = yield* configuration.resolvePrimary;
+
+            assert.isUndefined(primary.env.T3CODE_SESSION_FABRIC_RELAY_URL);
+            assert.isUndefined(primary.env.T3CODE_SESSION_FABRIC_AUTH_MODE);
+          }),
+        );
+      } finally {
+        restoreGlobal(buildName, previousBuildValue);
+        restoreEnv("T3CODE_SESSION_FABRIC_RELAY_URL", previousRuntimeValue);
+      }
+    }),
+  );
+
+  it.effect(
+    "rejects unsafe desktop runtime relay URLs instead of using the packaged fallback",
+    () =>
+      Effect.gen(function* () {
+        const globals = globalThis as Record<string, unknown>;
+        const buildName = "__T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__";
+        const previousBuildValue = globals[buildName];
+        const previousRuntimeValue = process.env.T3CODE_SESSION_FABRIC_RELAY_URL;
+        try {
+          globals[buildName] = "https://embedded.example.test";
+
+          for (const value of [
+            "http://relay.example.test",
+            "http://localhost:8788/path",
+            "http://localhost:8788?query=value",
+            "http://localhost:8788#fragment",
+            "http://user:password@localhost:8788",
+            "http://127.1:8788",
+            "http://0177.0.0.1:8788",
+            "https://relay.example.test/path",
+          ]) {
+            process.env.T3CODE_SESSION_FABRIC_RELAY_URL = value;
+            yield* withHarness(
+              Effect.gen(function* () {
+                const configuration =
+                  yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+                const primary = yield* configuration.resolvePrimary;
+
+                assert.isUndefined(primary.env.T3CODE_SESSION_FABRIC_RELAY_URL, value);
+                assert.isUndefined(primary.env.T3CODE_SESSION_FABRIC_AUTH_MODE, value);
+              }),
+            );
+          }
+        } finally {
+          restoreGlobal(buildName, previousBuildValue);
+          restoreEnv("T3CODE_SESSION_FABRIC_RELAY_URL", previousRuntimeValue);
+        }
+      }),
+  );
+
+  it.effect("does not forward an invalid session fabric relay URL", () =>
+    Effect.gen(function* () {
+      const previousRelayUrl = process.env.T3CODE_SESSION_FABRIC_RELAY_URL;
+      const previousAuthMode = process.env.T3CODE_SESSION_FABRIC_AUTH_MODE;
+      const previousStagingUrl = process.env.T3CODE_SCAFFOLD_STAGING_URL;
+      const previousProductionUrl = process.env.T3CODE_SCAFFOLD_PRODUCTION_URL;
+      const previousDefaultDeployment = process.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT;
+      try {
+        process.env.T3CODE_SESSION_FABRIC_RELAY_URL = "file:///tmp/session-fabric";
+        process.env.T3CODE_SESSION_FABRIC_AUTH_MODE = "disabled";
+        process.env.T3CODE_SCAFFOLD_STAGING_URL = "http://staging.example.test";
+        process.env.T3CODE_SCAFFOLD_PRODUCTION_URL = "https://example.test/path";
+        process.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT = "preview";
+
+        yield* withHarness(
+          Effect.gen(function* () {
+            const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+            const primary = yield* configuration.resolvePrimary;
+
+            assert.isUndefined(primary.env.T3CODE_SESSION_FABRIC_RELAY_URL);
+            assert.isUndefined(primary.env.T3CODE_SESSION_FABRIC_AUTH_MODE);
+            assert.isUndefined(primary.env.T3CODE_SCAFFOLD_STAGING_URL);
+            assert.isUndefined(primary.env.T3CODE_SCAFFOLD_STAGING_AUTH_MODE);
+            assert.isUndefined(primary.env.T3CODE_SCAFFOLD_PRODUCTION_URL);
+            assert.isUndefined(primary.env.T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE);
+            assert.isUndefined(primary.env.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT);
+          }),
+        );
+      } finally {
+        restoreEnv("T3CODE_SESSION_FABRIC_RELAY_URL", previousRelayUrl);
+        restoreEnv("T3CODE_SESSION_FABRIC_AUTH_MODE", previousAuthMode);
+        restoreEnv("T3CODE_SCAFFOLD_STAGING_URL", previousStagingUrl);
+        restoreEnv("T3CODE_SCAFFOLD_PRODUCTION_URL", previousProductionUrl);
+        restoreEnv("T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT", previousDefaultDeployment);
+      }
+    }),
   );
 
   it.effect("resolveWsl pins a default-tracking run to the concrete default distro", () =>

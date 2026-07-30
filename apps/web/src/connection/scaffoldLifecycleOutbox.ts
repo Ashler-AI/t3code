@@ -8,9 +8,11 @@ import {
 } from "@t3tools/client-runtime/scaffold";
 import {
   EnvironmentId,
+  ScaffoldPauseInput,
   type ScaffoldCreateParameters,
   type ScaffoldDeployment,
   type ProjectId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -34,6 +36,7 @@ let fallbackLifecycleLockTail: Promise<void> = Promise.resolve();
 // must be decoded instead of checked with the prototype-sensitive Schema.is.
 const decodeScaffoldLifecycleAction = Schema.decodeUnknownOption(ScaffoldLifecycleActionSchema);
 type ScaffoldCreateLifecycleAction = Extract<ScaffoldLifecycleAction, { readonly kind: "create" }>;
+type ScaffoldPauseLifecycleAction = Extract<ScaffoldLifecycleAction, { readonly kind: "pause" }>;
 
 function decodeDurableAction(value: unknown): ScaffoldLifecycleAction | undefined {
   const decoded = decodeScaffoldLifecycleAction(value);
@@ -127,6 +130,9 @@ export function createIndexedDbScaffoldLifecycleActionStore(
           if (
             hasCurrentPersistenceVersion(value) &&
             (action.kind !== "create" ||
+              (action.blocked &&
+                action.nextAttemptAt === null &&
+                action.lastErrorCode === LEGACY_CREATE_MISSING_AUTHORITY) ||
               (action.deployment !== undefined &&
                 action.draftId !== undefined &&
                 action.sourceEnvironmentId !== undefined &&
@@ -221,6 +227,41 @@ export function makeScaffoldCreateAction(input: {
   });
   if (action.kind !== "create") throw new Error("Expected a Scaffold create action.");
   return action;
+}
+
+export function makeScaffoldPauseAction(input: {
+  readonly environmentId: EnvironmentId;
+  readonly sourceThreadId: ThreadId;
+  readonly sessionId: string;
+  readonly expectedLifecycleEpoch: number;
+  readonly createdAt?: string;
+  readonly uuid?: () => string;
+}): ScaffoldPauseLifecycleAction {
+  const action = makeScaffoldLifecycleAction({
+    kind: "pause",
+    sourceThreadId: input.sourceThreadId,
+    actionId: `op_${(input.uuid ?? randomUUID)()}`,
+    environmentId: input.environmentId,
+    connectionId: `scaffold-session:${input.sessionId}`,
+    sessionId: input.sessionId,
+    expectedLifecycleEpoch: input.expectedLifecycleEpoch,
+    createdAt: input.createdAt ?? new Date().toISOString(),
+  });
+  if (action.kind !== "pause") throw new Error("Expected a Scaffold pause action.");
+  return action;
+}
+
+export function scaffoldPauseInputFromAction(input: {
+  readonly action: ScaffoldPauseLifecycleAction;
+  readonly deployment: ScaffoldDeployment;
+}): ScaffoldPauseInput {
+  return new ScaffoldPauseInput({
+    deployment: input.deployment,
+    operationId: input.action.actionId,
+    environmentId: input.action.environmentId,
+    sessionId: input.action.sessionId,
+    expectedLifecycleEpoch: input.action.expectedLifecycleEpoch,
+  });
 }
 
 export const browserScaffoldLifecycleActionStore = createIndexedDbScaffoldLifecycleActionStore();
@@ -325,6 +366,73 @@ export async function drainScaffoldLifecycleActions(input: {
   await withScaffoldLifecycleLock(drain);
 }
 
+export function createScaffoldLifecycleDrainRunner(input: {
+  readonly run: (actionId?: string) => Promise<void>;
+  readonly onIdle: () => Promise<void>;
+  readonly onError: (error: unknown) => void;
+}): {
+  readonly drain: (actionId?: string) => Promise<void>;
+  readonly dispose: () => void;
+} {
+  let disposed = false;
+  let running: Promise<void> | null = null;
+  let rerunRequested = false;
+
+  const drain = (actionId?: string): Promise<void> => {
+    if (disposed) return Promise.resolve();
+    if (running !== null) {
+      rerunRequested = true;
+      return running;
+    }
+    running = (async () => {
+      let nextActionId = actionId;
+      while (true) {
+        if (disposed) break;
+        rerunRequested = false;
+        try {
+          await input.run(nextActionId);
+        } catch (error) {
+          input.onError(error);
+        }
+        nextActionId = undefined;
+        if (rerunRequested) continue;
+        try {
+          await input.onIdle();
+        } catch (error) {
+          input.onError(error);
+        }
+        if (!rerunRequested) break;
+      }
+    })().finally(() => {
+      running = null;
+    });
+    return running;
+  };
+
+  return {
+    drain,
+    dispose: () => {
+      disposed = true;
+    },
+  };
+}
+
+export async function resolveScaffoldLifecycleRetryDelay(input: {
+  readonly store: ScaffoldLifecycleActionStore;
+  readonly isDisposed: () => boolean;
+  readonly now?: () => number;
+}): Promise<number | null> {
+  if (input.isDisposed()) return null;
+  const pending = await input.store.list();
+  if (input.isDisposed()) return null;
+  const now = (input.now ?? Date.now)();
+  const readyAt = pending
+    .filter((action) => !action.blocked)
+    .map((action) => action.nextAttemptAt ?? now)
+    .sort((left, right) => left - right)[0];
+  return readyAt === undefined ? null : Math.max(0, readyAt - now);
+}
+
 export function requestScaffoldLifecycleDrain(actionId?: string): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(DRAIN_EVENT, { detail: { actionId } }));
@@ -341,10 +449,18 @@ export function subscribeScaffoldLifecycleDrain(listener: (actionId?: string) =>
     listener(actionId);
   };
   const handleOnline = () => listener();
+  const handlePageShow = () => listener();
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === "visible") listener();
+  };
   window.addEventListener(DRAIN_EVENT, handleDrain);
   window.addEventListener("online", handleOnline);
+  window.addEventListener("pageshow", handlePageShow);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
   return () => {
     window.removeEventListener(DRAIN_EVENT, handleDrain);
     window.removeEventListener("online", handleOnline);
+    window.removeEventListener("pageshow", handlePageShow);
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
   };
 }

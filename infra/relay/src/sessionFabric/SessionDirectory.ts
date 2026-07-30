@@ -56,15 +56,15 @@ function embeddingEndpoint(baseUrl: string): string {
   return normalized.endsWith("/v1/embeddings") ? normalized : `${normalized}/v1/embeddings`;
 }
 
-export default class SessionDirectory extends Cloudflare.DurableObjectNamespace<SessionDirectory>()(
+export default class SessionDirectory extends Cloudflare.DurableObject<SessionDirectory>()(
   "SessionDirectory",
   Effect.gen(function* () {
     const basetenUrl = yield* Config.string("BASETEN_EMBEDDING_URL").pipe(Config.option);
     const basetenApiKey = yield* Config.redacted("BASETEN_API_KEY").pipe(Config.option);
+    const state = yield* Cloudflare.DurableObjectState;
+    const httpClient = yield* HttpClient.HttpClient;
 
     return Effect.gen(function* () {
-      const state = yield* Cloudflare.DurableObjectState;
-      const httpClient = yield* HttpClient.HttpClient;
       const { sql } = state.storage;
 
       yield* sql

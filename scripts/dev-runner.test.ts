@@ -569,6 +569,35 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
       }),
     );
 
+    it.effect("requires capabilities when combined dev targets a remote session fabric", () =>
+      Effect.gen(function* () {
+        for (const configuredMode of [undefined, "disabled"] as const) {
+          const env = yield* createDevRunnerEnv({
+            mode: "dev",
+            baseEnv: {
+              T3CODE_SESSION_FABRIC_RELAY_URL: "https://session-fabric.example.com/",
+              ...(configuredMode === undefined
+                ? {}
+                : { T3CODE_SESSION_FABRIC_AUTH_MODE: configuredMode }),
+            },
+            serverOffset: 0,
+            webOffset: 0,
+            t3Home: undefined,
+            browser: undefined,
+            autoBootstrapProjectFromCwd: undefined,
+            logWebSocketEvents: undefined,
+            host: "127.0.0.1",
+            port: undefined,
+            devUrl: undefined,
+            localDevBootstrapToken: "runner-generated-token",
+          });
+
+          assert.equal(env.T3CODE_SESSION_FABRIC_AUTH_MODE, "required");
+          assert.equal(env.VITE_T3CODE_SESSION_FABRIC_AUTH_MODE, "required");
+        }
+      }),
+    );
+
     it.effect("keeps split and remote dev outside automatic localhost authorization", () =>
       Effect.gen(function* () {
         for (const input of [

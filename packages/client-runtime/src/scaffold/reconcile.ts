@@ -1,4 +1,5 @@
 import type { ScaffoldLifecycleActionKind, ScaffoldSessionObservation } from "./model.ts";
+import type { ScaffoldOutboxExecutionResult } from "./outbox.ts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
@@ -131,6 +132,41 @@ export function reconcileScaffoldLifecycle(
           return { _tag: "blocked", observation, reason: errorCode ?? "sandbox_failed" };
       }
     }
+  }
+}
+
+export function scaffoldOutboxResultFromReconciliation(
+  reconciliation: ScaffoldLifecycleReconciliation,
+  fallbackErrorCode: string,
+): ScaffoldOutboxExecutionResult {
+  switch (reconciliation._tag) {
+    case "converged":
+    case "superseded":
+      return { _tag: "acknowledged" };
+    case "wait":
+      return {
+        _tag: "wait",
+        retryAfterMs: reconciliation.retryAfterMs,
+        errorCode: `session_${reconciliation.observation.status}`,
+        observation: {
+          sessionId: reconciliation.observation.sessionId,
+          lifecycleEpoch: reconciliation.observation.lifecycleEpoch,
+        },
+      };
+    case "stale":
+      return {
+        _tag: "retry",
+        retryAfterMs: reconciliation.retryAfterMs,
+        errorCode: "stale_lifecycle_epoch",
+      };
+    case "retry":
+      return {
+        _tag: "retry",
+        retryAfterMs: reconciliation.retryAfterMs,
+        errorCode: fallbackErrorCode,
+      };
+    case "blocked":
+      return { _tag: "blocked", errorCode: reconciliation.reason };
   }
 }
 

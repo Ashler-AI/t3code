@@ -44,6 +44,7 @@ import * as Config from "effect/Config";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
@@ -53,11 +54,24 @@ import {
   decideCommandSubmit,
   decideEventAppend,
   isCurrentRunnerAttachment,
+  nextSessionFabricMaintenanceDueAt,
+  offlineScaffoldCommandCanWake,
   runnerHelloMatchesLease,
+  scaffoldWakeFollowerStatus,
+  scaffoldWakeHasAttemptsRemaining,
+  scaffoldWakeKeepsCommandPending,
+  scaffoldWakeRequestsAuthority,
+  scaffoldWakeRetryDelayMs,
+  SESSION_FABRIC_WAKE_MAX_ATTEMPTS,
   SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
   SESSION_FABRIC_PERMISSION_CLOSE_CODE,
   shouldReplayCommand,
+  snapshotProvesScaffoldWakeTarget,
 } from "./SessionStreamModel.ts";
+import {
+  validateScaffoldWakeAuthorityConfig,
+  wakeScaffoldSession,
+} from "./ScaffoldWakeAuthority.ts";
 import SessionDirectory from "./SessionDirectory.ts";
 
 interface SocketAttachment {
@@ -88,6 +102,53 @@ export interface LocalSessionFabricPinnedAuthority {
   readonly runnerId: string;
   readonly actorId: string;
   readonly sessionId: string;
+}
+
+export function normalizeSnapshotToRelayCursor(
+  snapshot: SessionFabricSnapshot,
+  durableEventSequence: number,
+  previousCoveredEventSequence = 0,
+): SessionFabricSnapshot {
+  const incomingCoveredEventSequence = Math.min(
+    snapshot.session.cursor.eventSequence,
+    snapshot.compactedThroughEventSequence,
+  );
+  // Runner acknowledgement restarts behind the relay after reconnect. Coverage
+  // is monotonic across accepted snapshots, but it must never advance past the
+  // durable event maximum merely because a newer event interleaved projection.
+  const coveredEventSequence = Math.min(
+    Math.max(previousCoveredEventSequence, incomingCoveredEventSequence),
+    durableEventSequence,
+  );
+  return {
+    ...snapshot,
+    session: {
+      ...snapshot.session,
+      cursor: {
+        ...snapshot.session.cursor,
+        eventSequence: coveredEventSequence,
+      },
+    },
+    compactedThroughEventSequence: coveredEventSequence,
+  };
+}
+
+export function clientHelloShouldSynchronize(
+  hello: Extract<SessionFabricClientFrame, { type: "client.hello" }>["hello"],
+): boolean {
+  return hello.synchronize !== false;
+}
+
+export function snapshotAuthorityCanAdvance(input: {
+  readonly currentSnapshotSequence: number;
+  readonly currentUpdatedAt: string | null;
+  readonly incomingSnapshotSequence: number;
+  readonly incomingUpdatedAt: string;
+}): boolean {
+  if (input.incomingSnapshotSequence !== input.currentSnapshotSequence) {
+    return input.incomingSnapshotSequence > input.currentSnapshotSequence;
+  }
+  return input.currentUpdatedAt === null || input.incomingUpdatedAt >= input.currentUpdatedAt;
 }
 
 function completeLocalAuthority(meta: MetaRow): LocalSessionFabricPinnedAuthority | null {
@@ -138,6 +199,7 @@ export function localRunnerCanClaimPinnedAuthority(input: {
 export function localControllerMatchesPinnedAuthority(input: {
   readonly claims: SessionFabricCapabilityClaims;
   readonly sessionId: SessionFabricSessionId;
+  readonly publication: SessionFabricSnapshot["session"]["publication"];
   readonly location: SessionFabricSnapshot["session"]["location"];
   readonly pinned: LocalSessionFabricPinnedAuthority | null;
 }): boolean {
@@ -149,9 +211,25 @@ export function localControllerMatchesPinnedAuthority(input: {
     capabilityCanControlSession({
       claims: input.claims,
       sessionId: input.sessionId,
+      publication: input.publication,
       location: input.location,
-      localAuthority: { actorId: input.pinned.actorId },
     })
+  );
+}
+
+export function scaffoldControllerMatchesSnapshotIdentity(input: {
+  readonly claims: SessionFabricCapabilityClaims;
+  readonly sessionId: SessionFabricSessionId;
+  readonly publication: SessionFabricSnapshot["session"]["publication"];
+  readonly location: SessionFabricSnapshot["session"]["location"];
+}): boolean {
+  return (
+    input.publication === "public" &&
+    input.claims.role === "controller" &&
+    !isLocalSessionFabricCapability(input.claims) &&
+    isPublicScaffoldLocation(input.location) &&
+    input.claims.fabricSessionId === input.sessionId &&
+    input.claims.scaffoldSessionId === input.location.scaffoldSessionId
   );
 }
 
@@ -241,6 +319,20 @@ interface ContextRow {
   readonly published_at: string;
 }
 
+interface WakeRow {
+  readonly [key: string]: string | number | null;
+  readonly command_id: string;
+  readonly scaffold_session_id: string;
+  readonly expected_lifecycle_epoch: number;
+  readonly target_lifecycle_epoch: number | null;
+  readonly actor_id: string;
+  readonly status: string;
+  readonly attempt_count: number;
+  readonly next_attempt_at: number | null;
+  readonly detail: string | null;
+  readonly updated_at: string;
+}
+
 const decodeClientFrame = Schema.decodeUnknownEffect(
   Schema.fromJsonString(SessionFabricClientFrameSchema),
 );
@@ -280,7 +372,7 @@ const pathSessionId = (url: URL): SessionFabricSessionId | null => {
   }
 };
 
-export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNamespace<SessionStreamCoordinator>()(
+export default class SessionStreamCoordinator extends Cloudflare.DurableObject<SessionStreamCoordinator>()(
   "SessionStreamCoordinator",
   Effect.gen(function* () {
     const directory = yield* SessionDirectory;
@@ -292,11 +384,28 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
     const authPublicKeys = yield* Config.string("SESSION_FABRIC_CAPABILITY_PUBLIC_KEYS_JSON").pipe(
       Config.option,
     );
+    const wakeEndpoint = yield* Config.string("SESSION_FABRIC_SCAFFOLD_WAKE_URL").pipe(
+      Config.option,
+    );
+    const wakeSecret = yield* Config.redacted("SESSION_FABRIC_SCAFFOLD_WAKE_SECRET").pipe(
+      Config.option,
+    );
+    const wakeTimeoutMs = yield* Config.int("SESSION_FABRIC_SCAFFOLD_WAKE_TIMEOUT_MS").pipe(
+      Config.option,
+    );
     const verifierConfig = makeSessionFabricCapabilityVerifierConfig({
       mode: Option.getOrUndefined(authMode),
       issuer: Option.getOrUndefined(authIssuer),
       audience: Option.getOrUndefined(authAudience),
       publicKeysJson: Option.getOrUndefined(authPublicKeys),
+    });
+    const wakeEndpointValue = Option.getOrUndefined(wakeEndpoint);
+    const wakeSecretValue = Option.getOrUndefined(wakeSecret);
+    const wakeTimeoutMsValue = Option.getOrUndefined(wakeTimeoutMs);
+    const wakeAuthorityConfig = validateScaffoldWakeAuthorityConfig({
+      ...(wakeEndpointValue === undefined ? {} : { endpoint: wakeEndpointValue }),
+      ...(wakeSecretValue === undefined ? {} : { sharedSecret: Redacted.value(wakeSecretValue) }),
+      ...(wakeTimeoutMsValue === undefined ? {} : { timeoutMs: wakeTimeoutMsValue }),
     });
     return Effect.gen(function* () {
       const state = yield* Cloudflare.DurableObjectState;
@@ -333,6 +442,19 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         .exec(
           "CREATE TABLE IF NOT EXISTS session_commands (command_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, status TEXT NOT NULL, result_sequence INTEGER, detail TEXT, updated_at TEXT NOT NULL)",
         )
+        .pipe(Effect.asVoid);
+      yield* sql
+        .exec(
+          "CREATE TABLE IF NOT EXISTS session_command_wakes (command_id TEXT PRIMARY KEY, scaffold_session_id TEXT NOT NULL, expected_lifecycle_epoch INTEGER NOT NULL, target_lifecycle_epoch INTEGER, actor_id TEXT NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER, detail TEXT, updated_at TEXT NOT NULL)",
+        )
+        .pipe(Effect.asVoid);
+      yield* sql
+        .exec(
+          "CREATE TABLE IF NOT EXISTS session_maintenance (id INTEGER PRIMARY KEY CHECK (id = 1), directory_due_at INTEGER, wake_due_at INTEGER)",
+        )
+        .pipe(Effect.asVoid);
+      yield* sql
+        .exec("INSERT OR IGNORE INTO session_maintenance (id) VALUES (1)")
         .pipe(Effect.asVoid);
       yield* sql
         .exec(
@@ -454,7 +576,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         role: SocketAttachment["role"],
       ) {
         const sockets = yield* state.getWebSockets();
-        const current: Array<Cloudflare.DurableWebSocket> = [];
+        const current: Array<Cloudflare.WebSocket> = [];
         for (const socket of sockets) {
           const attachment = socket.deserializeAttachment<SocketAttachment>();
           if (attachment?.role !== role) continue;
@@ -474,7 +596,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         snapshot: SessionFabricSnapshot,
         meta: MetaRow,
       ) {
-        const eligible: Array<Cloudflare.DurableWebSocket> = [];
+        const eligible: Array<Cloudflare.WebSocket> = [];
         for (const runner of yield* socketsForRole("runner")) {
           const attachment = runner.deserializeAttachment<SocketAttachment>();
           if (
@@ -532,9 +654,26 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         }
       });
 
+      const armMaintenanceAlarm = Effect.fn("session_fabric.arm_maintenance_alarm")(function* () {
+        const cursor = yield* sql.exec<{
+          readonly directory_due_at: number | null;
+          readonly wake_due_at: number | null;
+        }>("SELECT directory_due_at, wake_due_at FROM session_maintenance WHERE id = 1");
+        const maintenance = yield* cursor.one();
+        const dueAt = nextSessionFabricMaintenanceDueAt({
+          directoryDueAt: maintenance.directory_due_at,
+          wakeDueAt: maintenance.wake_due_at,
+        });
+        if (dueAt !== null) yield* state.storage.setAlarm(dueAt);
+      });
+
       const scheduleDirectoryUpdate = Effect.fn("session_fabric.schedule_directory_update")(
         function* () {
-          yield* state.storage.setAlarm((yield* Clock.currentTimeMillis) + 2_000).pipe(
+          const dueAt = (yield* Clock.currentTimeMillis) + 2_000;
+          yield* sql
+            .exec("UPDATE session_maintenance SET directory_due_at = ? WHERE id = 1", dueAt)
+            .pipe(Effect.asVoid);
+          yield* armMaintenanceAlarm().pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("session fabric directory update could not be scheduled", {
                 cause,
@@ -610,7 +749,179 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             receipt.commandId,
           )
           .pipe(Effect.asVoid);
+        if (receipt.status === "accepted" || receipt.status === "rejected") {
+          yield* sql
+            .exec(
+              "UPDATE session_command_wakes SET status = ?, next_attempt_at = NULL, detail = ?, updated_at = ? WHERE command_id = ?",
+              receipt.status === "accepted" ? "completed" : "failed",
+              receipt.detail,
+              receipt.updatedAt,
+              receipt.commandId,
+            )
+            .pipe(Effect.asVoid);
+        }
         yield* broadcast("client", { type: "command.receipt", receipt });
+      });
+
+      const readWake = Effect.fn("session_fabric.read_wake")(function* (commandId: string) {
+        const cursor = yield* sql.exec<WakeRow>(
+          "SELECT command_id, scaffold_session_id, expected_lifecycle_epoch, target_lifecycle_epoch, actor_id, status, attempt_count, next_attempt_at, detail, updated_at FROM session_command_wakes WHERE command_id = ? LIMIT 1",
+          commandId,
+        );
+        return (yield* cursor.toArray()).at(0);
+      });
+
+      const readSharedWake = Effect.fn("session_fabric.read_shared_wake")(function* (
+        scaffoldSessionId: string,
+        expectedLifecycleEpoch: number,
+      ) {
+        const cursor = yield* sql.exec<WakeRow>(
+          "SELECT command_id, scaffold_session_id, expected_lifecycle_epoch, target_lifecycle_epoch, actor_id, status, attempt_count, next_attempt_at, detail, updated_at FROM session_command_wakes WHERE scaffold_session_id = ? AND expected_lifecycle_epoch = ? AND status IN ('pending', 'retrying', 'joining', 'awaiting_snapshot', 'ready') ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'retrying' THEN 1 WHEN 'awaiting_snapshot' THEN 2 WHEN 'ready' THEN 3 ELSE 4 END, rowid ASC LIMIT 1",
+          scaffoldSessionId,
+          expectedLifecycleEpoch,
+        );
+        return (yield* cursor.toArray()).at(0);
+      });
+
+      const scheduleWakeRetry = Effect.fn("session_fabric.schedule_wake_retry")(function* (
+        dueAt: number,
+      ) {
+        yield* sql
+          .exec(
+            "UPDATE session_maintenance SET wake_due_at = CASE WHEN wake_due_at IS NULL OR wake_due_at > ? THEN ? ELSE wake_due_at END WHERE id = 1",
+            dueAt,
+            dueAt,
+          )
+          .pipe(Effect.asVoid);
+        yield* armMaintenanceAlarm();
+      });
+
+      const failWake = Effect.fn("session_fabric.fail_wake")(function* (
+        row: WakeRow,
+        detail: string,
+      ) {
+        const commandCursor = yield* sql.exec<CommandRow>(
+          "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id IN (SELECT command_id FROM session_command_wakes WHERE scaffold_session_id = ? AND expected_lifecycle_epoch = ? AND status IN ('pending', 'retrying', 'joining', 'awaiting_snapshot', 'ready')) ORDER BY rowid ASC",
+          row.scaffold_session_id,
+          row.expected_lifecycle_epoch,
+        );
+        for (const commandRow of yield* commandCursor.toArray()) {
+          if (!shouldReplayCommand(commandRow.status)) continue;
+          const command = decodeCommand(commandRow.payload_json);
+          yield* storeReceipt({
+            sessionId: command.sessionId,
+            commandId: command.commandId,
+            status: "rejected",
+            resultSequence: null,
+            detail,
+            updatedAt: yield* currentIso,
+          });
+        }
+      });
+
+      const requestScaffoldWake = Effect.fn("session_fabric.request_scaffold_wake")(function* (
+        commandId: string,
+      ) {
+        const row = yield* readWake(commandId);
+        if (row === undefined || !scaffoldWakeRequestsAuthority(row.status)) return;
+        const commandCursor = yield* sql.exec<CommandRow>(
+          "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
+          row.command_id,
+        );
+        const commandRow = (yield* commandCursor.toArray()).at(0);
+        if (commandRow === undefined || !shouldReplayCommand(commandRow.status)) return;
+        const command = decodeCommand(commandRow.payload_json);
+        const attemptCount = row.attempt_count + 1;
+        const result = yield* Effect.promise(() =>
+          wakeScaffoldSession(wakeAuthorityConfig, {
+            fabricSessionId: command.sessionId,
+            commandId: row.command_id,
+            scaffoldSessionId: row.scaffold_session_id,
+            expectedLifecycleEpoch: row.expected_lifecycle_epoch,
+            actorId: row.actor_id,
+          }),
+        );
+        const updatedAt = yield* currentIso;
+        if (result.ok) {
+          const targetLifecycleEpoch = result.response.targetLifecycleEpoch;
+          const nextAttemptAt = scaffoldWakeHasAttemptsRemaining(attemptCount)
+            ? (yield* Clock.currentTimeMillis) + scaffoldWakeRetryDelayMs(attemptCount)
+            : null;
+          yield* sql
+            .exec(
+              "UPDATE session_command_wakes SET target_lifecycle_epoch = ?, status = 'awaiting_snapshot', attempt_count = ?, next_attempt_at = ?, detail = NULL, updated_at = ? WHERE command_id = ? AND status IN ('pending', 'retrying', 'awaiting_snapshot')",
+              targetLifecycleEpoch,
+              attemptCount,
+              nextAttemptAt,
+              updatedAt,
+              row.command_id,
+            )
+            .pipe(Effect.asVoid);
+          yield* sql
+            .exec(
+              "UPDATE session_command_wakes SET target_lifecycle_epoch = ?, status = 'awaiting_snapshot', attempt_count = ?, next_attempt_at = NULL, detail = NULL, updated_at = ? WHERE scaffold_session_id = ? AND expected_lifecycle_epoch = ? AND status = 'joining'",
+              targetLifecycleEpoch,
+              attemptCount,
+              updatedAt,
+              row.scaffold_session_id,
+              row.expected_lifecycle_epoch,
+            )
+            .pipe(Effect.asVoid);
+          const snapshot = yield* readSnapshot();
+          const meta = yield* readMeta();
+          if (
+            snapshot !== null &&
+            snapshotProvesScaffoldWakeTarget({
+              wakeFabricSessionId: command.sessionId,
+              wakeScaffoldSessionId: row.scaffold_session_id,
+              wakeTargetLifecycleEpoch: targetLifecycleEpoch,
+              snapshotFabricSessionId: snapshot.session.sessionId,
+              snapshotEnvironmentKind: snapshot.session.location.environmentKind,
+              snapshotScaffoldSessionId: snapshot.session.location.scaffoldSessionId,
+              snapshotLifecycleEpoch: snapshot.session.location.scaffoldLifecycleEpoch,
+              runnerGeneration: meta.runner_generation,
+            })
+          ) {
+            yield* sql
+              .exec(
+                "UPDATE session_command_wakes SET status = 'ready', next_attempt_at = NULL, detail = NULL, updated_at = ? WHERE scaffold_session_id = ? AND expected_lifecycle_epoch = ? AND status = 'awaiting_snapshot'",
+                updatedAt,
+                row.scaffold_session_id,
+                row.expected_lifecycle_epoch,
+              )
+              .pipe(Effect.asVoid);
+            yield* dispatchPendingCommands();
+            return;
+          }
+          if (nextAttemptAt !== null) {
+            yield* scheduleWakeRetry(nextAttemptAt);
+            return;
+          }
+          yield* failWake(
+            row,
+            `Scaffold runner did not publish lifecycle epoch ${targetLifecycleEpoch} after ${SESSION_FABRIC_WAKE_MAX_ATTEMPTS} wake attempts.`,
+          );
+          return;
+        }
+        if (
+          result.classification === "retryable" &&
+          scaffoldWakeHasAttemptsRemaining(attemptCount)
+        ) {
+          const dueAt = (yield* Clock.currentTimeMillis) + scaffoldWakeRetryDelayMs(attemptCount);
+          yield* sql
+            .exec(
+              "UPDATE session_command_wakes SET status = CASE WHEN status = 'awaiting_snapshot' THEN status ELSE 'retrying' END, attempt_count = ?, next_attempt_at = ?, detail = ?, updated_at = ? WHERE command_id = ?",
+              attemptCount,
+              dueAt,
+              result.message,
+              updatedAt,
+              row.command_id,
+            )
+            .pipe(Effect.asVoid);
+          yield* scheduleWakeRetry(dueAt);
+          return;
+        }
+        yield* failWake(row, result.message);
       });
 
       const rejectPendingCommands = Effect.fn("session_fabric.reject_pending_commands")(function* (
@@ -620,6 +931,8 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE status IN ('queued', 'delivered') ORDER BY rowid ASC",
         );
         for (const row of yield* cursor.toArray()) {
+          const wake = yield* readWake(row.command_id);
+          if (wake !== undefined && scaffoldWakeKeepsCommandPending(wake.status)) continue;
           const command = decodeCommand(row.payload_json);
           yield* storeReceipt({
             sessionId: command.sessionId,
@@ -648,9 +961,31 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           for (const row of yield* cursor.toArray()) {
             if (!shouldReplayCommand(row.status)) continue;
             const command = decodeCommand(row.payload_json);
+            const wake = yield* readWake(row.command_id);
+            if (
+              wake !== undefined &&
+              (wake.status !== "ready" ||
+                !snapshotProvesScaffoldWakeTarget({
+                  wakeFabricSessionId: command.sessionId,
+                  wakeScaffoldSessionId: wake.scaffold_session_id,
+                  wakeTargetLifecycleEpoch: wake.target_lifecycle_epoch,
+                  snapshotFabricSessionId: snapshot.session.sessionId,
+                  snapshotEnvironmentKind: snapshot.session.location.environmentKind,
+                  snapshotScaffoldSessionId: snapshot.session.location.scaffoldSessionId,
+                  snapshotLifecycleEpoch: snapshot.session.location.scaffoldLifecycleEpoch,
+                  runnerGeneration: meta.runner_generation,
+                }))
+            ) {
+              continue;
+            }
             const frame = encodeFrame({ type: "command.dispatch", command });
             const sent = yield* runner.send(frame).pipe(Effect.result);
             if (sent._tag === "Failure") {
+              if (wake !== undefined && scaffoldWakeKeepsCommandPending(wake.status)) {
+                yield* setRunnerState("offline");
+                yield* rejectPendingCommands("Session runner disconnected");
+                break;
+              }
               yield* storeReceipt({
                 sessionId: command.sessionId,
                 commandId: command.commandId,
@@ -677,7 +1012,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       );
 
       const synchronizeClient = Effect.fn("session_fabric.synchronize_client")(function* (
-        socket: Cloudflare.DurableWebSocket,
+        socket: Cloudflare.WebSocket,
         sessionId: SessionFabricSessionId,
         afterEventSequence: number,
         capability: SessionFabricCapabilityClaims | null,
@@ -721,7 +1056,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       });
 
       const handleRunnerHello = Effect.fn("session_fabric.handle_runner_hello")(function* (
-        socket: Cloudflare.DurableWebSocket,
+        socket: Cloudflare.WebSocket,
         expectedSessionId: string,
         frame: Extract<SessionFabricClientFrame, { type: "runner.hello" }>,
       ) {
@@ -822,7 +1157,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       });
 
       const handleClientHello = Effect.fn("session_fabric.handle_client_hello")(function* (
-        socket: Cloudflare.DurableWebSocket,
+        socket: Cloudflare.WebSocket,
         expectedSessionId: string,
         frame: Extract<SessionFabricClientFrame, { type: "client.hello" }>,
       ) {
@@ -851,16 +1186,18 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           runnerGeneration: null,
           capability: attachment.capability,
         });
-        yield* synchronizeClient(
-          socket,
-          frame.hello.sessionId,
-          frame.hello.afterEventSequence,
-          attachment.capability,
-        );
+        if (clientHelloShouldSynchronize(frame.hello)) {
+          yield* synchronizeClient(
+            socket,
+            frame.hello.sessionId,
+            frame.hello.afterEventSequence,
+            attachment.capability,
+          );
+        }
       });
 
       const handlePublishedEvent = Effect.fn("session_fabric.handle_published_event")(function* (
-        socket: Cloudflare.DurableWebSocket,
+        socket: Cloudflare.WebSocket,
         attachment: SocketAttachment,
         published: SessionFabricPublishedEvent,
       ) {
@@ -910,7 +1247,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         if (decision !== "accepted") return;
 
         const encodedPublished = encodePublishedEvent(published);
-        const sequence = state.storage.transactionSync(() => {
+        const sequence = state.raw.storage.transactionSync(() => {
           sql.raw.exec(
             "INSERT INTO session_events (event_id, occurred_at, payload_json) VALUES (?, ?, ?)",
             published.event.eventId,
@@ -991,7 +1328,29 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           ) {
             return;
           }
-          const encodedSnapshot = encodeSnapshot(published.snapshot);
+          const currentSnapshot =
+            meta.snapshot_json === null ? null : decodeSnapshot(meta.snapshot_json);
+          if (
+            !snapshotAuthorityCanAdvance({
+              currentSnapshotSequence: meta.snapshot_sequence,
+              currentUpdatedAt: currentSnapshot?.session.updatedAt ?? null,
+              incomingSnapshotSequence: published.snapshot.session.cursor.snapshotSequence,
+              incomingUpdatedAt: published.snapshot.session.updatedAt,
+            })
+          ) {
+            return;
+          }
+          const normalizedSnapshot = normalizeSnapshotToRelayCursor(
+            published.snapshot,
+            yield* currentEventSequence(),
+            currentSnapshot === null
+              ? 0
+              : Math.min(
+                  currentSnapshot.session.cursor.eventSequence,
+                  currentSnapshot.compactedThroughEventSequence,
+                ),
+          );
+          const encodedSnapshot = encodeSnapshot(normalizedSnapshot);
           yield* sql
             .exec(
               "UPDATE session_meta SET snapshot_json = ?, snapshot_sequence = ? WHERE id = 1",
@@ -999,11 +1358,44 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
               published.snapshot.session.cursor.snapshotSequence,
             )
             .pipe(Effect.asVoid);
+          const wakeCursor = yield* sql.exec<WakeRow>(
+            "SELECT command_id, scaffold_session_id, expected_lifecycle_epoch, target_lifecycle_epoch, actor_id, status, attempt_count, next_attempt_at, detail, updated_at FROM session_command_wakes WHERE status = 'awaiting_snapshot' ORDER BY rowid ASC",
+          );
+          for (const wake of yield* wakeCursor.toArray()) {
+            const commandCursor = yield* sql.exec<CommandRow>(
+              "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
+              wake.command_id,
+            );
+            const commandRow = (yield* commandCursor.toArray()).at(0);
+            if (commandRow === undefined) continue;
+            const command = decodeCommand(commandRow.payload_json);
+            if (
+              snapshotProvesScaffoldWakeTarget({
+                wakeFabricSessionId: command.sessionId,
+                wakeScaffoldSessionId: wake.scaffold_session_id,
+                wakeTargetLifecycleEpoch: wake.target_lifecycle_epoch,
+                snapshotFabricSessionId: normalizedSnapshot.session.sessionId,
+                snapshotEnvironmentKind: normalizedSnapshot.session.location.environmentKind,
+                snapshotScaffoldSessionId: normalizedSnapshot.session.location.scaffoldSessionId,
+                snapshotLifecycleEpoch: normalizedSnapshot.session.location.scaffoldLifecycleEpoch,
+                runnerGeneration: meta.runner_generation,
+              })
+            ) {
+              yield* sql
+                .exec(
+                  "UPDATE session_command_wakes SET status = 'ready', next_attempt_at = NULL, detail = NULL, updated_at = ? WHERE command_id = ? AND status = 'awaiting_snapshot'",
+                  yield* currentIso,
+                  wake.command_id,
+                )
+                .pipe(Effect.asVoid);
+            }
+          }
           yield* scheduleDirectoryUpdate();
           yield* broadcast("client", {
             type: "session.snapshot",
-            snapshot: published.snapshot,
+            snapshot: normalizedSnapshot,
           });
+          yield* dispatchPendingCommands();
         },
       );
 
@@ -1041,7 +1433,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       );
 
       const handleCommand = Effect.fn("session_fabric.handle_command")(function* (
-        socket: Cloudflare.DurableWebSocket,
+        socket: Cloudflare.WebSocket,
         attachment: SocketAttachment,
         command: SessionFabricCommand,
       ) {
@@ -1058,27 +1450,52 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         const localAuthority = completeLocalAuthority(meta);
         const commandAuthorized =
           snapshot !== null &&
+          snapshot.session.publication === "public" &&
           (verifierConfig?.mode === "disabled" ||
             (attachment.capability !== null &&
               (isLocalSessionFabricCapability(attachment.capability)
                 ? localControllerMatchesPinnedAuthority({
                     claims: attachment.capability,
                     sessionId: command.sessionId,
+                    publication: snapshot.session.publication,
                     location: snapshot.session.location,
                     pinned: localAuthority,
                   })
                 : capabilityCanControlSession({
                     claims: attachment.capability,
                     sessionId: command.sessionId,
+                    publication: snapshot.session.publication,
                     location: snapshot.session.location,
                   }))));
+        const scaffoldWakeController =
+          snapshot !== null &&
+          attachment.capability !== null &&
+          scaffoldControllerMatchesSnapshotIdentity({
+            claims: attachment.capability,
+            sessionId: command.sessionId,
+            publication: snapshot.session.publication,
+            location: snapshot.session.location,
+          }) &&
+          attachment.capability.role === "controller" &&
+          !isLocalSessionFabricCapability(attachment.capability)
+            ? attachment.capability
+            : null;
+        const sharedWake =
+          scaffoldWakeController !== null &&
+          snapshot !== null &&
+          snapshot.session.location.scaffoldSessionId !== null
+            ? yield* readSharedWake(
+                snapshot.session.location.scaffoldSessionId,
+                scaffoldWakeController.scaffoldLifecycleEpoch,
+              )
+            : undefined;
         const runners = snapshot === null ? [] : yield* eligibleRunners(snapshot, meta);
         const existingCursor = yield* sql.exec<CommandRow>(
           "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
           command.commandId,
         );
         const existing = (yield* existingCursor.toArray()).at(0);
-        if (commandAuthorized && existing !== undefined) {
+        if ((commandAuthorized || scaffoldWakeController !== null) && existing !== undefined) {
           yield* socket.send(
             encodeFrame({
               type: "command.receipt",
@@ -1094,11 +1511,26 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           );
           return;
         }
-        const authorizationDecision = decideAuthorizedCommandSubmit({
-          controllerMatchesSession: commandAuthorized,
-          runnerState: meta.runner_state,
-          eligibleRunnerCount: runners.length,
-        });
+        const shouldWake =
+          snapshot !== null &&
+          offlineScaffoldCommandCanWake({
+            controllerMatchesSnapshotIdentity: scaffoldWakeController !== null,
+            runnerState: meta.runner_state,
+            eligibleRunnerCount: runners.length,
+            wakeAlreadyActive: sharedWake !== undefined,
+            publication: snapshot.session.publication,
+            environmentKind: snapshot.session.location.environmentKind,
+            scaffoldSessionId: snapshot.session.location.scaffoldSessionId,
+            controllerLifecycleEpoch: scaffoldWakeController?.scaffoldLifecycleEpoch,
+            wakeAuthorityConfigured: wakeAuthorityConfig !== null,
+          });
+        const authorizationDecision = shouldWake
+          ? ({ type: "accepted" } as const)
+          : decideAuthorizedCommandSubmit({
+              controllerMatchesSession: commandAuthorized,
+              runnerState: meta.runner_state,
+              eligibleRunnerCount: runners.length,
+            });
         if (authorizationDecision.type === "rejected") {
           const updatedAt = yield* currentIso;
           const receipt = {
@@ -1109,7 +1541,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             detail: authorizationDecision.detail,
             updatedAt,
           };
-          if (commandAuthorized) {
+          if (commandAuthorized || scaffoldWakeController !== null) {
             yield* sql
               .exec(
                 "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at) VALUES (?, ?, 'rejected', NULL, ?, ?)",
@@ -1125,14 +1557,67 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         }
         const decision = decideCommandSubmit(existing);
         if (decision.type === "accepted") {
-          yield* sql
-            .exec(
-              "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at) VALUES (?, ?, 'queued', NULL, NULL, ?)",
-              command.commandId,
-              encodeCommand(command),
-              command.submittedAt,
-            )
-            .pipe(Effect.asVoid);
+          if (
+            shouldWake &&
+            snapshot !== null &&
+            snapshot.session.location.scaffoldSessionId !== null &&
+            scaffoldWakeController !== null
+          ) {
+            const wakeDueAt = yield* Clock.currentTimeMillis;
+            const joinedStatus =
+              sharedWake === undefined
+                ? "joining"
+                : scaffoldWakeFollowerStatus({
+                    leaderStatus: sharedWake.status,
+                    targetLifecycleEpoch: sharedWake.target_lifecycle_epoch,
+                  });
+            state.raw.storage.transactionSync(() => {
+              sql.raw.exec(
+                "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at) VALUES (?, ?, 'queued', NULL, NULL, ?)",
+                command.commandId,
+                encodeCommand(command),
+                command.submittedAt,
+              );
+              if (sharedWake === undefined) {
+                sql.raw.exec(
+                  "INSERT INTO session_command_wakes (command_id, scaffold_session_id, expected_lifecycle_epoch, target_lifecycle_epoch, actor_id, status, attempt_count, next_attempt_at, detail, updated_at) VALUES (?, ?, ?, NULL, ?, 'pending', 0, ?, NULL, ?)",
+                  command.commandId,
+                  snapshot.session.location.scaffoldSessionId,
+                  scaffoldWakeController.scaffoldLifecycleEpoch,
+                  scaffoldWakeController.actorId,
+                  wakeDueAt,
+                  command.submittedAt,
+                );
+                sql.raw.exec(
+                  "UPDATE session_maintenance SET wake_due_at = CASE WHEN wake_due_at IS NULL OR wake_due_at > ? THEN ? ELSE wake_due_at END WHERE id = 1",
+                  wakeDueAt,
+                  wakeDueAt,
+                );
+              } else {
+                sql.raw.exec(
+                  "INSERT INTO session_command_wakes (command_id, scaffold_session_id, expected_lifecycle_epoch, target_lifecycle_epoch, actor_id, status, attempt_count, next_attempt_at, detail, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+                  command.commandId,
+                  sharedWake.scaffold_session_id,
+                  sharedWake.expected_lifecycle_epoch,
+                  sharedWake.target_lifecycle_epoch,
+                  scaffoldWakeController.actorId,
+                  joinedStatus,
+                  sharedWake.attempt_count,
+                  command.submittedAt,
+                );
+              }
+            });
+            if (sharedWake === undefined) yield* armMaintenanceAlarm();
+          } else {
+            yield* sql
+              .exec(
+                "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at) VALUES (?, ?, 'queued', NULL, NULL, ?)",
+                command.commandId,
+                encodeCommand(command),
+                command.submittedAt,
+              )
+              .pipe(Effect.asVoid);
+          }
         }
         const row =
           decision.type === "duplicate"
@@ -1154,11 +1639,12 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             updatedAt: row.updated_at,
           }),
         });
-        yield* dispatchPendingCommands();
+        if (shouldWake && sharedWake === undefined) yield* requestScaffoldWake(command.commandId);
+        else yield* dispatchPendingCommands();
       });
 
       const handleFrame = Effect.fn("session_fabric.handle_frame")(function* (
-        socket: Cloudflare.DurableWebSocket,
+        socket: Cloudflare.WebSocket,
         frame: SessionFabricClientFrame,
       ) {
         const attachment = socket.deserializeAttachment<SocketAttachment>();
@@ -1195,11 +1681,65 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         }
       });
 
+      const rearmMaintenance = Effect.gen(function* () {
+        const nextCursor = yield* sql.exec<{ readonly next_attempt_at: number | null }>(
+          "SELECT MIN(next_attempt_at) AS next_attempt_at FROM session_command_wakes WHERE status IN ('pending', 'retrying', 'awaiting_snapshot') AND next_attempt_at IS NOT NULL",
+        );
+        const nextAttemptAt = (yield* nextCursor.one()).next_attempt_at;
+        yield* sql
+          .exec("UPDATE session_maintenance SET wake_due_at = ? WHERE id = 1", nextAttemptAt)
+          .pipe(Effect.asVoid);
+        yield* armMaintenanceAlarm();
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("session fabric maintenance could not be rearmed", { cause }),
+        ),
+      );
+
+      const runMaintenance = Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        const cursor = yield* sql.exec<{
+          readonly directory_due_at: number | null;
+          readonly wake_due_at: number | null;
+        }>("SELECT directory_due_at, wake_due_at FROM session_maintenance WHERE id = 1");
+        const maintenance = yield* cursor.one();
+        if (maintenance.directory_due_at !== null && maintenance.directory_due_at <= now) {
+          yield* sql
+            .exec("UPDATE session_maintenance SET directory_due_at = NULL WHERE id = 1")
+            .pipe(Effect.asVoid);
+          yield* updateDirectory;
+        }
+        if (maintenance.wake_due_at !== null && maintenance.wake_due_at <= now) {
+          yield* sql
+            .exec("UPDATE session_maintenance SET wake_due_at = NULL WHERE id = 1")
+            .pipe(Effect.asVoid);
+          const dueCursor = yield* sql.exec<WakeRow>(
+            "SELECT command_id, scaffold_session_id, expected_lifecycle_epoch, target_lifecycle_epoch, actor_id, status, attempt_count, next_attempt_at, detail, updated_at FROM session_command_wakes WHERE status IN ('pending', 'retrying', 'awaiting_snapshot') AND next_attempt_at IS NOT NULL AND next_attempt_at <= ? ORDER BY next_attempt_at ASC, rowid ASC",
+            now,
+          );
+          for (const wake of yield* dueCursor.toArray()) {
+            yield* requestScaffoldWake(wake.command_id).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("session fabric wake maintenance row failed", {
+                  commandId: wake.command_id,
+                  cause,
+                }),
+              ),
+            );
+          }
+        }
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("session fabric maintenance failed", { cause }),
+        ),
+        Effect.ensuring(rearmMaintenance),
+      );
+
       return {
         getSnapshot: readSnapshot,
         getEventBatch: readEvents,
         getContext: readContext,
-        alarm: () => updateDirectory,
+        alarm: () => runMaintenance,
         fetch: Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           // Durable Object fetch forwarding may preserve only the relative request
@@ -1301,7 +1841,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
               );
         }),
         webSocketMessage: Effect.fnUntraced(function* (
-          socket: Cloudflare.DurableWebSocket,
+          socket: Cloudflare.WebSocket,
           message: string | ArrayBuffer,
         ) {
           const attachment = socket.deserializeAttachment<SocketAttachment>();
@@ -1317,7 +1857,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           );
         }),
         webSocketClose: Effect.fnUntraced(function* (
-          socket: Cloudflare.DurableWebSocket,
+          socket: Cloudflare.WebSocket,
           code: number,
           reason: string,
           _wasClean: boolean,

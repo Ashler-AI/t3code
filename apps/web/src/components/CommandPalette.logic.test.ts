@@ -310,10 +310,59 @@ describe("Ashler command palette root", () => {
   });
 });
 
-describe("runScaffoldDraftLaunch", () => {
-  it("uses one resolved model snapshot for the draft controls and Scaffold grant", () => {
+describe("add project environment availability", () => {
+  it("defaults to the first connected environment and describes unavailable choices", () => {
     expect(commandPaletteSource).toMatch(
-      /let launchModelSelection = defaultScaffoldModelSelection;[\s\S]*?launchModelSelection =[\s\S]*?resolveScaffoldDraftModelSelection\(providers, sourceModelSelection\)[\s\S]*?setModelSelection\(draftId, launchModelSelection,[\s\S]*?scaffoldCreateParametersForModelSelection\(launchModelSelection\)/,
+      /isConnected: canCreateProjectInEnvironment\(environment\.connection\.phase\)[\s\S]*?status: connectionStatusText\(environment\.connection\)[\s\S]*?addProjectEnvironmentOptions\.find\(\(option\) => option\.isConnected\)\?\.environmentId/,
+    );
+    expect(commandPaletteSource).toMatch(
+      /description: option\.isConnected[\s\S]*?: option\.status,[\s\S]*?disabled: !option\.isConnected/,
+    );
+  });
+
+  it("keeps disconnected environments from entering or executing add-project flows", () => {
+    expect(commandPaletteSource).toMatch(
+      /const startAddProjectSourceSelection = useCallback\([\s\S]*?if \(!canCreateProjectInEnvironment\(environment\?\.connection\.phase\)\)[\s\S]*?title: "Environment unavailable"[\s\S]*?return;/,
+    );
+    expect(commandPaletteSource).toMatch(
+      /const handleAddProjectForEnvironment = useCallback\([\s\S]*?if \(!canCreateProjectInEnvironment\(environment\?\.connection\.phase\)\)[\s\S]*?title: "Environment unavailable"[\s\S]*?return;/,
+    );
+    expect(commandPaletteSource).toMatch(
+      /async function submitAddProjectCloneFlow[\s\S]*?if \(!canCreateProjectInEnvironment\(browseEnvironment\?\.connection\.phase\)\)[\s\S]*?title: "Environment unavailable"[\s\S]*?return;/,
+    );
+  });
+
+  it("disables browse and clone submission while the selected environment is disconnected", () => {
+    expect(commandPaletteSource).toMatch(
+      /const canSubmitBrowsePath =[\s\S]*?canCreateProjectInEnvironment\(browseEnvironment\?\.connection\.phase\)/,
+    );
+    expect(commandPaletteSource).toMatch(
+      /const canSubmitRemoteProjectFlow =[\s\S]*?canCreateProjectInEnvironment\(browseEnvironment\?\.connection\.phase\)/,
+    );
+    expect(commandPaletteSource).toMatch(
+      /disabled=\{[\s\S]*?!canCreateProjectInEnvironment\(browseEnvironment\?\.connection\.phase\)[\s\S]*?relativePathNeedsActiveProject/,
+    );
+  });
+});
+
+describe("new session targets", () => {
+  it("starts the preferred local project immediately instead of opening another project submenu", () => {
+    expect(commandPaletteSource).toMatch(
+      /kind: "action",\s*value: "action:new-session:local"[\s\S]*?disabled: scaffoldSourceProject === null[\s\S]*?run: async \(\) => \{[\s\S]*?handleNewThread\([\s\S]*?scopeProjectRef\(scaffoldSourceProject\.environmentId, scaffoldSourceProject\.id\)[\s\S]*?forceNew: true/,
+    );
+  });
+});
+
+describe("runScaffoldDraftLaunch", () => {
+  it("snapshots the source composer before draft creation and reuses its translated selection", () => {
+    expect(commandPaletteSource).toMatch(
+      /const sourceModelSelection =[\s\S]*?composerHandleRef\?\.current\?\.getSendContext\(\)\.selectedModelSelection[\s\S]*?const launchModelSelection =[\s\S]*?resolveScaffoldDraftModelSelection\(providers, sourceModelSelection\)[\s\S]*?runScaffoldLaunchFlight\([\s\S]*?setModelSelection\(draftId, launchModelSelection,[\s\S]*?scaffoldCreateParametersForModelSelection\(launchModelSelection\)/,
+    );
+  });
+
+  it("uses the preferred local picker member or the first available local project as the Scaffold source", () => {
+    expect(commandPaletteSource).toMatch(
+      /const scaffoldSourceProject =[\s\S]*?projectPickerEntries\.find\(\(entry\) => entry\.isPreferred\)\?\.targetProject \?\?[\s\S]*?projectPickerEntries\[0\]\?\.targetProject \?\?[\s\S]*?hasContextualProject: scaffoldSourceProject !== null[\s\S]*?handleNewThread\(scaffoldSourceProjectRef,[\s\S]*?sourceEnvironmentId: scaffoldSourceProject\.environmentId,[\s\S]*?sourceProjectId: scaffoldSourceProject\.id/,
     );
   });
 

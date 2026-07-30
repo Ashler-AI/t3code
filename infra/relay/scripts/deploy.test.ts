@@ -216,6 +216,23 @@ describe("release workflow tracing config propagation", () => {
       expect(workflow).toContain('cat "$config_path" >> "$GITHUB_ENV"');
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("normalizes packaged Ashler endpoints with the shared HTTPS-origin policy", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workflowPath = yield* path.fromFileUrl(
+        new URL("../../../.github/workflows/release.yml", import.meta.url),
+      );
+      const workflow = yield* fileSystem.readFileString(workflowPath);
+
+      expect(workflow).toContain(
+        'import { normalizeSecureRelayUrl } from "./packages/shared/src/relayUrl.ts";',
+      );
+      expect(workflow).toContain('echo "session_fabric_relay_url=${normalized_public_origins[0]}"');
+      expect(workflow).not.toContain("const isHttpUrl = (value)");
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });
 
 describe("publicConfigFromOutput", () => {

@@ -310,13 +310,14 @@ export function makeRelaySessionFabricUiSessionSource(
     } satisfies SessionFabricControllerBinding;
   });
 
-  const makeHello = (afterEventSequence: number) => ({
+  const makeHello = (afterEventSequence: number, synchronize = true) => ({
     type: "client.hello" as const,
     hello: {
       protocolVersion: SESSION_FABRIC_PROTOCOL_VERSION,
       sessionId: options.sessionId,
       clientId: options.clientId,
       afterEventSequence,
+      ...(synchronize ? {} : { synchronize: false as const }),
       connectedAt: now(),
     },
   });
@@ -337,7 +338,9 @@ export function makeRelaySessionFabricUiSessionSource(
       Effect.gen(function* () {
         const subscription = yield* input.makeInput;
         const output = yield* Queue.unbounded<A>();
-        const fabricSequence = yield* Ref.make(0);
+        const fabricSequence = yield* Ref.make(
+          latestKnownSnapshot?.session.cursor.eventSequence ?? 0,
+        );
         const localSequence = yield* Ref.make(subscription.afterSequence ?? 0);
         const requestCompletionMarker = subscription.requestCompletionMarker === true;
         const project = input.makeProject();
@@ -638,7 +641,7 @@ export function makeRelaySessionFabricUiSessionSource(
               {
                 onOpen: Effect.gen(function* () {
                   opened = true;
-                  yield* write(encodeClientFrame(makeHello(0)));
+                  yield* write(encodeClientFrame(makeHello(0, false)));
                   yield* write(
                     encodeClientFrame({
                       type: "command.submit",

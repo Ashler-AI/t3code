@@ -14,8 +14,12 @@ import {
   ConnectionBlockedError,
   ConnectionTransientError,
   RelayConnectionTarget,
+  ScaffoldConnectionTarget,
 } from "../connection/model.ts";
-import { prepareManagedScaffoldConnection } from "./managedConnection.ts";
+import {
+  prepareManagedScaffoldConnection,
+  scaffoldTargetFromBinding,
+} from "./managedConnection.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("env_scaffold_1");
 const binding = new ScaffoldEnvironmentBinding({
@@ -33,6 +37,15 @@ const binding = new ScaffoldEnvironmentBinding({
 });
 
 describe("prepareManagedScaffoldConnection", () => {
+  it("preserves safe Scaffold links without persisting transport authority", () => {
+    const target = scaffoldTargetFromBinding(binding, "Scaffold staging");
+
+    expect(target).toBeInstanceOf(ScaffoldConnectionTarget);
+    expect(target.links).toEqual(binding.links);
+    expect(JSON.stringify(target)).not.toContain("bootstrap");
+    expect(JSON.stringify(target)).not.toContain("attachCredential");
+  });
+
   it.effect("re-prepares once when the direct descriptor rejects a stale attach grant", () =>
     Effect.gen(function* () {
       let authorizeCount = 0;

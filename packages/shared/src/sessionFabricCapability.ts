@@ -347,27 +347,23 @@ export function capabilityCanReadSession(
 export function capabilityCanControlSession(input: {
   readonly claims: SessionFabricCapabilityClaims;
   readonly sessionId: SessionFabricSessionId;
+  readonly publication: SessionFabricSnapshot["session"]["publication"];
   readonly location: SessionFabricExecutionLocation;
-  readonly localAuthority?: {
-    readonly actorId: string;
-  };
 }): boolean {
-  const { claims, sessionId, location } = input;
-  if (claims.role === "controller" && isLocalSessionFabricCapability(claims)) {
+  const { claims, sessionId, publication, location } = input;
+  // Controller actor identity is audit provenance, not execution ownership.
+  // The signed command scope and exact public session binding authorize control;
+  // runner capabilities independently fence the sole execution owner.
+  if (publication !== "public" || claims.role !== "controller") return false;
+  if (isLocalSessionFabricCapability(claims)) {
     return (
-      input.localAuthority !== undefined &&
       isPublicLocalLocation(location) &&
-      localCapabilityMatchesAuthority({
-        claims,
-        sessionId,
-        environmentId: location.environmentId,
-        threadId: location.threadId,
-        actorId: input.localAuthority.actorId,
-      })
+      claims.fabricSessionId === sessionId &&
+      claims.environmentId === location.environmentId &&
+      claims.threadId === location.threadId
     );
   }
   return (
-    claims.role === "controller" &&
     isPublicScaffoldLocation(location) &&
     claims.fabricSessionId === sessionId &&
     claims.scaffoldSessionId === location.scaffoldSessionId &&

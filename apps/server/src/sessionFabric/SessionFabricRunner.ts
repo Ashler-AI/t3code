@@ -37,6 +37,7 @@ import * as Clock from "effect/Clock";
 import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -54,6 +55,10 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerConfig from "../config.ts";
 import { recordSessionFabricRunnerState } from "../observability/Metrics.ts";
 import { normalizeDispatchCommand } from "../orchestration/Normalizer.ts";
+import {
+  projectActivityEvent,
+  projectThreadDetailSnapshot,
+} from "../orchestration/ActivityPayloadProjection.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -124,6 +129,9 @@ const decodeServerFrame = Schema.decodeUnknownEffect(
 
 const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
 
+export const SESSION_FABRIC_SNAPSHOT_REFRESH_WINDOW_MS = 2_000;
+const SESSION_FABRIC_SNAPSHOT_REFRESH_MAX_BATCH = 512;
+
 const optionValue = <A>(value: Option.Option<A>): A | null =>
   Option.isSome(value) ? value.value : null;
 
@@ -180,7 +188,13 @@ export function resolveSessionFabricRunnerConfig(
     relayUrl: optionValue(config.relayUrl),
     environmentKind,
     publication: config.publication,
-    runnerGeneration: Math.max(0, config.runnerGeneration),
+    // A Scaffold lifecycle epoch is the durable execution-ownership fence.
+    // Reusing it as the runner generation prevents a process restarted after
+    // pause/resume from presenting itself as the pre-resume runner.
+    runnerGeneration:
+      environmentKind === "scaffold" && scaffoldLifecycleEpoch !== null
+        ? scaffoldLifecycleEpoch
+        : Math.max(0, config.runnerGeneration),
     overrideSessionId:
       overrideSessionId === null ? null : SessionFabricSessionIdSchema.make(overrideSessionId),
     overrideThreadId: overrideThreadId === null ? null : (overrideThreadId as ThreadId),
@@ -203,7 +217,7 @@ export async function requestLocalSessionFabricRunnerCapability(input: {
   readonly fabricSessionId: SessionFabricSessionId;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
-  readonly runnerId: typeof SessionFabricRunnerId.Type;
+  readonly runnerId: SessionFabricRunnerId;
   readonly fetch?: typeof globalThis.fetch;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly now?: () => number;
@@ -251,10 +265,7 @@ export async function requestLocalSessionFabricRunnerCapability(input: {
     bindings.environmentKind !== "local" ||
     bindings.fabricSessionId !== input.fabricSessionId ||
     bindings.environmentId !== input.environmentId ||
-    bindings.threadId !== input.threadId ||
-    !("runnerId" in bindings) ||
-    bindings.runnerId !== input.runnerId ||
-    bindings.actorId.length === 0
+    bindings.threadId !== input.threadId
   ) {
     throw new Error("Scaffold returned an invalid local session fabric capability.");
   }
@@ -319,8 +330,35 @@ export function makeSessionFabricWebSocketProtocols(
     : ["t3.session-fabric.v1", `t3.session-fabric.capability.${grant.capability}`];
 }
 
-export function sessionFabricCapabilityRefreshDelayMs(expiresAt: string, now: number): number {
-  return Math.max(0, Date.parse(expiresAt) - now - 30_000);
+export function sessionFabricCapabilityRefreshDelayMs(
+  expiresAt: string,
+  now: number,
+  identity: {
+    readonly sessionId: SessionFabricSessionId;
+    readonly threadId: ThreadId;
+  },
+): number {
+  const identityKey = `${identity.sessionId}\0${identity.threadId}`;
+  let hash = 2_166_136_261;
+  for (let index = 0; index < identityKey.length; index += 1) {
+    hash = Math.imul(hash ^ identityKey.charCodeAt(index), 16_777_619) >>> 0;
+  }
+  const refreshLeadTimeMs = 30_000 + (hash % 60_001);
+  return Math.max(0, Date.parse(expiresAt) - now - refreshLeadTimeMs);
+}
+
+export function sessionFabricReconnectDelayMs(
+  consecutiveFailures: number,
+  sessionId: string,
+): number {
+  const failureCount = Math.max(1, Math.floor(consecutiveFailures));
+  const baseDelay = Math.min(24_000, 1_000 * 2 ** Math.min(5, failureCount - 1));
+  let hash = 2_166_136_261;
+  for (let index = 0; index < sessionId.length; index += 1) {
+    hash = Math.imul(hash ^ sessionId.charCodeAt(index), 16_777_619) >>> 0;
+  }
+  const jitterWindow = Math.floor(baseDelay / 4);
+  return baseDelay + (hash % (jitterWindow + 1));
 }
 
 export function orchestrationEventThreadId(event: OrchestrationEvent): ThreadId | null {
@@ -365,6 +403,7 @@ export function buildSessionFabricSnapshot(input: {
 }): SessionFabricSnapshot | null {
   const selected = shellForThread({ shell: input.shell, thread: input.detail.thread });
   if (selected === null) return null;
+  const projectedDetail = projectThreadDetailSnapshot(input.detail);
   const firstUserMessage = input.detail.thread.messages.find((message) => message.role === "user");
   const searchableText = [
     input.detail.thread.title,
@@ -405,9 +444,57 @@ export function buildSessionFabricSnapshot(input: {
       updatedAt: input.detail.thread.updatedAt,
     },
     shell: selected.shell,
-    thread: input.detail,
+    thread: projectedDetail,
     compactedThroughEventSequence: input.acknowledgedEventSequence,
   };
+}
+
+export function buildSessionFabricPublishedEvent(input: {
+  readonly sessionId: SessionFabricSessionId;
+  readonly runnerId: SessionFabricRunnerId;
+  readonly runnerGeneration: number;
+  readonly event: OrchestrationEvent;
+}): SessionFabricPublishedEvent {
+  return {
+    sessionId: input.sessionId,
+    runnerId: input.runnerId,
+    runnerGeneration: input.runnerGeneration,
+    event: projectActivityEvent(input.event),
+  };
+}
+
+export function sessionFabricCheckpointTurnCount(snapshot: SessionFabricSnapshot): number {
+  return snapshot.thread.thread.checkpoints.reduce(
+    (latest, checkpoint) => Math.max(latest, checkpoint.checkpointTurnCount),
+    0,
+  );
+}
+
+export function shouldPublishSessionFabricContext(input: {
+  readonly previousCheckpointTurnCount: number | null;
+  readonly checkpointTurnCount: number;
+  readonly force: boolean;
+}): boolean {
+  return (
+    input.force ||
+    input.previousCheckpointTurnCount === null ||
+    input.checkpointTurnCount !== input.previousCheckpointTurnCount
+  );
+}
+
+export function coalesceSessionFabricSnapshotRefreshes<E, R>(
+  stream: Stream.Stream<unknown, E, R>,
+): Stream.Stream<void, E, R> {
+  // A fixed window bounds refresh latency even while committed events keep
+  // arriving. This intentionally is not a trailing debounce, which could
+  // starve snapshots forever during a long streaming turn.
+  return stream.pipe(
+    Stream.groupedWithin(
+      SESSION_FABRIC_SNAPSHOT_REFRESH_MAX_BATCH,
+      Duration.millis(SESSION_FABRIC_SNAPSHOT_REFRESH_WINDOW_MS),
+    ),
+    Stream.map(() => undefined),
+  );
 }
 
 export function sessionFabricCommandReceipt(input: {
@@ -437,7 +524,7 @@ export function sessionFabricCommandReceipt(input: {
 
 export function buildSessionFabricContextPublication(input: {
   readonly sessionId: SessionFabricSessionId;
-  readonly runnerId: typeof SessionFabricRunnerId.Type;
+  readonly runnerId: SessionFabricRunnerId;
   readonly runnerGeneration: number;
   readonly codeDiff: string | null;
   readonly publishedAt: IsoDateTime;
@@ -575,6 +662,7 @@ export const make = Effect.gen(function* () {
           });
 
     const acknowledgedEventSequence = yield* Ref.make(0);
+    const snapshotRefreshes = yield* Queue.sliding<void>(1);
     const contextCache = yield* Ref.make<{
       readonly checkpointTurnCount: number;
       readonly codeDiff: string | null;
@@ -591,10 +679,7 @@ export const make = Effect.gen(function* () {
     const loadCodeDiff = Effect.fn("session_fabric_runner.load_code_diff")(function* (
       snapshot: SessionFabricSnapshot,
     ) {
-      const checkpointTurnCount = snapshot.thread.thread.checkpoints.reduce(
-        (latest, checkpoint) => Math.max(latest, checkpoint.checkpointTurnCount),
-        0,
-      );
+      const checkpointTurnCount = sessionFabricCheckpointTurnCount(snapshot);
       const cached = yield* Ref.get(contextCache);
       if (cached?.checkpointTurnCount === checkpointTurnCount) return cached.codeDiff;
       const codeDiff =
@@ -622,7 +707,19 @@ export const make = Effect.gen(function* () {
 
     const sendContext = Effect.fn("session_fabric_runner.send_context")(function* (
       snapshot: SessionFabricSnapshot,
+      force: boolean,
     ) {
+      const checkpointTurnCount = sessionFabricCheckpointTurnCount(snapshot);
+      const cached = yield* Ref.get(contextCache);
+      if (
+        !shouldPublishSessionFabricContext({
+          previousCheckpointTurnCount: cached?.checkpointTurnCount ?? null,
+          checkpointTurnCount,
+          force,
+        })
+      ) {
+        return;
+      }
       const published = buildSessionFabricContextPublication({
         sessionId: session.sessionId,
         runnerId,
@@ -633,38 +730,39 @@ export const make = Effect.gen(function* () {
       yield* send({ type: "session.publish-context", published });
     });
 
-    const sendSnapshot = Effect.gen(function* () {
-      const snapshot = yield* loadSnapshot(
-        session.sessionId,
-        session.threadId,
-        yield* Ref.get(acknowledgedEventSequence),
-      );
-      if (snapshot === null) return;
-      yield* send({
-        type: "session.publish-snapshot",
-        published: {
-          sessionId: session.sessionId,
-          runnerId,
-          runnerGeneration: config.runnerGeneration,
-          snapshot,
-        },
+    const sendSnapshot = (forceContext: boolean) =>
+      Effect.gen(function* () {
+        const snapshot = yield* loadSnapshot(
+          session.sessionId,
+          session.threadId,
+          yield* Ref.get(acknowledgedEventSequence),
+        );
+        if (snapshot === null) return;
+        yield* send({
+          type: "session.publish-snapshot",
+          published: {
+            sessionId: session.sessionId,
+            runnerId,
+            runnerGeneration: config.runnerGeneration,
+            snapshot,
+          },
+        });
+        yield* sendContext(snapshot, forceContext);
       });
-      yield* sendContext(snapshot);
-    });
 
     const publishEvent = (event: OrchestrationEvent) =>
       send({
         type: "session.publish-event",
-        published: {
+        published: buildSessionFabricPublishedEvent({
           sessionId: session.sessionId,
           runnerId,
           runnerGeneration: config.runnerGeneration,
           event,
-        } satisfies SessionFabricPublishedEvent,
+        }),
       });
 
     const publishLiveEvent = (event: OrchestrationEvent) =>
-      publishEvent(event).pipe(Effect.andThen(sendSnapshot));
+      publishEvent(event).pipe(Effect.andThen(Queue.offer(snapshotRefreshes, undefined)));
 
     const sendCommandReceipt = Effect.fn("session_fabric_runner.send_command_receipt")(function* (
       command: SessionFabricCommand,
@@ -742,7 +840,7 @@ export const make = Effect.gen(function* () {
           connectedAt: yield* nowIso,
         },
       });
-      yield* sendSnapshot;
+      yield* sendSnapshot(true);
       yield* engine.readEvents(0, Number.MAX_SAFE_INTEGER).pipe(
         Stream.filter((event) => orchestrationEventThreadId(event) === session.threadId),
         Stream.runForEach(publishEvent),
@@ -771,43 +869,78 @@ export const make = Effect.gen(function* () {
         ),
       { onOpen: onOpenSafe },
     );
-    const outgoing = Deferred.await(ready).pipe(
+    const outgoingEvents = Deferred.await(ready).pipe(
       Effect.andThen(
         Effect.forever(Queue.take(session.events).pipe(Effect.flatMap(publishLiveEvent))),
       ),
     );
-    const connection = Effect.raceFirst(incoming, outgoing);
+    const outgoingSnapshots = Deferred.await(ready).pipe(
+      Effect.andThen(
+        coalesceSessionFabricSnapshotRefreshes(Stream.fromQueue(snapshotRefreshes)).pipe(
+          Stream.runForEach(() => sendSnapshot(false)),
+        ),
+      ),
+    );
+    const connection = Effect.raceFirst(
+      incoming,
+      Effect.raceFirst(outgoingEvents, outgoingSnapshots),
+    );
     const currentTimeMillis = yield* Clock.currentTimeMillis;
     yield* capability === null
       ? connection
       : Effect.raceFirst(
           connection,
           Effect.sleep(
-            sessionFabricCapabilityRefreshDelayMs(capability.expiresAt, currentTimeMillis),
+            sessionFabricCapabilityRefreshDelayMs(capability.expiresAt, currentTimeMillis, {
+              sessionId: session.sessionId,
+              threadId: session.threadId,
+            }),
           ),
         );
   });
 
   const runSession = (session: SessionFabricRunnerSession) =>
-    Effect.forever(
-      recordSessionFabricRunnerState("connecting", runnerMetricAttributes).pipe(
-        Effect.andThen(runConnection(session)),
-        Effect.provide(Socket.layerWebSocketConstructorGlobal),
-        Effect.catchCause((cause) =>
-          recordSessionFabricRunnerState("connection_failed", runnerMetricAttributes).pipe(
-            Effect.andThen(
-              Effect.logWarning("session fabric runner connection failed", {
-                sessionId: session.sessionId,
-                threadId: session.threadId,
-                cause: Cause.pretty(cause),
-              }),
-            ),
-          ),
+    Effect.gen(function* () {
+      let consecutiveFailures = 0;
+      return yield* Effect.forever(
+        recordSessionFabricRunnerState("connecting", runnerMetricAttributes).pipe(
+          Effect.andThen(runConnection(session)),
+          Effect.provide(Socket.layerWebSocketConstructorGlobal),
+          Effect.matchCauseEffect({
+            onFailure: (cause) => {
+              consecutiveFailures += 1;
+              const reconnectDelayMs = sessionFabricReconnectDelayMs(
+                consecutiveFailures,
+                session.sessionId,
+              );
+              return recordSessionFabricRunnerState(
+                "connection_failed",
+                runnerMetricAttributes,
+              ).pipe(
+                Effect.andThen(
+                  Effect.logWarning("session fabric runner connection failed", {
+                    sessionId: session.sessionId,
+                    threadId: session.threadId,
+                    reconnectDelayMs,
+                    cause: Cause.pretty(cause),
+                  }),
+                ),
+                Effect.andThen(
+                  recordSessionFabricRunnerState("reconnect_wait", runnerMetricAttributes),
+                ),
+                Effect.andThen(Effect.sleep(reconnectDelayMs)),
+              );
+            },
+            onSuccess: () => {
+              consecutiveFailures = 0;
+              return recordSessionFabricRunnerState("reconnect_wait", runnerMetricAttributes).pipe(
+                Effect.andThen(Effect.sleep("1 second")),
+              );
+            },
+          }),
         ),
-        Effect.andThen(recordSessionFabricRunnerState("reconnect_wait", runnerMetricAttributes)),
-        Effect.andThen(Effect.sleep("1 second")),
-      ),
-    );
+      );
+    });
 
   const ensureSession = Effect.fn("session_fabric_runner.ensure_session")(function* (
     threadId: ThreadId,

@@ -5,6 +5,7 @@ import { CommandId, EnvironmentId, ProjectId, ThreadId } from "./baseSchemas.ts"
 import {
   SESSION_FABRIC_PROTOCOL_VERSION,
   SessionFabricClientFrame,
+  SessionFabricCapabilityGrant,
   SessionFabricCapabilityClaims,
   SessionFabricClientId,
   SessionFabricCommand,
@@ -17,6 +18,7 @@ import {
 
 const decodeRunnerHello = Schema.decodeUnknownSync(SessionFabricRunnerHello);
 const decodeCapabilityClaims = Schema.decodeUnknownSync(SessionFabricCapabilityClaims);
+const decodeCapabilityGrant = Schema.decodeUnknownSync(SessionFabricCapabilityGrant);
 const decodeClientFrame = Schema.decodeUnknownSync(SessionFabricClientFrame);
 const decodeSearchRequest = Schema.decodeUnknownSync(SessionFabricSearchRequest);
 const decodeCommandReceipt = Schema.decodeUnknownSync(SessionFabricCommandReceipt);
@@ -139,6 +141,33 @@ describe("session fabric contracts", () => {
     ).toMatchObject({ role: "controller", actorId: "user-1", threadId: "thread-1" });
   });
 
+  it("keeps local capability response bindings distinct from signed JWT authority", () => {
+    const response = {
+      capability: "header.payload.signature",
+      tokenType: "Bearer",
+      role: "runner",
+      scopes: ["session:publish", "session:execute"],
+      expiresAt: "2026-07-24T20:15:00.000Z",
+      issuer: "scaffold",
+      audience: "session-fabric",
+      keyId: "proof-1",
+      bindings: {
+        fabricSessionId: "sf:environment-1:thread-1",
+        environmentKind: "local",
+        environmentId: "environment-1",
+        threadId: "thread-1",
+      },
+    } as const;
+
+    expect(decodeCapabilityGrant(response).bindings).toEqual(response.bindings);
+    expect(() =>
+      decodeCapabilityGrant({
+        ...response,
+        bindings: { ...response.bindings, actorId: "user-1", runnerId: "runner-1" },
+      }),
+    ).toThrow();
+  });
+
   it("carries the original idempotent orchestration command", () => {
     const frame = decodeClientFrame({
       type: "command.submit",
@@ -161,6 +190,33 @@ describe("session fabric contracts", () => {
     expect(frame.command.commandId).toBe(CommandId.make("command-1"));
     expect(frame.command.clientId).toBe(SessionFabricClientId.make("client-2"));
     expect(frame.command.command.commandId).toBe(frame.command.commandId);
+  });
+
+  it("defaults client sockets to synchronization and permits command-only sockets", () => {
+    const baseHello = {
+      type: "client.hello",
+      hello: {
+        protocolVersion: SESSION_FABRIC_PROTOCOL_VERSION,
+        sessionId: "global-session-1",
+        clientId: "client-2",
+        afterEventSequence: 7,
+        connectedAt: "2026-07-24T20:01:00.000Z",
+      },
+    } as const;
+
+    const synchronized = decodeClientFrame(baseHello);
+    const commandOnly = decodeClientFrame({
+      ...baseHello,
+      hello: { ...baseHello.hello, synchronize: false },
+    });
+
+    expect(synchronized.type).toBe("client.hello");
+    expect(commandOnly.type).toBe("client.hello");
+    if (synchronized.type !== "client.hello" || commandOnly.type !== "client.hello") {
+      throw new Error("unexpected frame");
+    }
+    expect(synchronized.hello.synchronize).toBeUndefined();
+    expect(commandOnly.hello.synchronize).toBe(false);
   });
 
   it("rejects invalid semantic search limits", () => {

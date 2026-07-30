@@ -320,6 +320,9 @@ class TestWebSocket {
 
 class TestRelay {
   readonly sockets: TestWebSocket[] = [];
+  readonly clientHellos: Array<
+    Extract<SessionFabricClientFrameType, { type: "client.hello" }>["hello"]
+  > = [];
   clientHelloCount = 0;
   private readonly initialSnapshot: SessionFabricSnapshot;
   private readonly emitReplayEvent: boolean;
@@ -338,6 +341,8 @@ class TestRelay {
   receive(socket: TestWebSocket, frame: SessionFabricClientFrameType) {
     if (frame.type === "client.hello") {
       this.clientHelloCount += 1;
+      this.clientHellos.push(frame.hello);
+      if (frame.hello.synchronize === false) return;
       socket.serverFrame({ type: "session.snapshot", snapshot: this.initialSnapshot });
       if (this.emitReplayEvent) {
         socket.serverFrame({
@@ -1031,7 +1036,52 @@ describe("Relay session fabric UI source", () => {
       ]);
       relay.sockets[0]!.open();
       expect(yield* Fiber.join(dispatched)).toEqual({ sequence: 8 });
+      expect(relay.clientHellos.at(-1)).toMatchObject({
+        afterEventSequence: 0,
+        synchronize: false,
+      });
       expect(capabilityCalls).toEqual(["viewer", "controller"]);
+    }),
+  );
+
+  it.live("resumes viewer sockets from the authoritative relay event cursor", () =>
+    Effect.gen(function* () {
+      const authoritative = {
+        ...snapshot,
+        session: {
+          ...snapshot.session,
+          cursor: { eventSequence: 23, snapshotSequence: 7 },
+        },
+        compactedThroughEventSequence: 23,
+      };
+      const relay = new TestRelay(authoritative, false);
+      const source = makeSource(relay, "client-authoritative-resume", (() =>
+        Promise.resolve(Response.json(authoritative))) as typeof fetch);
+      expect(yield* source.authoritativeThreadSnapshot({} as never, THREAD_ID)).toEqual(
+        Option.some(authoritative.thread),
+      );
+      const streamed = yield* Effect.forkChild(
+        source
+          .subscribeThread(() =>
+            Effect.succeed({
+              threadId: THREAD_ID,
+              afterSequence: 0,
+              requestCompletionMarker: true,
+            }),
+          )
+          .pipe(
+            Stream.runDrain,
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          ),
+      );
+
+      yield* awaitSocketCount(relay, 1);
+      relay.sockets[0]!.open();
+      yield* awaitHelloCount(relay, 1);
+      yield* Fiber.interrupt(streamed);
+
+      expect(relay.clientHellos[0]).toMatchObject({ afterEventSequence: 23 });
+      expect(relay.clientHellos[0]?.synchronize).toBeUndefined();
     }),
   );
 
@@ -1097,7 +1147,6 @@ describe("Relay session fabric UI source", () => {
                       environmentKind: "local",
                       environmentId: body.environmentId,
                       threadId: body.threadId,
-                      actorId: "user-1",
                     }
                   : {
                       fabricSessionId: body.fabricSessionId,
@@ -1210,7 +1259,6 @@ describe("Relay session fabric UI source", () => {
                     environmentKind: "local",
                     environmentId: ENVIRONMENT_ID,
                     threadId: THREAD_ID,
-                    actorId: "user-1",
                   },
           });
         }) as typeof fetch,

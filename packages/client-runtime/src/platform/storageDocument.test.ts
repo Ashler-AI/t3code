@@ -1,4 +1,9 @@
-import { EnvironmentId, SessionFabricClientId, SessionFabricSessionId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ScaffoldSessionLinks,
+  SessionFabricClientId,
+  SessionFabricSessionId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 
 import * as TokenStore from "../authorization/tokenStore.ts";
@@ -166,13 +171,18 @@ describe("ConnectionCatalogDocument", () => {
     expect(document.credentials).toEqual([]);
   });
 
-  it("persists a Scaffold binding without transport authority", () => {
+  it("persists safe Scaffold links without transport authority", () => {
     const target = new ScaffoldConnectionTarget({
       environmentId: ENVIRONMENT_ID,
       label: "Scaffold sandbox",
       deployment: "staging",
       sessionId: "session-1",
       lifecycleEpoch: 7,
+      links: new ScaffoldSessionLinks({
+        session: "https://scaffold.example.test/?q=session-1",
+        web: "https://scaffold.example.test/sessions/session-1/web",
+        tilt: "https://scaffold.example.test/sessions/session-1/tilt",
+      }),
     });
     const document = registerConnectionInCatalog(
       EMPTY_CONNECTION_CATALOG_DOCUMENT,
@@ -184,5 +194,6 @@ describe("ConnectionCatalogDocument", () => {
     expect(document.credentials).toEqual([]);
     expect(JSON.stringify(document)).not.toContain("bootstrap");
     expect(JSON.stringify(document)).not.toContain("attachCredential");
+    expect(JSON.stringify(document)).toContain("/sessions/session-1/web");
   });
 });

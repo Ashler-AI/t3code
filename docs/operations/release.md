@@ -82,6 +82,15 @@ Required `production` environment variables:
 Optional `production` environment variables:
 
 - `RELAY_DOMAIN` when overriding the derived `relay.<RELAY_API_ZONE_NAME>` domain
+- `T3CODE_SESSION_FABRIC_RELAY_URL`
+- `T3CODE_SCAFFOLD_STAGING_URL`
+- `T3CODE_SCAFFOLD_PRODUCTION_URL`
+- `T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT` (`staging` or `production`)
+
+The release embeds these public endpoints in desktop, CLI, and hosted web artifacts. Session-fabric
+authentication is always `required`, Scaffold authentication is always `oauth`, and OAuth credentials
+remain in each user's local credential store. The tracked `.env.defaults` provides Ashler source-build
+defaults only; production GitHub environment variables take precedence during releases.
 
 Required `production` environment secrets:
 

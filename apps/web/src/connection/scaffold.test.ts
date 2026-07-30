@@ -4,6 +4,7 @@ import {
   ScaffoldEnvironmentBinding,
   ScaffoldObserveInput,
   ScaffoldPreparedConnection,
+  ScaffoldResumeAndPrepareInput,
   ScaffoldSessionLinks,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -130,6 +131,49 @@ describe("Scaffold connection lifecycle client", () => {
     expect(init).toMatchObject({ method: "POST", credentials: "include" });
     expect(String(init?.body)).toContain('"operationId":"operation-1"');
     expect(String(init?.body)).not.toContain("one-time-bootstrap");
+  });
+
+  it("coalesces concurrent resume prepares for the same exact target", async () => {
+    let fetchCalls = 0;
+    let releaseResponse: (() => void) | undefined;
+    const responseReady = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    const fetchMock = async () => {
+      fetchCalls += 1;
+      await responseReady;
+      return Response.json(prepared);
+    };
+    const makeInput = (operationId: string) =>
+      new ScaffoldResumeAndPrepareInput({
+        deployment: "staging",
+        operationId,
+        environmentId: prepared.binding.environmentId,
+        sessionId: prepared.binding.sessionId,
+        expectedLifecycleEpoch: prepared.binding.lifecycleEpoch,
+      });
+
+    const first = requestScaffoldPreparedConnection(
+      makeInput("resume-1"),
+      fetchMock,
+      "http://127.0.0.1:3773/api/scaffold/connection",
+    );
+    const second = requestScaffoldPreparedConnection(
+      makeInput("resume-2"),
+      fetchMock,
+      "http://127.0.0.1:3773/api/scaffold/connection",
+    );
+    releaseResponse?.();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult).toEqual(secondResult);
+    expect(fetchCalls).toBe(1);
+
+    await requestScaffoldPreparedConnection(
+      makeInput("resume-3"),
+      fetchMock,
+      "http://127.0.0.1:3773/api/scaffold/connection",
+    );
+    expect(fetchCalls).toBe(2);
   });
 
   it("aborts a hung local lifecycle request at the configured deadline", async () => {

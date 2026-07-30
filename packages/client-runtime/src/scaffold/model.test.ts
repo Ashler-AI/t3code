@@ -1,4 +1,4 @@
-import { EnvironmentId, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -117,5 +117,26 @@ describe("Scaffold lifecycle model", () => {
         kind: "create",
       }),
     ).toThrow();
+  });
+
+  it("requires the native source thread on durable pause intents", () => {
+    const pause = makeScaffoldLifecycleAction({
+      actionId: "pause-operation-1",
+      kind: "pause",
+      sourceThreadId: ThreadId.make("thread-1"),
+      environmentId: EnvironmentId.make("env-1"),
+      connectionId: "connection-1",
+      sessionId: "session-1",
+      expectedLifecycleEpoch: 1,
+      createdAt: "2026-07-29T19:00:00.000Z",
+    });
+
+    expect(decodeScaffoldLifecycleAction(pause)).toMatchObject({
+      kind: "pause",
+      sourceThreadId: "thread-1",
+    });
+    const legacyPause = structuredClone(pause);
+    Reflect.deleteProperty(legacyPause, "sourceThreadId");
+    expect(() => decodeScaffoldLifecycleAction(legacyPause)).toThrow();
   });
 });

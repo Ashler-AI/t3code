@@ -37,6 +37,7 @@ import {
   PanelsTopLeftIcon,
   SearchIcon,
   ServerIcon,
+  TerminalIcon,
   Trash2Icon,
   Undo2Icon,
 } from "lucide-react";
@@ -134,6 +135,8 @@ import {
   prStatusIndicator,
   resolveThreadPr,
   settledPrHoverColorClass,
+  terminalStatusFromRunningIds,
+  type TerminalStatusIndicator,
 } from "./ThreadStatusIndicators";
 import {
   resolveSnoozePresets,
@@ -146,6 +149,7 @@ import { ProviderInstanceIcon } from "./chat/ProviderInstanceIcon";
 import { getTriggerDisplayModelLabel } from "./chat/providerIconUtils";
 import { deriveProviderInstanceEntries, type ProviderInstanceEntry } from "../providerInstances";
 import { primaryServerProvidersAtom } from "../state/server";
+import { useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { CommandDialogTrigger } from "./ui/command";
 import { Button } from "./ui/button";
@@ -176,15 +180,12 @@ import {
   type ScaffoldSessionUiEntry,
   useScaffoldSessionUiStore,
 } from "../scaffoldSessionUiStore";
-import { readRuntimeBasePath } from "../runtimeBasePath";
-import {
-  configuredSessionFabricRelayUrl,
-  sessionFabricRoutePath,
-} from "../connection/sessionFabricBootstrap";
+import { configuredSessionFabricRelayUrl } from "../connection/sessionFabricBootstrap";
 import {
   selectPublicLocalSidebarSessions,
   selectShadowedSessionFabricThreadKeys,
   selectVisibleSessionFabricSidebarSessions,
+  sessionFabricScaffoldLinks,
   sessionFabricRunnerStateLabel,
   startSessionFabricSidebarDiscovery,
   type SessionFabricSidebarDirectoryState,
@@ -253,16 +254,98 @@ function WorkingDuration(props: { startedAt: string | null }) {
   );
 }
 
-function ScaffoldSessionRowDetails(props: { entry: ScaffoldSessionUiEntry | null }) {
+function terminalProcessLabel(count: number): string {
+  return `${count} terminal ${count === 1 ? "process" : "processes"} running`;
+}
+
+export function stopScaffoldRowDestinationPropagation(
+  event: Pick<ReactMouseEvent, "stopPropagation">,
+): void {
+  event.stopPropagation();
+}
+
+export type ScaffoldSessionRowPresentation = Pick<
+  ScaffoldSessionUiEntry,
+  "deployment" | "links" | "sessionId"
+>;
+
+export function resolveScaffoldAgentUrl(entry: ScaffoldSessionRowPresentation): string | null {
+  const { links, sessionId } = entry;
+  if (links === null || sessionId === null || sessionId.trim() !== sessionId) return null;
+  try {
+    const sessionUrl = new URL(links.session);
+    if (
+      (sessionUrl.protocol !== "https:" && sessionUrl.protocol !== "http:") ||
+      sessionUrl.username !== "" ||
+      sessionUrl.password !== ""
+    ) {
+      return null;
+    }
+    const querySessionIds = sessionUrl.searchParams.getAll("q");
+    const segments = sessionUrl.pathname.split("/").filter(Boolean);
+    const pathSessionId =
+      segments.length === 2 && segments[0] === "sessions"
+        ? decodeURIComponent(segments[1] ?? "")
+        : null;
+    const matchesRootQuery =
+      sessionUrl.pathname === "/" &&
+      querySessionIds.length === 1 &&
+      querySessionIds[0] === sessionId;
+    const matchesSessionPath = querySessionIds.length === 0 && pathSessionId === sessionId;
+    if (!matchesRootQuery && !matchesSessionPath) return null;
+    return `${sessionUrl.origin}/sessions/${encodeURIComponent(sessionId)}/agent`;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveScaffoldSessionRowPresentation(
+  entry: ScaffoldSessionUiEntry | null,
+  registeredTarget: {
+    readonly deployment: ScaffoldSessionUiEntry["deployment"];
+    readonly sessionId: ScaffoldSessionUiEntry["sessionId"];
+    readonly links?: Exclude<ScaffoldSessionUiEntry["links"], null>;
+  } | null,
+): ScaffoldSessionRowPresentation | null {
+  if (entry !== null) {
+    return {
+      deployment: entry.deployment,
+      links: entry.links ?? registeredTarget?.links ?? null,
+      sessionId: entry.sessionId ?? registeredTarget?.sessionId ?? null,
+    };
+  }
+  if (registeredTarget === null) return null;
+  return {
+    deployment: registeredTarget.deployment,
+    links: registeredTarget.links ?? null,
+    sessionId: registeredTarget.sessionId,
+  };
+}
+
+function ScaffoldSessionRowDetails(props: { entry: ScaffoldSessionRowPresentation | null }) {
   const entry = props.entry;
   if (!entry) return null;
   const links = entry.links;
+  const agentUrl = resolveScaffoldAgentUrl(entry);
   return (
     <div className="ml-4 flex h-4 min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground/65">
       <CloudIcon aria-hidden className="size-3 shrink-0" />
       <span className="min-w-0 flex-1 truncate">Scaffold {entry.deployment}</span>
       {links ? (
         <span className="flex shrink-0 items-center gap-0.5">
+          {agentUrl ? (
+            <a
+              href={agentUrl}
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Open Scaffold agent"
+              title="Open Scaffold agent"
+              className="inline-flex size-4 items-center justify-center rounded-sm hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+              onClick={(event) => stopScaffoldRowDestinationPropagation(event)}
+            >
+              <TerminalIcon className="size-2.5" />
+            </a>
+          ) : null}
           {[
             { href: links.session, label: "Open Scaffold session", Icon: ExternalLinkIcon },
             { href: links.web, label: "Open Scaffold web", Icon: Globe2Icon },
@@ -276,7 +359,7 @@ function ScaffoldSessionRowDetails(props: { entry: ScaffoldSessionUiEntry | null
               aria-label={label}
               title={label}
               className="inline-flex size-4 items-center justify-center rounded-sm hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
-              onClick={(event) => event.stopPropagation()}
+              onClick={(event) => stopScaffoldRowDestinationPropagation(event)}
             >
               <Icon className="size-2.5" />
             </a>
@@ -296,6 +379,8 @@ function SidebarV2ThreadTooltip({
   modelInstanceId,
   modelLabel,
   branchMismatch,
+  terminalStatus,
+  terminalProcessCount,
 }: {
   thread: SidebarThreadSummary;
   projectTitle: string | null;
@@ -308,6 +393,8 @@ function SidebarV2ThreadTooltip({
     threadBranch: string;
     currentBranch: string;
   } | null;
+  terminalStatus: TerminalStatusIndicator | null;
+  terminalProcessCount: number;
 }) {
   return (
     <TooltipPopup
@@ -360,6 +447,17 @@ function SidebarV2ThreadTooltip({
                 iconClassName="size-3 shrink-0 grayscale opacity-60"
               />
               <div className="min-w-0 truncate text-foreground/75">{modelLabel}</div>
+            </div>
+          ) : null}
+          {terminalStatus ? (
+            <div className="flex min-w-0 items-center gap-2">
+              <TerminalIcon
+                aria-hidden
+                className={cn("size-3 shrink-0", terminalStatus.colorClass)}
+              />
+              <div className="min-w-0 truncate text-foreground/75">
+                {terminalProcessLabel(terminalProcessCount)}
+              </div>
             </div>
           ) : null}
           {thread.session?.lastError ? (
@@ -445,7 +543,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   isActive: boolean;
   jumpLabel: string | null;
   environmentLabel: string | null;
-  scaffoldSession: ScaffoldSessionUiEntry | null;
+  scaffoldSession: ScaffoldSessionRowPresentation | null;
   projectCwd: string | null;
   projectTitle: string | null;
   providerEntryByInstanceId: ReadonlyMap<string, ProviderInstanceEntry>;
@@ -492,6 +590,12 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   const lastVisitedAt = useUiStateStore((state) => state.threadLastVisitedAtById[threadKey]);
   const isSelected = useThreadSelectionStore((state) => state.selectedThreadKeys.has(threadKey));
   const openPrLink = useOpenPrLink();
+  const runningTerminalIds = useThreadRunningTerminalIds({
+    environmentId: thread.environmentId,
+    threadId: thread.id,
+  });
+  const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
+  const terminalProcessCount = runningTerminalIds.length;
 
   // Same semantics as v1 (never-visited counts as read): flipping the beta
   // flag must not light up every historical thread as unread.
@@ -569,6 +673,8 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
       modelInstanceId={modelInstanceId}
       modelLabel={modelLabel}
       branchMismatch={branchMismatch}
+      terminalStatus={terminalStatus}
+      terminalProcessCount={terminalProcessCount}
     />
   );
 
@@ -763,6 +869,16 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
         #{pr.number}
       </button>
     ) : null;
+  const terminalStatusIcon = terminalStatus ? (
+    <span
+      role="img"
+      aria-label={terminalProcessLabel(terminalProcessCount)}
+      data-testid={`sidebar-v2-terminal-status-${thread.id}`}
+      className={cn("inline-flex shrink-0 items-center justify-center", terminalStatus.colorClass)}
+    >
+      <TerminalIcon className={cn("size-3.5", terminalStatus.pulse && "animate-status-pulse")} />
+    </span>
+  ) : null;
 
   if (variant === "slim") {
     return (
@@ -807,6 +923,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                   Regenerating title
                 </span>
               ) : null}
+              {terminalStatusIcon}
               {/* The PR badge stays outside the hover-fading slot: it must
               remain visible AND clickable while the row is hovered. Only
               the time/jump label yields to the settle affordance. */}
@@ -929,11 +1046,15 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                   Regenerating title
                 </span>
               ) : null}
+              {terminalStatusIcon}
               {prBadge}
               <span className="relative ml-auto flex h-6 min-w-8 shrink-0 items-center justify-end text-xs">
+                {/* This label becomes an invisible absolute overlay on hover;
+                    it must not intercept clicks intended for the settle or
+                    snooze controls underneath it. */}
                 <span
                   className={cn(
-                    "tabular-nums text-muted-foreground/55 transition-opacity group-hover/v2-row:opacity-0",
+                    "pointer-events-none tabular-nums text-muted-foreground/55 transition-opacity group-hover/v2-row:opacity-0",
                     snoozeMenuOpen && "opacity-0",
                   )}
                 >
@@ -960,7 +1081,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                     {props.settlementSupported ? (
                       <button
                         type="button"
-                        aria-label="Mark thread done"
+                        aria-label="Settle thread"
                         onClick={handleSettleClick}
                         className="inline-flex cursor-pointer items-center rounded-md bg-transparent px-2 text-xs text-muted-foreground hover:text-foreground"
                       >
@@ -1143,6 +1264,32 @@ export default function SidebarV2() {
         environments.map((environment) => [environment.environmentId, environment.label] as const),
       ),
     [environments],
+  );
+  const scaffoldTargetByEnvironmentId = useMemo(
+    () =>
+      new Map(
+        environments.flatMap((environment) =>
+          environment.entry.target._tag === "ScaffoldConnectionTarget"
+            ? [[environment.environmentId, environment.entry.target] as const]
+            : [],
+        ),
+      ),
+    [environments],
+  );
+  const scaffoldSessionPresentationByEnvironmentId = useMemo(
+    () =>
+      new Map(
+        environments.flatMap((environment) => {
+          const presentation = resolveScaffoldSessionRowPresentation(
+            scaffoldSessionForEnvironment(scaffoldSessionsByDraftId, environment.environmentId),
+            scaffoldTargetByEnvironmentId.get(environment.environmentId) ?? null,
+          );
+          return presentation === null
+            ? []
+            : ([[environment.environmentId, presentation]] as const);
+        }),
+      ),
+    [environments, scaffoldSessionsByDraftId, scaffoldTargetByEnvironmentId],
   );
   const orderedProjects = useMemo(
     () =>
@@ -1712,15 +1859,15 @@ export default function SidebarV2() {
   const navigateToFabricSession = useCallback(
     (session: SessionFabricSidebarSession) => {
       if (isMobile) setOpenMobile(false);
-      window.location.assign(
-        sessionFabricRoutePath({
-          sessionId: session.sessionId,
+      void router.navigate({
+        to: "/$environmentId/$threadId",
+        params: {
+          environmentId: `session-fabric:${session.sessionId}`,
           threadId: session.threadId,
-          runtimeBasePath: readRuntimeBasePath(),
-        }),
-      );
+        },
+      });
     },
-    [isMobile, setOpenMobile],
+    [isMobile, router, setOpenMobile],
   );
 
   const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
@@ -2602,10 +2749,9 @@ export default function SidebarV2() {
                       isActive={routeThreadKey === threadKey}
                       jumpLabel={showJumpHints ? (jumpLabelByKey.get(threadKey) ?? null) : null}
                       environmentLabel={environmentLabelById.get(thread.environmentId) ?? null}
-                      scaffoldSession={scaffoldSessionForEnvironment(
-                        scaffoldSessionsByDraftId,
-                        thread.environmentId,
-                      )}
+                      scaffoldSession={
+                        scaffoldSessionPresentationByEnvironmentId.get(thread.environmentId) ?? null
+                      }
                       projectCwd={
                         projectCwdByKey.get(`${thread.environmentId}:${thread.projectId}`) ?? null
                       }
@@ -2684,34 +2830,76 @@ export default function SidebarV2() {
                   );
                 });
                 items.push(
-                  ...publicLocalFabricSessions.map((session) => (
-                    <li key={`session-fabric:${session.sessionId}`} className="list-none py-px">
-                      <button
-                        type="button"
-                        className="group/v2-row w-full cursor-pointer rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-sidebar-row-hover"
-                        onClick={() => navigateToFabricSession(session)}
-                      >
-                        <div className="flex h-6 min-w-0 items-center gap-2">
-                          <span
-                            aria-hidden
-                            className={cn(
-                              "size-2 shrink-0 rounded-full",
-                              session.runnerState === "online"
-                                ? "bg-emerald-500"
-                                : "bg-muted-foreground/30",
-                            )}
-                          />
-                          <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                            {session.title}
-                          </span>
+                  ...publicLocalFabricSessions.map((session) => {
+                    const scaffoldLinks = sessionFabricScaffoldLinks(session);
+                    const environmentLabel =
+                      session.environmentKind === "scaffold" ? "Scaffold" : "Local";
+                    return (
+                      <li key={`session-fabric:${session.sessionId}`} className="list-none py-px">
+                        <div className="group/v2-row rounded-md transition-colors hover:bg-sidebar-row-hover">
+                          <button
+                            type="button"
+                            className="w-full cursor-pointer px-2.5 pb-0.5 pt-1.5 text-left"
+                            onClick={() => navigateToFabricSession(session)}
+                          >
+                            <div className="flex h-6 min-w-0 items-center gap-2">
+                              <span
+                                aria-hidden
+                                className={cn(
+                                  "size-2 shrink-0 rounded-full",
+                                  session.runnerState === "online"
+                                    ? "bg-emerald-500"
+                                    : "bg-muted-foreground/30",
+                                )}
+                              />
+                              <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                                {session.title}
+                              </span>
+                            </div>
+                            <div className="ml-4 flex h-4 min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground/65">
+                              <ServerIcon aria-hidden className="size-3 shrink-0" />
+                              <span>
+                                {environmentLabel} ·{" "}
+                                {sessionFabricRunnerStateLabel(session.runnerState)}
+                              </span>
+                            </div>
+                          </button>
+                          {scaffoldLinks === null ? null : (
+                            <div className="ml-6 flex items-center gap-1.5 px-2.5 pb-1.5 text-[11px]">
+                              {(
+                                [
+                                  ["Session", scaffoldLinks.sessionUrl],
+                                  ["Web", scaffoldLinks.webUrl],
+                                  ["Tilt", scaffoldLinks.tiltUrl],
+                                ] as const
+                              ).map(([label, href]) => (
+                                <a
+                                  key={label}
+                                  href={href}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                                  onClick={(event) => event.stopPropagation()}
+                                >
+                                  {label}
+                                </a>
+                              ))}
+                              <button
+                                type="button"
+                                className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  navigateToFabricSession(session);
+                                }}
+                              >
+                                Agent
+                              </button>
+                            </div>
+                          )}
                         </div>
-                        <div className="ml-4 flex h-4 min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground/65">
-                          <ServerIcon aria-hidden className="size-3 shrink-0" />
-                          <span>Local · {sessionFabricRunnerStateLabel(session.runnerState)}</span>
-                        </div>
-                      </button>
-                    </li>
-                  )),
+                      </li>
+                    );
+                  }),
                 );
                 if (fabricDirectoryState?.status === "loading") {
                   items.push(
@@ -2720,7 +2908,7 @@ export default function SidebarV2() {
                       role="status"
                       className="list-none px-2.5 py-2 text-xs text-muted-foreground"
                     >
-                      Loading shared local sessions…
+                      Loading shared sessions…
                     </li>,
                   );
                 } else if (fabricDirectoryState?.status === "error") {
@@ -2731,7 +2919,7 @@ export default function SidebarV2() {
                       className="flex list-none items-center gap-2 px-2.5 py-2 text-xs text-destructive"
                     >
                       <CircleAlertIcon aria-hidden className="size-3.5 shrink-0" />
-                      <span className="min-w-0 flex-1">Couldn’t load shared local sessions.</span>
+                      <span className="min-w-0 flex-1">Couldn’t load shared sessions.</span>
                       <button
                         type="button"
                         className="shrink-0 font-medium text-foreground hover:underline"
@@ -2840,7 +3028,7 @@ export default function SidebarV2() {
                         className="mb-1 mt-3 flex w-full cursor-pointer items-center gap-2 px-2.5 text-left"
                       >
                         <span className="text-xs font-medium text-muted-foreground/50">
-                          {settledShelfExpanded ? "Done" : `Done (${settledThreads.length})`}
+                          {settledShelfExpanded ? "Settled" : `Settled (${settledThreads.length})`}
                         </span>
                         <span className="h-px flex-1 bg-sidebar-border/60" />
                         <ChevronDownIcon

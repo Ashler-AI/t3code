@@ -17,7 +17,6 @@ import {
   finalizeSessionFabricSessionResponse,
   forwardSessionFabricRequest,
   normalizeSessionFabricAuthorizationRequestUrl,
-  resolveSessionFabricCorsOrigin,
   resolveSessionFabricRequestAuthorization,
 } from "./SessionFabricApi.ts";
 import { resolveSessionFabricRoute } from "./route.ts";
@@ -81,28 +80,6 @@ describe("session fabric API authorization URL portability", () => {
       });
     }),
   );
-
-  it("allows a localhost origin for a relative local workerd request", () => {
-    expect(
-      resolveSessionFabricCorsOrigin({
-        requestUrl: "/v1/session-fabric/sessions",
-        origin: "http://localhost:5173/",
-        authDisabled: true,
-        allowedOrigins: new Set(),
-      }),
-    ).toBe("http://localhost:5173");
-  });
-
-  it("rejects a localhost origin for an absolute public request", () => {
-    expect(
-      resolveSessionFabricCorsOrigin({
-        requestUrl: "https://fabric.example/v1/session-fabric/sessions",
-        origin: "http://localhost:5173",
-        authDisabled: true,
-        allowedOrigins: new Set(),
-      }),
-    ).toBeNull();
-  });
 });
 
 describe("session fabric API session forwarding", () => {

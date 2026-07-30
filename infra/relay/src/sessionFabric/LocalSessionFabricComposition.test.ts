@@ -323,6 +323,7 @@ class ComposedRelay {
     const authorized = localControllerMatchesPinnedAuthority({
       claims: socket.claims,
       sessionId: frame.command.sessionId,
+      publication: snapshot.session.publication,
       location: snapshot.session.location,
       pinned,
     });
@@ -416,7 +417,6 @@ function grant(role: "viewer" | "controller", actorId: string): SessionFabricCap
             environmentKind: "local",
             environmentId: ENVIRONMENT_ID,
             threadId: THREAD_ID,
-            actorId,
           },
   };
 }
@@ -434,7 +434,7 @@ const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({} as never);
 
 describe("local session fabric composition", () => {
   it.effect(
-    "pins actor A while public viewers share one exactly-once command result without browser storage",
+    "keeps runner actor A pinned while authenticated viewers share one exactly-once command result without browser storage",
     () =>
       Effect.gen(function* () {
         expect("localStorage" in globalThis).toBe(false);
@@ -489,23 +489,19 @@ describe("local session fabric composition", () => {
         relay.sockets[0]!.open();
         relay.sockets[1]!.open();
 
-        const rejectedFiber = yield* Effect.forkChild(
+        const acceptedByActorB = yield* Effect.forkChild(
           actorB
             .dispatch({
               type: "thread.meta.update",
               commandId: CommandId.make("command-b"),
               threadId: THREAD_ID,
-              title: "Actor B must not control",
+              title: "Accepted from actor B",
             })
-            .pipe(
-              Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
-              Effect.flip,
-            ),
+            .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
         );
         while (relay.sockets.length < 3) yield* Effect.yieldNow;
         relay.sockets[2]!.open();
-        const rejected = yield* Fiber.join(rejectedFiber);
-        expect(rejected.message).toContain("Controller capability required");
+        expect(yield* Fiber.join(acceptedByActorB)).toEqual({ sequence: 2 });
 
         const commandA = {
           type: "thread.meta.update" as const,
@@ -521,7 +517,7 @@ describe("local session fabric composition", () => {
         while (relay.sockets.length < 4) yield* Effect.yieldNow;
         relay.sockets[3]!.open();
         const accepted = yield* Fiber.join(acceptedFiber);
-        expect(accepted).toEqual({ sequence: 2 });
+        expect(accepted).toEqual({ sequence: 3 });
 
         const duplicateFiber = yield* Effect.forkChild(
           actorA
@@ -531,14 +527,16 @@ describe("local session fabric composition", () => {
         while (relay.sockets.length < 5) yield* Effect.yieldNow;
         relay.sockets[4]!.open();
         const duplicate = yield* Fiber.join(duplicateFiber);
-        expect(duplicate).toEqual({ sequence: 2 });
+        expect(duplicate).toEqual({ sequence: 3 });
 
+        expect((yield* Queue.take(eventsA)).commandId).toBe("command-b");
+        expect((yield* Queue.take(eventsB)).commandId).toBe("command-b");
         expect((yield* Queue.take(eventsA)).commandId).toBe("command-a");
         expect((yield* Queue.take(eventsB)).commandId).toBe("command-a");
         expect(yield* Queue.size(eventsA)).toBe(0);
         expect(yield* Queue.size(eventsB)).toBe(0);
-        expect(relay.acceptedCommands).toBe(1);
-        expect(relay.rejectedCommands).toBe(1);
+        expect(relay.acceptedCommands).toBe(2);
+        expect(relay.rejectedCommands).toBe(0);
 
         yield* Fiber.interrupt(streamA);
         yield* Fiber.interrupt(streamB);

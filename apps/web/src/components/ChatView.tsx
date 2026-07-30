@@ -23,6 +23,7 @@ import {
 } from "@t3tools/contracts";
 import {
   connectionStatusTitle,
+  type ScaffoldConnectionTarget,
   type EnvironmentConnectionPresentation,
 } from "@t3tools/client-runtime/connection";
 import { effectiveSettled, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
@@ -288,6 +289,7 @@ import {
   deriveLockedProvider,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
+  resolveFailedScaffoldDraftRetryMode,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
@@ -1720,6 +1722,7 @@ function ChatViewContent(props: ChatViewProps) {
     scaffoldPhase: (scaffoldSessionUi ?? activeScaffoldSession)?.phase ?? null,
   });
   const activeEnvironmentConnectionPhase = activeEnvironment?.connection.phase ?? "available";
+  const activeEnvironmentConnectionError = activeEnvironment?.connection.error ?? null;
   const activeEnvironmentUnavailable =
     activeEnvironment !== null &&
     !ignoreSourceEnvironmentForScaffoldDraft &&
@@ -1739,18 +1742,18 @@ function ChatViewContent(props: ChatViewProps) {
     };
   }, [activeEnvironment, activeEnvironmentUnavailable, activeEnvironmentUnavailableLabel]);
   const handleReconnectActiveEnvironment = useCallback(
-    async (environmentId: EnvironmentId) => {
+    async (environmentId: EnvironmentId): Promise<boolean> => {
       const result = await retryEnvironment(environmentId);
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not reconnect environment",
-            description: error instanceof Error ? error.message : "Failed to reconnect.",
-          }),
-        );
-      }
+      if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return true;
+      const error = squashAtomCommandFailure(result);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not reconnect environment",
+          description: error instanceof Error ? error.message : "Failed to reconnect.",
+        }),
+      );
+      return false;
     },
     [retryEnvironment],
   );
@@ -2753,10 +2756,38 @@ function ChatViewContent(props: ChatViewProps) {
     const entry = scaffoldSessionUi;
     if (!entry || entry.phase !== "failed" || retryingScaffoldActionId !== null) return;
 
+    const registeredTarget = environments
+      .map((environment) => environment.entry.target)
+      .find(
+        (target): target is ScaffoldConnectionTarget =>
+          target._tag === "ScaffoldConnectionTarget" &&
+          target.deployment === entry.deployment &&
+          target.sessionId === entry.sessionId &&
+          (entry.environmentId === null || entry.environmentId === target.environmentId),
+      );
+    const retryMode =
+      registeredTarget === undefined ? resolveFailedScaffoldDraftRetryMode(entry) : "reconnect";
+    if (retryMode === "none") return;
+
     setRetryingScaffoldActionId(entry.actionId);
     let retryPersistenceFailureHandled = false;
     try {
       const scaffoldUi = useScaffoldSessionUiStore.getState();
+      if (retryMode === "reconnect") {
+        const targetEnvironmentId = registeredTarget?.environmentId ?? entry.environmentId;
+        if (targetEnvironmentId === null) return;
+        if (registeredTarget !== undefined) {
+          scaffoldUi.reconnectRegisteredTarget(entry.draftId, registeredTarget);
+        } else {
+          scaffoldUi.setPhase(entry.draftId, "resuming");
+        }
+        setThreadError(activeThread?.id ?? null, null);
+        const reconnectStarted = await handleReconnectActiveEnvironment(targetEnvironmentId);
+        if (!reconnectStarted) {
+          scaffoldUi.fail(entry.draftId, "This Scaffold environment could not be reconnected.");
+        }
+        return;
+      }
       const volatileCreateAction = scaffoldUi.volatileCreateActionsByDraftId[entry.draftId];
       const retried = await retryScaffoldLifecycleAction({
         store: browserScaffoldLifecycleActionStore,
@@ -2793,7 +2824,14 @@ function ChatViewContent(props: ChatViewProps) {
     } finally {
       setRetryingScaffoldActionId(null);
     }
-  }, [activeThread?.id, retryingScaffoldActionId, scaffoldSessionUi, setThreadError]);
+  }, [
+    activeThread?.id,
+    environments,
+    handleReconnectActiveEnvironment,
+    retryingScaffoldActionId,
+    scaffoldSessionUi,
+    setThreadError,
+  ]);
   const onReplaceScaffoldDraft = useCallback(() => openCommandPalette({ open: "new-session" }), []);
 
   // A draft is visible before its worktree exists. Rehydrate all accepted
@@ -4981,11 +5019,6 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     const scaffoldDeliveryDeferred = scaffoldSendDecision.deliveryDeferred;
-    if (scaffoldSendDecision.shouldResume && activeScaffoldSession) {
-      const scaffoldUi = useScaffoldSessionUiStore.getState();
-      scaffoldUi.setPhase(activeScaffoldSession.draftId, "resuming");
-      void handleReconnectActiveEnvironment(activeThread.environmentId);
-    }
     if (!activeProject) {
       toastManager.add(
         stackedThreadToast({
@@ -5253,6 +5286,11 @@ function ChatViewContent(props: ChatViewProps) {
           createdAt: messageCreatedAt,
         });
         messagePersistedToOutbox = true;
+        if (scaffoldSendDecision.shouldResume && activeScaffoldSession) {
+          const scaffoldUi = useScaffoldSessionUiStore.getState();
+          scaffoldUi.setPhase(activeScaffoldSession.draftId, "resuming");
+          void handleReconnectActiveEnvironment(activeThread.environmentId);
+        }
         promptRef.current = "";
         clearComposerDraftContent(composerDraftTarget);
         composerRef.current?.resetCursorState();
@@ -5330,9 +5368,27 @@ function ChatViewContent(props: ChatViewProps) {
 
   useEffect(() => {
     const session = scaffoldSessionUi ?? activeScaffoldSession;
-    if (session?.phase !== "resuming" || activeEnvironmentConnectionPhase !== "connected") return;
-    useScaffoldSessionUiStore.getState().setPhase(session.draftId, "ready");
-  }, [activeEnvironmentConnectionPhase, activeScaffoldSession, scaffoldSessionUi]);
+    if (session?.phase !== "resuming") return;
+    if (!scaffoldDraftBoundToTarget) return;
+    if (activeEnvironmentConnectionPhase === "connected") {
+      useScaffoldSessionUiStore.getState().setPhase(session.draftId, "ready");
+      return;
+    }
+    if (activeEnvironmentConnectionPhase === "error") {
+      useScaffoldSessionUiStore
+        .getState()
+        .fail(
+          session.draftId,
+          activeEnvironmentConnectionError ?? "This Scaffold environment could not be reconnected.",
+        );
+    }
+  }, [
+    activeEnvironmentConnectionError,
+    activeEnvironmentConnectionPhase,
+    activeScaffoldSession,
+    scaffoldDraftBoundToTarget,
+    scaffoldSessionUi,
+  ]);
 
   const onInterrupt = async () => {
     if (!activeThread) return;
@@ -6422,6 +6478,7 @@ function ChatViewContent(props: ChatViewProps) {
                                           scaffoldSessionUi.terminal !== true &&
                                           scaffoldSessionUi.error !==
                                             SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE,
+                                        error: scaffoldSessionUi.error,
                                       },
                                       scaffoldDraftRetrying:
                                         retryingScaffoldActionId === scaffoldSessionUi.actionId,

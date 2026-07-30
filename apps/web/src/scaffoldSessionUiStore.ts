@@ -5,6 +5,8 @@ import type {
   ScaffoldEnvironmentBinding,
   ScaffoldSessionLinks,
 } from "@t3tools/contracts";
+import type { ScaffoldConnectionTarget } from "@t3tools/client-runtime/connection";
+import type { EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
 import type { ScaffoldLifecycleAction } from "@t3tools/client-runtime/scaffold";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
@@ -103,6 +105,14 @@ interface ScaffoldSessionUiState {
     >,
   ) => void;
   connected: (draftId: DraftId, binding: ScaffoldEnvironmentBinding) => void;
+  registered: (draftId: DraftId, binding: ScaffoldEnvironmentBinding) => void;
+  adoptRegisteredTarget: (draftId: DraftId, target: ScaffoldConnectionTarget) => void;
+  syncRegisteredTarget: (
+    draftId: DraftId,
+    target: ScaffoldConnectionTarget,
+    connection: EnvironmentConnectionPresentation,
+  ) => void;
+  reconnectRegisteredTarget: (draftId: DraftId, target: ScaffoldConnectionTarget) => void;
   rebindCreating: (
     draftId: DraftId,
     actionId: string,
@@ -207,6 +217,194 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
             },
           };
         }),
+      registered: (draftId, binding) =>
+        set((state) => {
+          const current = state.entriesByDraftId[draftId];
+          if (!current || current.terminal === true) return state;
+          if (binding.deployment !== current.deployment) {
+            return {
+              entriesByDraftId: {
+                ...state.entriesByDraftId,
+                [draftId]: {
+                  ...current,
+                  phase: "failed",
+                  environmentId: null,
+                  lifecycleEpoch: 0,
+                  links: null,
+                  error: SCAFFOLD_DEPLOYMENT_MISMATCH_MESSAGE,
+                },
+              },
+            };
+          }
+          if (binding.status === "stopped" || binding.status === "failed") {
+            return {
+              entriesByDraftId: {
+                ...state.entriesByDraftId,
+                [draftId]: {
+                  ...current,
+                  phase: "failed",
+                  environmentId: binding.environmentId,
+                  sessionId: binding.sessionId,
+                  lifecycleEpoch: binding.lifecycleEpoch,
+                  links: binding.links,
+                  error:
+                    binding.status === "stopped"
+                      ? SCAFFOLD_SESSION_STOPPED_MESSAGE
+                      : SCAFFOLD_SESSION_FAILED_MESSAGE,
+                  terminal: true,
+                },
+              },
+            };
+          }
+          const phase =
+            binding.status === "paused"
+              ? "paused"
+              : current.phase === "ready"
+                ? "ready"
+                : current.phase === "resuming"
+                  ? "resuming"
+                  : "creating";
+          return {
+            entriesByDraftId: {
+              ...state.entriesByDraftId,
+              [draftId]: {
+                ...current,
+                phase,
+                environmentId: binding.environmentId,
+                sessionId: binding.sessionId,
+                lifecycleEpoch: binding.lifecycleEpoch,
+                links: binding.links,
+                error: null,
+                terminal: false,
+              },
+            },
+          };
+        }),
+      adoptRegisteredTarget: (draftId, target) =>
+        set((state) => {
+          const current = state.entriesByDraftId[draftId];
+          if (
+            !current ||
+            current.phase !== "creating" ||
+            current.terminal === true ||
+            current.deployment !== target.deployment ||
+            current.sessionId !== target.sessionId
+          ) {
+            return state;
+          }
+          return {
+            entriesByDraftId: {
+              ...state.entriesByDraftId,
+              [draftId]: {
+                ...current,
+                environmentId: target.environmentId,
+                lifecycleEpoch: target.lifecycleEpoch,
+                links: target.links ?? current.links,
+                error: null,
+                terminal: false,
+              },
+            },
+          };
+        }),
+      syncRegisteredTarget: (draftId, target, connection) =>
+        set((state) => {
+          const current = state.entriesByDraftId[draftId];
+          if (
+            !current ||
+            current.terminal === true ||
+            current.deployment !== target.deployment ||
+            current.sessionId !== target.sessionId ||
+            (current.environmentId !== null && current.environmentId !== target.environmentId)
+          ) {
+            return state;
+          }
+
+          let phase = current.phase;
+          let error = current.error;
+          switch (connection.phase) {
+            case "connected":
+              if (current.phase !== "paused") {
+                phase = "ready";
+                error = null;
+              }
+              break;
+            case "error":
+              phase = "failed";
+              error = connection.error ?? "This Scaffold environment could not be connected.";
+              break;
+            case "available":
+            case "offline":
+            case "connecting":
+            case "reconnecting":
+              if (current.phase === "ready") phase = "resuming";
+              break;
+          }
+          if (current.phase === "paused") {
+            phase = "paused";
+            error = current.error;
+          }
+
+          const links = target.links ?? current.links;
+          const lifecycleEpoch = Math.max(current.lifecycleEpoch, target.lifecycleEpoch);
+          const linksMatch =
+            current.links === links ||
+            (current.links !== null &&
+              links !== null &&
+              current.links.session === links.session &&
+              current.links.web === links.web &&
+              current.links.tilt === links.tilt);
+          if (
+            current.phase === phase &&
+            current.environmentId === target.environmentId &&
+            current.lifecycleEpoch === lifecycleEpoch &&
+            current.error === error &&
+            linksMatch
+          ) {
+            return state;
+          }
+          return {
+            entriesByDraftId: {
+              ...state.entriesByDraftId,
+              [draftId]: {
+                ...current,
+                phase,
+                environmentId: target.environmentId,
+                lifecycleEpoch,
+                links,
+                error,
+                terminal: false,
+              },
+            },
+          };
+        }),
+      reconnectRegisteredTarget: (draftId, target) =>
+        set((state) => {
+          const current = state.entriesByDraftId[draftId];
+          if (
+            !current ||
+            current.phase !== "failed" ||
+            current.terminal === true ||
+            current.deployment !== target.deployment ||
+            current.sessionId !== target.sessionId ||
+            (current.environmentId !== null && current.environmentId !== target.environmentId)
+          ) {
+            return state;
+          }
+          return {
+            entriesByDraftId: {
+              ...state.entriesByDraftId,
+              [draftId]: {
+                ...current,
+                phase: "resuming",
+                environmentId: target.environmentId,
+                lifecycleEpoch: target.lifecycleEpoch,
+                links: target.links ?? current.links,
+                error: null,
+                terminal: false,
+              },
+            },
+          };
+        }),
       rebindCreating: (draftId, actionId, sessionId, lifecycleEpoch) =>
         set((state) => {
           const current = state.entriesByDraftId[draftId];
@@ -255,6 +453,7 @@ export const useScaffoldSessionUiStore = create<ScaffoldSessionUiState>()(
         set((state) => {
           const current = state.entriesByDraftId[draftId];
           if (!current || current.terminal === true) return state;
+          if (current.phase === "failed" && current.error === error) return state;
           return {
             entriesByDraftId: {
               ...state.entriesByDraftId,

@@ -4,6 +4,7 @@ import {
   NonNegativeInt,
   ProjectId,
   ScaffoldAgentEffort,
+  ThreadId,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -135,6 +136,7 @@ export class ScaffoldPauseLifecycleAction extends Schema.Class<ScaffoldPauseLife
 )({
   ...ScaffoldLifecycleActionBase,
   kind: Schema.Literal("pause"),
+  sourceThreadId: ThreadId,
 }) {}
 
 /**

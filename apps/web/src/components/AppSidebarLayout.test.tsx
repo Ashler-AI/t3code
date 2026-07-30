@@ -1,6 +1,7 @@
 import {
   ConnectionBlockedError,
   ConnectionTransientError,
+  ScaffoldConnectionTarget,
 } from "@t3tools/client-runtime/connection";
 import { describe, expect, it, vi } from "vite-plus/test";
 
@@ -38,7 +39,10 @@ import {
 import {
   bindScaffoldDraftToRemote,
   classifyScaffoldCreateFailure,
+  authorizeScaffoldPause,
   commitLegacyFailedScaffoldObservation,
+  registeredScaffoldTargets,
+  reconcileScaffoldPauseAction,
   reconcileLegacyFailedScaffoldSessions,
   reconcileScaffoldLifecycleStartup,
   scaffoldRetargetProvidersAreReady,
@@ -116,6 +120,155 @@ function scaffoldEntry(
 }
 
 describe("Scaffold sidebar create failure classification", () => {
+  const pauseAction = makeScaffoldLifecycleAction({
+    actionId: "op-pause",
+    kind: "pause",
+    sourceThreadId: ThreadId.make("thread-source"),
+    environmentId: EnvironmentId.make("environment-scaffold"),
+    connectionId: "connection-scaffold",
+    sessionId: "session-scaffold",
+    expectedLifecycleEpoch: 3,
+    createdAt: "2026-07-29T00:00:00.000Z",
+  });
+  if (pauseAction.kind !== "pause") throw new Error("expected pause action");
+
+  it("uses shared lifecycle reconciliation for transient pause failures", () => {
+    expect(
+      reconcileScaffoldPauseAction({
+        action: pauseAction,
+        error: new ScaffoldLifecycleError({
+          reason: "network",
+          message: "temporarily unavailable",
+          status: 503,
+          code: "scaffold_unavailable",
+          retryAfterMs: 250,
+        }),
+      }),
+    ).toEqual({
+      _tag: "retry",
+      retryAfterMs: 250,
+      errorCode: "scaffold_unavailable",
+    });
+  });
+
+  it("exposes every registered Scaffold target regardless of transport phase", () => {
+    const target = (environmentId: string) =>
+      new ScaffoldConnectionTarget({
+        environmentId: EnvironmentId.make(environmentId),
+        label: "Scaffold staging",
+        deployment: "staging",
+        sessionId: `session-${environmentId}`,
+        lifecycleEpoch: 1,
+      });
+
+    expect(
+      registeredScaffoldTargets([
+        { connection: { phase: "reconnecting" }, entry: { target: target("backoff") } },
+        { connection: { phase: "offline" }, entry: { target: target("offline") } },
+        { connection: { phase: "connected" }, entry: { target: target("connected") } },
+      ]),
+    ).toEqual([target("backoff"), target("offline"), target("connected")]);
+  });
+
+  it.each(["paused", "stopped"] as const)(
+    "acknowledges authoritative %s pause convergence",
+    (status) => {
+      expect(
+        reconcileScaffoldPauseAction({
+          action: pauseAction,
+          error: new ScaffoldLifecycleError({
+            reason: "conflict",
+            message: `already ${status}`,
+            status: 409,
+            code: "sandbox_lifecycle_changed",
+            observation: new ScaffoldSessionObservation({
+              sessionId: `session-${status}`,
+              status,
+              lifecycleEpoch: 3,
+            }),
+          }),
+        }),
+      ).toEqual({ _tag: "acknowledged" });
+    },
+  );
+
+  it("drops a stale pause when its exact source thread is no longer explicitly settled", () => {
+    expect(
+      authorizeScaffoldPause({
+        action: pauseAction,
+        shellsReady: true,
+        threadShells: [
+          {
+            environmentId: EnvironmentId.make("environment-scaffold"),
+            id: ThreadId.make("thread-source"),
+            settledOverride: "active",
+          },
+        ],
+      }),
+    ).toBe("acknowledge");
+  });
+
+  it("does not pause a shared Scaffold environment while a sibling is active", () => {
+    expect(
+      authorizeScaffoldPause({
+        action: pauseAction,
+        shellsReady: true,
+        threadShells: [
+          {
+            environmentId: EnvironmentId.make("environment-scaffold"),
+            id: ThreadId.make("thread-source"),
+            settledOverride: "settled",
+          },
+          {
+            environmentId: EnvironmentId.make("environment-scaffold"),
+            id: ThreadId.make("thread-sibling"),
+            settledOverride: null,
+          },
+        ],
+      }),
+    ).toBe("acknowledge");
+  });
+
+  it("executes only when the source and every sibling are explicitly settled", () => {
+    expect(
+      authorizeScaffoldPause({
+        action: pauseAction,
+        shellsReady: true,
+        threadShells: [
+          {
+            environmentId: EnvironmentId.make("environment-scaffold"),
+            id: ThreadId.make("thread-source"),
+            settledOverride: "settled",
+          },
+          {
+            environmentId: EnvironmentId.make("environment-scaffold"),
+            id: ThreadId.make("thread-sibling"),
+            settledOverride: "settled",
+          },
+        ],
+      }),
+    ).toBe("execute");
+  });
+
+  it("acknowledges a refreshed 409 observation that supersedes the pause epoch", () => {
+    expect(
+      reconcileScaffoldPauseAction({
+        action: pauseAction,
+        error: new ScaffoldLifecycleError({
+          reason: "conflict",
+          message: "lifecycle changed",
+          status: 409,
+          code: "sandbox_lifecycle_changed",
+          observation: new ScaffoldSessionObservation({
+            sessionId: "session-scaffold",
+            status: "ready",
+            lifecycleEpoch: 4,
+          }),
+        }),
+      }),
+    ).toEqual({ _tag: "acknowledged" });
+  });
+
   it.each(["stopped", "failed"] as const)(
     "reconciles one legacy failed draft to authoritative %s state",
     async (status) => {
@@ -274,6 +427,15 @@ describe("Scaffold sidebar create failure classification", () => {
       lifecycleEpoch: 9,
       status: "stopped",
     });
+  });
+
+  it("wakes the durable lifecycle outbox once after saved projections hydrate", () => {
+    expect(appSidebarLayoutSource).toMatch(
+      /useScaffoldSessionUiStore\.persist\.onFinishHydration\(wakeAfterHydration\)[\s\S]*?persist\.hasHydrated\(\)[\s\S]*?\}, \[\]\);/,
+    );
+    expect(appSidebarLayoutSource).not.toMatch(
+      /requestScaffoldLifecycleDrain\(\);[\s\S]*?\}, \[entriesByDraftId\]\);/,
+    );
   });
 
   it("commits a delayed terminal observation after an unrelated Scaffold projection rerender", () => {
@@ -482,7 +644,7 @@ describe("Scaffold sidebar create failure classification", () => {
     expect(scaffoldRetargetProvidersAreReady(readyOmpCatalog)).toBe(true);
   });
 
-  it("surfaces retryable connection details for explicit retry", () => {
+  it("keeps transient connection failures non-terminal while the same session recovers", () => {
     expect(
       classifyScaffoldCreateFailure(
         new ConnectionTransientError({
@@ -491,9 +653,67 @@ describe("Scaffold sidebar create failure classification", () => {
         }),
       ),
     ).toEqual({
-      result: { _tag: "retry", retryAfterMs: 1_000, errorCode: "timeout" },
+      result: { _tag: "wait", retryAfterMs: 1_000, errorCode: "timeout" },
       detail: "Scaffold connected, but the agent environment did not become ready.",
     });
+  });
+
+  it("preserves one create action beyond the retry budget and acknowledges it after recovery", async () => {
+    const action = makeScaffoldLifecycleAction({
+      actionId: "op-transient-recovery",
+      kind: "create",
+      deployment: "staging",
+      draftId: "draft-transient-recovery",
+      sourceEnvironmentId: EnvironmentId.make("environment-source"),
+      sourceProjectId: ProjectId.make("project-source"),
+      environmentId: EnvironmentId.make("scaffold-pending:draft-transient-recovery"),
+      connectionId: "connection-transient-recovery",
+      sessionId: "session-transient-recovery",
+      expectedLifecycleEpoch: 0,
+      createdAt: "2026-07-27T00:00:00.000Z",
+    });
+    const store = createMemoryScaffoldLifecycleActionStore([action]);
+    const onBlocked = vi.fn();
+    let now = 0;
+    let executions = 0;
+
+    const drain = () =>
+      drainScaffoldLifecycleActions({
+        store,
+        now: () => now,
+        onBlocked,
+        execute: async () => {
+          executions += 1;
+          if (executions > 9) return { _tag: "acknowledged" } as const;
+          return classifyScaffoldCreateFailure(
+            new ConnectionTransientError({
+              reason: "network",
+              detail: "Scaffold could not be reached.",
+            }),
+          ).result;
+        },
+      });
+
+    for (let attempt = 0; attempt < 9; attempt += 1) {
+      await drain();
+      await expect(store.list()).resolves.toMatchObject([
+        {
+          actionId: action.actionId,
+          connectionId: action.connectionId,
+          sessionId: action.sessionId,
+          attempt: 0,
+          blocked: false,
+          lastErrorCode: "network",
+        },
+      ]);
+      now += 1_000;
+    }
+
+    await drain();
+
+    expect(executions).toBe(10);
+    expect(onBlocked).not.toHaveBeenCalled();
+    await expect(store.list()).resolves.toEqual([]);
   });
 
   it("keeps preparation-pending failures non-terminal and honors their retry delay", () => {
@@ -853,6 +1073,191 @@ describe("Scaffold sidebar create failure classification", () => {
     ]);
   });
 
+  it("keeps an exact volatile create pending until its durable action is visible", async () => {
+    const entry = scaffoldEntry("creating");
+    const volatileAction = makeScaffoldLifecycleAction({
+      actionId: entry.actionId,
+      kind: "create",
+      deployment: entry.deployment,
+      draftId: entry.draftId,
+      sourceEnvironmentId: entry.sourceEnvironmentId,
+      sourceProjectId: entry.sourceProjectId,
+      environmentId: EnvironmentId.make(`scaffold-pending:${entry.draftId}`),
+      connectionId: "connection-volatile-create",
+      sessionId: entry.sessionId!,
+      expectedLifecycleEpoch: entry.lifecycleEpoch,
+      createdAt: entry.createdAt,
+    });
+    const failures = vi.fn();
+
+    await reconcileScaffoldLifecycleStartup({
+      store: createMemoryScaffoldLifecycleActionStore(),
+      entriesByDraftId: { [entry.draftId]: entry },
+      volatileCreateActionsByDraftId: { [entry.draftId]: volatileAction },
+      catalogReady: true,
+      recover: vi.fn(),
+      fail: failures,
+    });
+
+    expect(failures).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a volatile create does not match its creating projection", async () => {
+    const entry = scaffoldEntry("creating");
+    const volatileAction = makeScaffoldLifecycleAction({
+      actionId: "op-different",
+      kind: "create",
+      deployment: entry.deployment,
+      draftId: entry.draftId,
+      sourceEnvironmentId: entry.sourceEnvironmentId,
+      sourceProjectId: entry.sourceProjectId,
+      environmentId: EnvironmentId.make(`scaffold-pending:${entry.draftId}`),
+      connectionId: "connection-volatile-mismatch",
+      sessionId: entry.sessionId!,
+      expectedLifecycleEpoch: entry.lifecycleEpoch,
+      createdAt: entry.createdAt,
+    });
+    const failures = vi.fn();
+
+    await reconcileScaffoldLifecycleStartup({
+      store: createMemoryScaffoldLifecycleActionStore(),
+      entriesByDraftId: { [entry.draftId]: entry },
+      volatileCreateActionsByDraftId: { [entry.draftId]: volatileAction },
+      catalogReady: true,
+      recover: vi.fn(),
+      fail: failures,
+    });
+
+    expect(failures).toHaveBeenCalledExactlyOnceWith(
+      entry.draftId,
+      "This Scaffold session request no longer matches its saved draft. Start a new session.",
+    );
+  });
+
+  it("waits for connection catalog hydration before failing a targetless creating draft", async () => {
+    const entry = scaffoldEntry("creating");
+    const failures = vi.fn();
+
+    await reconcileScaffoldLifecycleStartup({
+      store: createMemoryScaffoldLifecycleActionStore(),
+      entriesByDraftId: { [entry.draftId]: entry },
+      catalogReady: false,
+      recover: vi.fn(),
+      fail: failures,
+    });
+
+    expect(failures).not.toHaveBeenCalled();
+  });
+
+  it("adopts an exact registered target that arrives after initial hydration", async () => {
+    const entry = scaffoldEntry("creating", { deployment: "staging" });
+    const store = createMemoryScaffoldLifecycleActionStore();
+    const adopted = vi.fn();
+    const failures = vi.fn();
+
+    await reconcileScaffoldLifecycleStartup({
+      store,
+      entriesByDraftId: { [entry.draftId]: entry },
+      catalogReady: false,
+      recover: vi.fn(),
+      adoptRegisteredTarget: adopted,
+      fail: failures,
+    });
+
+    const target = new ScaffoldConnectionTarget({
+      environmentId: EnvironmentId.make("environment-scaffold"),
+      label: "Scaffold staging",
+      deployment: "staging",
+      sessionId: "ses-scaffold",
+      lifecycleEpoch: 4,
+    });
+    await reconcileScaffoldLifecycleStartup({
+      store,
+      entriesByDraftId: { [entry.draftId]: entry },
+      catalogReady: true,
+      registeredScaffoldTargets: [target],
+      recover: vi.fn(),
+      adoptRegisteredTarget: adopted,
+      fail: failures,
+    });
+
+    expect(failures).not.toHaveBeenCalled();
+    expect(adopted).toHaveBeenCalledExactlyOnceWith(entry, target);
+  });
+
+  it("adopts a registered target and retires its surviving create action", async () => {
+    const action = makeScaffoldLifecycleAction({
+      actionId: "op-registered-target",
+      kind: "create",
+      deployment: "staging",
+      draftId: "draft-scaffold",
+      sourceEnvironmentId: EnvironmentId.make("environment-source"),
+      sourceProjectId: ProjectId.make("project-source"),
+      environmentId: EnvironmentId.make("scaffold-pending:draft-scaffold"),
+      connectionId: "connection-registered-target",
+      sessionId: "ses-scaffold",
+      expectedLifecycleEpoch: 4,
+      createdAt: "2026-07-27T00:00:00.000Z",
+    });
+    const entry = scaffoldEntry("creating", {
+      actionId: action.actionId,
+      deployment: "staging",
+      lifecycleEpoch: 4,
+    });
+    const target = new ScaffoldConnectionTarget({
+      environmentId: EnvironmentId.make("environment-scaffold"),
+      label: "Scaffold staging",
+      deployment: "staging",
+      sessionId: "ses-scaffold",
+      lifecycleEpoch: 4,
+    });
+    const store = createMemoryScaffoldLifecycleActionStore([action]);
+    const adopted = vi.fn();
+
+    await reconcileScaffoldLifecycleStartup({
+      store,
+      entriesByDraftId: { [entry.draftId]: entry },
+      catalogReady: true,
+      registeredScaffoldTargets: [target],
+      recover: vi.fn(),
+      adoptRegisteredTarget: adopted,
+      fail: vi.fn(),
+    });
+
+    expect(adopted).toHaveBeenCalledExactlyOnceWith(entry, target);
+    await expect(store.list()).resolves.toEqual([]);
+  });
+
+  it.each([
+    ["wrong session", { sessionId: "ses-other", deployment: "staging" as const }],
+    ["wrong deployment", { sessionId: "ses-scaffold", deployment: "production" as const }],
+  ])("does not adopt a registered target with the %s", async (_label, mismatch) => {
+    const entry = scaffoldEntry("creating", { deployment: "staging" });
+    const adopted = vi.fn();
+    const failures = vi.fn();
+
+    await reconcileScaffoldLifecycleStartup({
+      store: createMemoryScaffoldLifecycleActionStore(),
+      entriesByDraftId: { [entry.draftId]: entry },
+      catalogReady: true,
+      registeredScaffoldTargets: [
+        new ScaffoldConnectionTarget({
+          environmentId: EnvironmentId.make("environment-scaffold"),
+          label: "Scaffold",
+          deployment: mismatch.deployment,
+          sessionId: mismatch.sessionId,
+          lifecycleEpoch: 4,
+        }),
+      ],
+      recover: vi.fn(),
+      adoptRegisteredTarget: adopted,
+      fail: failures,
+    });
+
+    expect(adopted).not.toHaveBeenCalled();
+    expect(failures).toHaveBeenCalledOnce();
+  });
+
   it("fails a targetless legacy action without trusting its contradictory UI target", async () => {
     const current = makeScaffoldLifecycleAction({
       actionId: "op-targetless-legacy",
@@ -940,7 +1345,7 @@ describe("Scaffold sidebar create failure classification", () => {
     });
   });
 
-  it("retries typed transient failures", () => {
+  it("waits on typed transient failures without consuming the retry budget", () => {
     expect(
       classifyScaffoldCreateFailure(
         new ConnectionTransientError({
@@ -949,7 +1354,7 @@ describe("Scaffold sidebar create failure classification", () => {
         }),
       ),
     ).toEqual({
-      result: { _tag: "retry", retryAfterMs: 1_000, errorCode: "network" },
+      result: { _tag: "wait", retryAfterMs: 1_000, errorCode: "network" },
       detail: "Scaffold could not be reached.",
     });
   });

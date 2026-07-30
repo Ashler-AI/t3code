@@ -5,12 +5,7 @@ import {
 } from "@t3tools/client-runtime/environment";
 import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { canSettle, canSnooze } from "@t3tools/client-runtime/state/thread-settled";
-import {
-  EnvironmentId,
-  ScaffoldPauseInput,
-  type ScopedThreadRef,
-  ThreadId,
-} from "@t3tools/contracts";
+import { EnvironmentId, type ScopedThreadRef, ThreadId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -21,6 +16,7 @@ import { getFallbackThreadIdAfterDelete } from "../components/Sidebar.logic";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { terminalEnvironment } from "../state/terminal";
 import { threadEnvironment } from "../state/threads";
+import { readPreparedConnection } from "../state/session";
 import { vcsEnvironment } from "../state/vcs";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
@@ -38,13 +34,13 @@ import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { useClientSettings } from "./useSettings";
 import { useAtomCommand } from "../state/use-atom-command";
-import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
-import { serverEnvironment } from "../state/server";
-import { randomUUID } from "../lib/utils";
+import { useEnvironments } from "../state/environments";
 import {
-  scaffoldSessionForEnvironment,
-  useScaffoldSessionUiStore,
-} from "../scaffoldSessionUiStore";
+  browserScaffoldLifecycleActionStore,
+  enqueueScaffoldLifecycleAction,
+  makeScaffoldPauseAction,
+  requestScaffoldLifecycleDrain,
+} from "../connection/scaffoldLifecycleOutbox";
 
 export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
@@ -106,12 +102,42 @@ export class ThreadSnoozeBlockedError extends Schema.TaggedErrorClass<ThreadSnoo
   }
 }
 
+export async function settleThenEnqueueScaffoldPause<
+  Result extends { readonly _tag: string },
+>(input: {
+  readonly settle: () => Promise<Result>;
+  readonly enqueuePause: () => Promise<void>;
+  readonly onPausePersistenceFailure?: (error: unknown) => void;
+}): Promise<Result> {
+  const result = await input.settle();
+  if (result._tag === "Failure") return result;
+  try {
+    await input.enqueuePause();
+  } catch (error) {
+    input.onPausePersistenceFailure?.(error);
+  }
+  return result;
+}
+
+export function currentScaffoldLifecycleEpoch(input: {
+  readonly environmentId: EnvironmentId;
+  readonly sessionId: string;
+  readonly persistedEpoch: number;
+}): number {
+  const prepared = readPreparedConnection(input.environmentId);
+  const preparedTarget = prepared?.target;
+  if (
+    preparedTarget?._tag !== "ScaffoldConnectionTarget" ||
+    preparedTarget.environmentId !== input.environmentId ||
+    preparedTarget.sessionId !== input.sessionId
+  ) {
+    return input.persistedEpoch;
+  }
+  return Math.max(input.persistedEpoch, preparedTarget.lifecycleEpoch);
+}
+
 export function useThreadActions() {
   const { environments } = useEnvironments();
-  const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const pauseScaffold = useAtomCommand(serverEnvironment.pauseScaffold, {
-    reportFailure: false,
-  });
   const closeTerminal = useAtomCommand(terminalEnvironment.close);
   const archiveThreadMutation = useAtomCommand(threadEnvironment.archive, {
     reportFailure: false,
@@ -460,44 +486,39 @@ export function useThreadActions() {
       // Settlement is authoritative orchestration state. Persist it before the
       // optional Scaffold lifecycle side effect so a pause conflict can never
       // roll the thread back to active.
-      const result = await settleThreadMutation({
-        environmentId: target.environmentId,
-        input: { threadId: target.threadId },
-      });
-      if (result._tag === "Failure") return result;
-
       const scaffoldEnvironment = environments.find(
         (environment) =>
           environment.environmentId === target.environmentId &&
           environment.entry.target._tag === "ScaffoldConnectionTarget",
       );
-      if (
-        scaffoldEnvironment?.entry.target._tag === "ScaffoldConnectionTarget" &&
-        primaryEnvironmentId !== null
-      ) {
-        const scaffoldTarget = scaffoldEnvironment.entry.target;
-        const pauseResult = await pauseScaffold({
-          environmentId: primaryEnvironmentId,
-          input: new ScaffoldPauseInput({
-            deployment: scaffoldTarget.deployment,
-            operationId: randomUUID(),
-            environmentId: scaffoldTarget.environmentId,
-            sessionId: scaffoldTarget.sessionId,
-            expectedLifecycleEpoch: scaffoldTarget.lifecycleEpoch,
+      return settleThenEnqueueScaffoldPause({
+        settle: () =>
+          settleThreadMutation({
+            environmentId: target.environmentId,
+            input: { threadId: target.threadId },
           }),
-        });
-        if (pauseResult._tag === "Success") {
-          const scaffoldUi = useScaffoldSessionUiStore.getState();
-          const entry = scaffoldSessionForEnvironment(
-            scaffoldUi.entriesByDraftId,
-            target.environmentId,
-          );
-          if (entry) scaffoldUi.connected(entry.draftId, pauseResult.value);
-        }
-      }
-      return result;
+        enqueuePause: async () => {
+          if (scaffoldEnvironment?.entry.target._tag !== "ScaffoldConnectionTarget") return;
+          const scaffoldTarget = scaffoldEnvironment.entry.target;
+          const action = makeScaffoldPauseAction({
+            environmentId: scaffoldTarget.environmentId,
+            sourceThreadId: target.threadId,
+            sessionId: scaffoldTarget.sessionId,
+            expectedLifecycleEpoch: currentScaffoldLifecycleEpoch({
+              environmentId: scaffoldTarget.environmentId,
+              sessionId: scaffoldTarget.sessionId,
+              persistedEpoch: scaffoldTarget.lifecycleEpoch,
+            }),
+          });
+          await enqueueScaffoldLifecycleAction(browserScaffoldLifecycleActionStore, action);
+          requestScaffoldLifecycleDrain(action.actionId);
+        },
+        onPausePersistenceFailure: (error) => {
+          console.error("Could not save the Scaffold pause request.", error);
+        },
+      });
     },
-    [environments, pauseScaffold, primaryEnvironmentId, resolveThreadTarget, settleThreadMutation],
+    [environments, resolveThreadTarget, settleThreadMutation],
   );
 
   const unsettleThread = useCallback(

@@ -77,6 +77,8 @@ import {
   ScaffoldEnvironmentBinding,
   ScaffoldLifecycleError,
   ScaffoldPauseInput,
+  ScaffoldRenameInput,
+  ScaffoldSessionObservation,
 } from "./scaffold.ts";
 import {
   RelayClientInstallFailedError,
@@ -268,6 +270,7 @@ export const WS_METHODS = {
   // Managed Scaffold lifecycle. This method executes on the local T3 server;
   // browser clients never call the Scaffold control plane directly.
   scaffoldPause: "scaffold.pause",
+  scaffoldRename: "scaffold.rename",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -469,6 +472,12 @@ export const WsOmpAccountsRemoveRpc = Rpc.make(WS_METHODS.ompAccountsRemove, {
 export const WsScaffoldPauseRpc = Rpc.make(WS_METHODS.scaffoldPause, {
   payload: ScaffoldPauseInput,
   success: ScaffoldEnvironmentBinding,
+  error: Schema.Union([ScaffoldLifecycleError, EnvironmentAuthorizationError]),
+});
+
+export const WsScaffoldRenameRpc = Rpc.make(WS_METHODS.scaffoldRename, {
+  payload: ScaffoldRenameInput,
+  success: ScaffoldSessionObservation,
   error: Schema.Union([ScaffoldLifecycleError, EnvironmentAuthorizationError]),
 });
 
@@ -902,6 +911,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOmpAccountsCancelLoginRpc,
   WsOmpAccountsRemoveRpc,
   WsScaffoldPauseRpc,
+  WsScaffoldRenameRpc,
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsSourceControlLookupRepositoryRpc,
