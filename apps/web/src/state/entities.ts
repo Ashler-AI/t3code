@@ -21,6 +21,7 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 import { useMemo } from "react";
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { environmentCatalog } from "../connection/catalog";
 import { environmentProjects } from "./projects";
 import { environmentServerConfigsAtom } from "./server";
 import { allEnvironmentShellsBootstrappedAtom } from "./shell";
@@ -225,11 +226,27 @@ export function readThreadShell(ref: ScopedThreadRef): EnvironmentThreadShell | 
 /** Whether the environment's server understands thread.settle/unsettle.
     False for pre-settlement servers (capability defaults false on decode),
     so clients under version skew fall back instead of erroring. */
-export function readEnvironmentSupportsSettlement(environmentId: EnvironmentId): boolean {
+export function environmentSupportsSettlement(input: {
+  readonly serverConfig: {
+    readonly environment: {
+      readonly capabilities: { readonly threadSettlement?: boolean };
+    };
+  } | null;
+  readonly sourceTag: string | null;
+}): boolean {
   return (
-    appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId)?.environment.capabilities
-      .threadSettlement === true
+    input.serverConfig?.environment.capabilities.threadSettlement === true ||
+    input.sourceTag === "SessionFabricConnectionTarget"
   );
+}
+
+export function readEnvironmentSupportsSettlement(environmentId: EnvironmentId): boolean {
+  return environmentSupportsSettlement({
+    serverConfig: appAtomRegistry.get(environmentServerConfigsAtom).get(environmentId) ?? null,
+    sourceTag:
+      appAtomRegistry.get(environmentCatalog.catalogValueAtom).entries.get(environmentId)?.target
+        ._tag ?? null,
+  });
 }
 
 /** Whether the environment's server understands thread.snooze/unsnooze.

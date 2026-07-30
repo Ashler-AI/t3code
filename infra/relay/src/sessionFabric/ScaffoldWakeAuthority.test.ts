@@ -12,8 +12,10 @@ import {
 } from "./ScaffoldWakeAuthority.ts";
 
 const request = {
-  fabricSessionId: "fabric-1",
+  fabricSessionId: "sf:pre-migration-environment:thread-1",
   commandId: "command-1",
+  environmentId: "post-migration-environment",
+  threadId: "thread-1",
   scaffoldSessionId: "scaffold-1",
   expectedLifecycleEpoch: 4,
   actorId: "actor-1",
@@ -31,6 +33,8 @@ const successResponse = (overrides: Record<string, unknown> = {}) => ({
   version: "scaffold.session_fabric.wake_result.v1",
   fabricSessionId: request.fabricSessionId,
   commandId: request.commandId,
+  environmentId: request.environmentId,
+  threadId: request.threadId,
   scaffoldSessionId: request.scaffoldSessionId,
   expectedLifecycleEpoch: request.expectedLifecycleEpoch,
   targetLifecycleEpoch: request.expectedLifecycleEpoch + 1,

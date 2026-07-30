@@ -16,7 +16,12 @@ import {
   scopeThreadRef,
   scopedThreadKey,
 } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef, SidebarProjectGroupingMode } from "@t3tools/contracts";
+import {
+  type EnvironmentId,
+  type ScopedThreadRef,
+  type SidebarProjectGroupingMode,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import {
   AlarmClockIcon,
@@ -95,7 +100,11 @@ import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useNowMinute } from "../hooks/useNowMinute";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
-import { useProjects, useThreadShells } from "../state/entities";
+import {
+  readEnvironmentSupportsSettlement,
+  useProjects,
+  useThreadShells,
+} from "../state/entities";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
@@ -218,6 +227,20 @@ function threadTimeLabel(thread: SidebarThreadSummary): string {
 function settledTimeLabel(thread: SidebarThreadSummary): string {
   const timestamp = resolveSettledTimestamp(thread);
   return timestamp === null ? "" : compactSidebarTimeLabel(formatRelativeTimeLabel(timestamp));
+}
+
+export async function runSidebarThreadActionOnce<A>(
+  inFlightThreadKeys: Set<string>,
+  threadKey: string,
+  action: () => Promise<A>,
+): Promise<A | null> {
+  if (inFlightThreadKeys.has(threadKey)) return null;
+  inFlightThreadKeys.add(threadKey);
+  try {
+    return await action();
+  } finally {
+    inFlightThreadKeys.delete(threadKey);
+  }
 }
 
 // Floats at the row's right edge, vertically centered, while the jump
@@ -1529,6 +1552,17 @@ export default function SidebarV2() {
       }),
     [connectedThreadKeys, fabricDirectoryState?.sessions, scopedProjectKeys],
   );
+  const sessionFabricThreadBySessionId = useMemo(() => {
+    const byKey = new Map<string, EnvironmentThreadShell>(
+      threads.map((thread) => [`${thread.environmentId}:${thread.id}`, thread] as const),
+    );
+    return new Map(
+      publicLocalFabricSessions.flatMap((session) => {
+        const thread = byKey.get(`session-fabric:${session.sessionId}:${session.threadId}`);
+        return thread === undefined ? [] : ([[session.sessionId, thread]] as const);
+      }),
+    );
+  }, [publicLocalFabricSessions, threads]);
   const shadowedSessionFabricThreadKeys = useMemo(
     () =>
       selectShadowedSessionFabricThreadKeys(
@@ -1745,8 +1779,7 @@ export default function SidebarV2() {
     for (const thread of visible) {
       // Servers without the capability never classify as settled. The durable
       // thread projection is the sole settlement authority for every runner.
-      const supportsSettlement =
-        serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement === true;
+      const supportsSettlement = readEnvironmentSupportsSettlement(thread.environmentId);
       const supportsSnooze =
         serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true;
       const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
@@ -2047,8 +2080,8 @@ export default function SidebarV2() {
       void router.navigate({
         to: "/$environmentId/$threadId",
         params: {
-          environmentId: `session-fabric:${session.sessionId}`,
-          threadId: session.threadId,
+          environmentId: `session-fabric:${session.sessionId}` as EnvironmentId,
+          threadId: session.threadId as ThreadId,
         },
       });
     },
@@ -2117,6 +2150,7 @@ export default function SidebarV2() {
   // A settle per thread at a time: double clicks and repeated menu picks
   // must not dispatch a second settle that fails and toasts a false error.
   const settlingThreadKeysRef = useRef(new Set<string>());
+  const unsettlingThreadKeysRef = useRef(new Set<string>());
   // Parking the thread you're looking at (settle or snooze) moves you
   // forward: the next remaining card (never a settled or snoozed row, never
   // one leaving in the same batch), or a fresh draft in this project when it
@@ -2149,42 +2183,37 @@ export default function SidebarV2() {
 
   const attemptSettle = useCallback(
     (threadRef: ScopedThreadRef, opts: { coSettlingKeys?: ReadonlySet<string> } = {}) => {
-      void (async () => {
-        const threadKey = scopedThreadKey(threadRef);
-        if (settlingThreadKeysRef.current.has(threadKey)) return;
-        settlingThreadKeysRef.current.add(threadKey);
-        try {
-          const navigateAfterSettle = planForwardNavigation(threadKey, opts.coSettlingKeys);
-          const result = await settleThread(threadRef);
-          if (result._tag === "Failure") {
-            // Never navigate away from a thread that did not settle.
-            if (!isAtomCommandInterrupted(result)) {
-              const error = squashAtomCommandFailure(result);
-              toastManager.add(
-                stackedThreadToast({
-                  type: "error",
-                  title: "Failed to settle thread",
-                  description: error instanceof Error ? error.message : "An error occurred.",
-                }),
-              );
-            }
-            return;
+      const threadKey = scopedThreadKey(threadRef);
+      void runSidebarThreadActionOnce(settlingThreadKeysRef.current, threadKey, async () => {
+        const navigateAfterSettle = planForwardNavigation(threadKey, opts.coSettlingKeys);
+        const result = await settleThread(threadRef);
+        if (result._tag === "Failure") {
+          // Never navigate away from a thread that did not settle.
+          if (!isAtomCommandInterrupted(result)) {
+            const error = squashAtomCommandFailure(result);
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Failed to settle thread",
+                description: error instanceof Error ? error.message : "An error occurred.",
+              }),
+            );
           }
-          // Only move forward if the user is still on the settled thread —
-          // a navigation made during the await wins over ours.
-          if (routeThreadKeyRef.current === threadKey) {
-            navigateAfterSettle?.();
-          }
-        } finally {
-          settlingThreadKeysRef.current.delete(threadKey);
+          return;
         }
-      })();
+        // Only move forward if the user is still on the settled thread —
+        // a navigation made during the await wins over ours.
+        if (routeThreadKeyRef.current === threadKey) {
+          navigateAfterSettle?.();
+        }
+      });
     },
     [planForwardNavigation, settleThread],
   );
   const attemptUnsettle = useCallback(
     (threadRef: ScopedThreadRef) => {
-      void (async () => {
+      const threadKey = scopedThreadKey(threadRef);
+      void runSidebarThreadActionOnce(unsettlingThreadKeysRef.current, threadKey, async () => {
         const result = await unsettleThread(threadRef);
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
@@ -2196,7 +2225,7 @@ export default function SidebarV2() {
             }),
           );
         }
-      })();
+      });
     },
     [unsettleThread],
   );
@@ -2469,9 +2498,7 @@ export default function SidebarV2() {
         // clears the override, for auto-settled rows it pins the thread
         // active until real activity clears the pin. Environments without
         // the settlement capability get no lifecycle items at all.
-        const supportsSettlement =
-          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
-          true;
+        const supportsSettlement = readEnvironmentSupportsSettlement(thread.environmentId);
         const supportsSnooze =
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true;
         const supportsTitleRegeneration =
@@ -2999,10 +3026,9 @@ export default function SidebarV2() {
                               ? "unsettle"
                               : "settle"
                         }
-                        settlementSupported={
-                          serverConfigs.get(thread.environmentId)?.environment.capabilities
-                            .threadSettlement === true
-                        }
+                        settlementSupported={readEnvironmentSupportsSettlement(
+                          thread.environmentId,
+                        )}
                         snoozeSupported={
                           serverConfigs.get(thread.environmentId)?.environment.capabilities
                             .threadSnooze === true
@@ -3106,14 +3132,30 @@ export default function SidebarV2() {
                   items.push(
                     ...publicLocalFabricSessions.map((session) => {
                       const scaffoldLinks = sessionFabricScaffoldLinks(session);
+                      const fabricThread = sessionFabricThreadBySessionId.get(session.sessionId);
+                      const fabricThreadRef = fabricThread
+                        ? scopeThreadRef(fabricThread.environmentId, fabricThread.id)
+                        : null;
+                      const fabricThreadIsSettled =
+                        fabricThread !== undefined &&
+                        effectiveSettled(fabricThread, {
+                          now: `${nowMinute}:00.000Z`,
+                          autoSettleAfterDays,
+                          changeRequestState:
+                            changeRequestStateByKey.get(
+                              scopedThreadKey(
+                                scopeThreadRef(fabricThread.environmentId, fabricThread.id),
+                              ),
+                            ) ?? null,
+                        });
                       const environmentLabel =
                         session.environmentKind === "scaffold" ? "Scaffold" : "Local";
                       return (
                         <li key={`session-fabric:${session.sessionId}`} className="list-none py-px">
-                          <div className="group/v2-row rounded-md transition-colors hover:bg-sidebar-row-hover">
+                          <div className="group/v2-row relative rounded-md transition-colors hover:bg-sidebar-row-hover">
                             <button
                               type="button"
-                              className="w-full cursor-pointer px-2.5 pb-0.5 pt-1.5 text-left"
+                              className="w-full cursor-pointer pb-0.5 pl-2.5 pr-10 pt-1.5 text-left"
                               onClick={() => navigateToFabricSession(session)}
                             >
                               <div className="flex h-6 min-w-0 items-center gap-2">
@@ -3138,26 +3180,52 @@ export default function SidebarV2() {
                                 </span>
                               </div>
                             </button>
+                            {fabricThreadRef === null ? null : (
+                              <button
+                                type="button"
+                                aria-label={
+                                  fabricThreadIsSettled ? "Un-settle thread" : "Settle thread"
+                                }
+                                className="absolute right-2.5 top-1.5 inline-flex h-6 cursor-pointer items-center rounded-md px-2 text-xs text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/v2-row:opacity-100"
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  if (fabricThreadIsSettled) attemptUnsettle(fabricThreadRef);
+                                  else attemptSettle(fabricThreadRef);
+                                }}
+                              >
+                                {fabricThreadIsSettled ? (
+                                  <Undo2Icon className="size-3" />
+                                ) : (
+                                  <CheckIcon className="size-3" />
+                                )}
+                              </button>
+                            )}
                             {scaffoldLinks === null ? null : (
                               <div className="ml-6 flex items-center gap-1.5 px-2.5 pb-1.5 text-[11px]">
                                 {(
                                   [
                                     ["Session", scaffoldLinks.sessionUrl],
+                                    ["Agent", scaffoldLinks.agentUrl],
                                     ["Web", scaffoldLinks.webUrl],
                                     ["Tilt", scaffoldLinks.tiltUrl],
                                   ] as const
-                                ).map(([label, href]) => (
-                                  <a
-                                    key={label}
-                                    href={href}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                                    onClick={(event) => event.stopPropagation()}
-                                  >
-                                    {label}
-                                  </a>
-                                ))}
+                                )
+                                  .flatMap(([label, href]) =>
+                                    href === null ? [] : [[label, href] as const],
+                                  )
+                                  .map(([label, href]) => (
+                                    <a
+                                      key={label}
+                                      href={href}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                                      onClick={(event) => event.stopPropagation()}
+                                    >
+                                      {label}
+                                    </a>
+                                  ))}
                                 <button
                                   type="button"
                                   className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
@@ -3166,7 +3234,7 @@ export default function SidebarV2() {
                                     navigateToFabricSession(session);
                                   }}
                                 >
-                                  Agent
+                                  Mirror
                                 </button>
                               </div>
                             )}

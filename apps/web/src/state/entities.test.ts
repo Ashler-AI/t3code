@@ -2,7 +2,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveThreadDetailRef } from "./entities";
+import { environmentSupportsSettlement, resolveThreadDetailRef } from "./entities";
 
 const threadRef = scopeThreadRef(EnvironmentId.make("environment-1"), ThreadId.make("thread-1"));
 
@@ -32,5 +32,28 @@ describe("resolveThreadDetailRef", () => {
         waitForShell: false,
       }),
     ).toBe(threadRef);
+  });
+});
+
+describe("readEnvironmentSupportsSettlement", () => {
+  it("recognizes a virtual session-fabric source without fabricating server config", () => {
+    expect(
+      environmentSupportsSettlement({
+        serverConfig: null,
+        sourceTag: "SessionFabricConnectionTarget",
+      }),
+    ).toBe(true);
+  });
+
+  it("preserves direct environment version-skew behavior", () => {
+    expect(
+      environmentSupportsSettlement({ serverConfig: null, sourceTag: "PrimaryConnectionTarget" }),
+    ).toBe(false);
+    expect(
+      environmentSupportsSettlement({
+        serverConfig: { environment: { capabilities: { threadSettlement: true } } },
+        sourceTag: "ScaffoldConnectionTarget",
+      }),
+    ).toBe(true);
   });
 });

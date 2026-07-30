@@ -5,10 +5,12 @@ import {
   decideCommandSubmit,
   decideEventAppend,
   decideRunnerGeneration,
+  eventCancelsPendingSettlePause,
   isCurrentRunnerAttachment,
   nextSessionFabricMaintenanceDueAt,
   offlineScaffoldCommandCanWake,
   runnerHelloMatchesLease,
+  scaffoldWakeLifecycleAuthority,
   scaffoldWakeRetryDelayMs,
   scaffoldWakeKeepsCommandPending,
   scaffoldWakeFollowerStatus,
@@ -16,6 +18,13 @@ import {
   scaffoldWakeRequestsAuthority,
   SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
   SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+  settledEventCanQueueScaffoldPause,
+  settlePauseCanResettle,
+  settlePauseCancellationState,
+  settlePauseCompensationCommandId,
+  settlePauseLifecycleAuthority,
+  settlePauseNeedsCompensatingWake,
+  settlementEventIdFromCompensationCommand,
   snapshotProvesScaffoldWakeTarget,
   shouldReplayCommand,
 } from "./SessionStreamModel.ts";
@@ -195,10 +204,14 @@ describe("SessionStreamModel", () => {
   it("gates resumed command delivery on an exact Scaffold snapshot and runner generation", () => {
     const target = {
       wakeFabricSessionId: "fabric-session",
+      wakeEnvironmentId: "environment-1",
+      wakeThreadId: "thread-1",
       wakeScaffoldSessionId: "ses_scaffold",
       wakeTargetLifecycleEpoch: 8,
       snapshotFabricSessionId: "fabric-session",
       snapshotEnvironmentKind: "scaffold",
+      snapshotEnvironmentId: "environment-1",
+      snapshotThreadId: "thread-1",
       snapshotScaffoldSessionId: "ses_scaffold",
       snapshotLifecycleEpoch: 8,
       runnerGeneration: 8,
@@ -209,9 +222,109 @@ describe("SessionStreamModel", () => {
     expect(snapshotProvesScaffoldWakeTarget({ ...target, snapshotFabricSessionId: "other" })).toBe(
       false,
     );
+    expect(snapshotProvesScaffoldWakeTarget({ ...target, snapshotThreadId: "other" })).toBe(false);
     expect(
       snapshotProvesScaffoldWakeTarget({ ...target, snapshotScaffoldSessionId: "other" }),
     ).toBe(false);
+  });
+
+  it("queues only an exact current public Scaffold settlement and cancels pending work on activity", () => {
+    const candidate = {
+      eventType: "thread.settled",
+      eventThreadId: "thread-1",
+      snapshotThreadId: "thread-1",
+      publication: "public",
+      environmentKind: "scaffold",
+      scaffoldSessionId: "scaffold-1",
+      lifecycleEpoch: 7,
+      runnerGeneration: 7,
+    } as const;
+    expect(settledEventCanQueueScaffoldPause(candidate)).toBe(true);
+    expect(settledEventCanQueueScaffoldPause({ ...candidate, runnerGeneration: 8 })).toBe(false);
+    expect(settledEventCanQueueScaffoldPause({ ...candidate, publication: "local_only" })).toBe(
+      false,
+    );
+    expect(eventCancelsPendingSettlePause("thread.unsettled")).toBe(true);
+    expect(eventCancelsPendingSettlePause("thread.message-sent")).toBe(true);
+    expect(eventCancelsPendingSettlePause("thread.meta-updated")).toBe(false);
+    expect(scaffoldWakeKeepsCommandPending("joining_pause")).toBe(true);
+  });
+
+  it("records an in-flight cancellation and compensates when no command wake can carry it", () => {
+    expect(settlePauseCancellationState("pending")).toBe("cancelled");
+    expect(settlePauseCancellationState("in_flight")).toBe("cancel_requested");
+    expect(settlePauseCancellationState("completed")).toBeNull();
+    expect(
+      settlePauseNeedsCompensatingWake({ cancellationRequested: true, joinedCommandCount: 0 }),
+    ).toBe(true);
+    expect(
+      settlePauseNeedsCompensatingWake({ cancellationRequested: true, joinedCommandCount: 1 }),
+    ).toBe(false);
+    const commandId = settlePauseCompensationCommandId("event-settled-1");
+    expect(commandId).toBe("settled-pause:event-settled-1");
+    expect(settlementEventIdFromCompensationCommand(commandId)).toBe("event-settled-1");
+    expect(scaffoldWakeRequestsAuthority("retrying")).toBe(true);
+    expect(
+      snapshotProvesScaffoldWakeTarget({
+        wakeFabricSessionId: "fabric-1",
+        wakeEnvironmentId: "environment-1",
+        wakeThreadId: "thread-1",
+        wakeScaffoldSessionId: "scaffold-1",
+        wakeTargetLifecycleEpoch: 9,
+        snapshotFabricSessionId: "fabric-1",
+        snapshotEnvironmentKind: "scaffold",
+        snapshotEnvironmentId: "environment-1",
+        snapshotThreadId: "thread-1",
+        snapshotScaffoldSessionId: "scaffold-1",
+        snapshotLifecycleEpoch: 9,
+        runnerGeneration: 9,
+      }),
+    ).toBe(true);
+  });
+
+  it("advances durable authority through a settled pause before the next wake", () => {
+    const pausedEpoch = settlePauseLifecycleAuthority({
+      currentLifecycleEpoch: 7,
+      expectedLifecycleEpoch: 7,
+      targetLifecycleEpoch: 8,
+    });
+
+    expect(pausedEpoch).toBe(8);
+    const wakeExpectedEpoch = scaffoldWakeLifecycleAuthority({
+      durableLifecycleEpoch: pausedEpoch ?? 0,
+      controllerLifecycleEpoch: 7,
+    });
+    expect(wakeExpectedEpoch).toBe(8);
+    expect(
+      snapshotProvesScaffoldWakeTarget({
+        wakeFabricSessionId: "fabric-1",
+        wakeEnvironmentId: "environment-1",
+        wakeThreadId: "thread-1",
+        wakeScaffoldSessionId: "scaffold-1",
+        wakeTargetLifecycleEpoch: wakeExpectedEpoch + 1,
+        snapshotFabricSessionId: "fabric-1",
+        snapshotEnvironmentKind: "scaffold",
+        snapshotEnvironmentId: "environment-1",
+        snapshotThreadId: "thread-1",
+        snapshotScaffoldSessionId: "scaffold-1",
+        snapshotLifecycleEpoch: wakeExpectedEpoch + 1,
+        runnerGeneration: wakeExpectedEpoch + 1,
+      }),
+    ).toBe(true);
+    expect(
+      settlePauseLifecycleAuthority({
+        currentLifecycleEpoch: 8,
+        expectedLifecycleEpoch: 7,
+        targetLifecycleEpoch: 8,
+      }),
+    ).toBeNull();
+  });
+
+  it("allows a new settlement at the same epoch only after terminal cancellation or failure", () => {
+    expect(settlePauseCanResettle("cancelled")).toBe(true);
+    expect(settlePauseCanResettle("failed")).toBe(true);
+    expect(settlePauseCanResettle("pending")).toBe(false);
+    expect(settlePauseCanResettle("completed")).toBe(false);
   });
 
   it("bounds Scaffold wake retry backoff", () => {

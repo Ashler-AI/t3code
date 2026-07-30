@@ -1,4 +1,9 @@
-import { type SessionFabricCapabilityGrant, SessionFabricSessionId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  type SessionFabricCapabilityGrant,
+  SessionFabricSessionId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
@@ -11,6 +16,10 @@ import {
 } from "./sessionFabricAuthorization.ts";
 
 const expiresAt = "2026-07-27T20:10:00.000Z";
+const ENVIRONMENT_ID = EnvironmentId.make("environment-1");
+const THREAD_ID = ThreadId.make("thread-1");
+const LOCAL_ENVIRONMENT_ID = EnvironmentId.make("environment-local");
+const LOCAL_THREAD_ID = ThreadId.make("thread-local");
 
 function grant(role: "viewer" | "controller", token: string): SessionFabricCapabilityGrant {
   return {
@@ -28,6 +37,9 @@ function grant(role: "viewer" | "controller", token: string): SessionFabricCapab
         ? {}
         : {
             fabricSessionId: SessionFabricSessionId.make("fabric-1"),
+            environmentKind: "scaffold",
+            environmentId: ENVIRONMENT_ID,
+            threadId: THREAD_ID,
             scaffoldSessionId: "ses-1",
             scaffoldLifecycleEpoch: 2,
           },
@@ -169,6 +181,9 @@ describe("SessionFabricAuthorization", () => {
 
       const result = yield* authorization.controller({
         fabricSessionId: SessionFabricSessionId.make("fabric-1"),
+        environmentKind: "scaffold",
+        environmentId: ENVIRONMENT_ID,
+        threadId: THREAD_ID,
         scaffoldSessionId: "ses-1",
         scaffoldLifecycleEpoch: 2,
       });
@@ -179,6 +194,9 @@ describe("SessionFabricAuthorization", () => {
           body: {
             role: "controller",
             fabricSessionId: "fabric-1",
+            environmentKind: "scaffold",
+            environmentId: "environment-1",
+            threadId: "thread-1",
             scaffoldSessionId: "ses-1",
             scaffoldLifecycleEpoch: 2,
             deployment: "staging",
@@ -198,6 +216,9 @@ describe("SessionFabricAuthorization", () => {
             ...grant("controller", "controller-secret"),
             bindings: {
               fabricSessionId: SessionFabricSessionId.make("fabric-other"),
+              environmentKind: "scaffold",
+              environmentId: ENVIRONMENT_ID,
+              threadId: THREAD_ID,
               scaffoldSessionId: "ses-1",
               scaffoldLifecycleEpoch: 2,
             },
@@ -207,6 +228,9 @@ describe("SessionFabricAuthorization", () => {
       const error = yield* authorization
         .controller({
           fabricSessionId: SessionFabricSessionId.make("fabric-1"),
+          environmentKind: "scaffold",
+          environmentId: ENVIRONMENT_ID,
+          threadId: THREAD_ID,
           scaffoldSessionId: "ses-1",
           scaffoldLifecycleEpoch: 2,
         })
@@ -232,6 +256,9 @@ describe("SessionFabricAuthorization", () => {
       const error = yield* authorization
         .controller({
           fabricSessionId: SessionFabricSessionId.make("fabric-1"),
+          environmentKind: "scaffold",
+          environmentId: ENVIRONMENT_ID,
+          threadId: THREAD_ID,
           scaffoldSessionId: "ses-1",
           scaffoldLifecycleEpoch: 2,
         })
@@ -256,6 +283,9 @@ describe("SessionFabricAuthorization", () => {
       const error = yield* authorization
         .controller({
           fabricSessionId: SessionFabricSessionId.make("fabric-1"),
+          environmentKind: "scaffold",
+          environmentId: ENVIRONMENT_ID,
+          threadId: THREAD_ID,
           scaffoldSessionId: "ses-1",
           scaffoldLifecycleEpoch: 2,
         })
@@ -295,8 +325,8 @@ describe("SessionFabricAuthorization", () => {
       const result = yield* authorization.controller({
         fabricSessionId: SessionFabricSessionId.make("fabric-local"),
         environmentKind: "local",
-        environmentId: "environment-local",
-        threadId: "thread-local",
+        environmentId: LOCAL_ENVIRONMENT_ID,
+        threadId: LOCAL_THREAD_ID,
       });
       expect(result?.bindings).toMatchObject({
         environmentKind: "local",
@@ -340,8 +370,8 @@ describe("SessionFabricAuthorization", () => {
         .controller({
           fabricSessionId: SessionFabricSessionId.make("fabric-local"),
           environmentKind: "local",
-          environmentId: "environment-local",
-          threadId: "thread-local",
+          environmentId: LOCAL_ENVIRONMENT_ID,
+          threadId: LOCAL_THREAD_ID,
         })
         .pipe(Effect.flip);
 

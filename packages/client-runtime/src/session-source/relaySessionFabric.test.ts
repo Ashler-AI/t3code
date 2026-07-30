@@ -457,6 +457,13 @@ function makeSource(
 }
 
 describe("Relay session fabric UI source", () => {
+  it("advertises thread settlement without requiring a server config", () => {
+    expect(
+      makeSource(new TestRelay(), "client-capabilities").capabilitiesFromServerConfig(null)
+        .threadSettlement,
+    ).toBe(true);
+  });
+
   it.effect("loads the runtime schema module and fetches its authoritative snapshot", () =>
     Effect.gen(function* () {
       const relay = new TestRelay();
@@ -986,6 +993,9 @@ describe("Relay session fabric UI source", () => {
                 ? {}
                 : {
                     fabricSessionId: SESSION_ID,
+                    environmentKind: "scaffold",
+                    environmentId: ENVIRONMENT_ID,
+                    threadId: THREAD_ID,
                     scaffoldSessionId: "ses-scaffold-1",
                     scaffoldLifecycleEpoch: 2,
                   },
@@ -1150,6 +1160,9 @@ describe("Relay session fabric UI source", () => {
                     }
                   : {
                       fabricSessionId: body.fabricSessionId,
+                      environmentKind: "scaffold",
+                      environmentId: body.environmentId,
+                      threadId: body.threadId,
                       scaffoldSessionId: body.scaffoldSessionId,
                       scaffoldLifecycleEpoch: body.scaffoldLifecycleEpoch,
                     },
@@ -1563,6 +1576,9 @@ describe("Relay session fabric UI source", () => {
                   ? {}
                   : {
                       fabricSessionId: SESSION_ID,
+                      environmentKind: "scaffold",
+                      environmentId: ENVIRONMENT_ID,
+                      threadId: THREAD_ID,
                       scaffoldSessionId: "ses-scaffold-1",
                       scaffoldLifecycleEpoch: 2,
                     },

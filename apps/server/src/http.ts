@@ -155,6 +155,9 @@ const SessionFabricCapabilityProxyRequest = Schema.Union([
     ...sessionFabricCapabilityDeployment,
     role: Schema.Literal("controller"),
     fabricSessionId: SessionFabricSessionId,
+    environmentKind: Schema.Literal("scaffold"),
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
     scaffoldSessionId: TrimmedNonEmptyString,
     scaffoldLifecycleEpoch: Schema.Number,
   }),
@@ -502,7 +505,7 @@ export const scaffoldSessionFabricCapabilityRouteLayer = HttpRouter.add(
     const capability =
       input.role === "viewer"
         ? ({ role: "viewer" } as const)
-        : "environmentKind" in input
+        : input.environmentKind === "local"
           ? ({
               role: "controller",
               fabricSessionId: input.fabricSessionId,
@@ -513,6 +516,9 @@ export const scaffoldSessionFabricCapabilityRouteLayer = HttpRouter.add(
           : ({
               role: "controller",
               fabricSessionId: input.fabricSessionId,
+              environmentKind: input.environmentKind,
+              environmentId: input.environmentId,
+              threadId: input.threadId,
               scaffoldSessionId: input.scaffoldSessionId,
               scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch,
             } as const);

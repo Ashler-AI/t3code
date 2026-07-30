@@ -42,6 +42,7 @@ function record(input: {
             worktreePath: "/workspace/repo",
             scaffoldSessionId: null,
             scaffoldSessionUrl: null,
+            scaffoldSessionDetailUrl: null,
             scaffoldLifecycleEpoch: null,
           }
         : {
@@ -52,7 +53,8 @@ function record(input: {
             repositoryRoot: "/workspace/repo",
             worktreePath: "/workspace/repo",
             scaffoldSessionId: "ses_scaffold",
-            scaffoldSessionUrl: "https://scaffold.example/sessions/ses_scaffold",
+            scaffoldSessionUrl: "https://sandbox.example/sessions/ses_scaffold/agent",
+            scaffoldSessionDetailUrl: "https://scaffold-agent.example/?q=ses_scaffold",
             scaffoldLifecycleEpoch: 1,
           },
     initialPrompt: null,
@@ -88,6 +90,7 @@ describe("session fabric sidebar", () => {
         runnerState: "online",
         scaffoldSessionId: null,
         scaffoldSessionUrl: null,
+        scaffoldSessionDetailUrl: null,
       },
       {
         sessionId: "public-scaffold",
@@ -98,13 +101,14 @@ describe("session fabric sidebar", () => {
         title: "public-scaffold",
         runnerState: "online",
         scaffoldSessionId: "ses_scaffold",
-        scaffoldSessionUrl: "https://scaffold.example/sessions/ses_scaffold",
+        scaffoldSessionUrl: "https://sandbox.example/sessions/ses_scaffold/agent",
+        scaffoldSessionDetailUrl: "https://scaffold-agent.example/?q=ses_scaffold",
       },
     ]);
   });
 
-  it("keeps session rows in creation order when opening a session updates activity", () => {
-    const sessions = selectPublicLocalSidebarSessions([
+  it("keeps every session row in the same order when opening one updates its activity", () => {
+    const records = [
       record({
         sessionId: "newer-session",
         publication: "public",
@@ -119,12 +123,26 @@ describe("session fabric sidebar", () => {
         createdAt: "2026-07-28T00:00:00.000Z",
         updatedAt: "2026-07-30T00:00:00.000Z",
       }),
-    ]);
+      record({
+        sessionId: "oldest-unrelated-session",
+        publication: "public",
+        environmentKind: "local",
+        createdAt: "2026-07-27T00:00:00.000Z",
+        updatedAt: "2026-07-27T00:00:00.000Z",
+      }),
+    ];
+    const beforeOpening = selectPublicLocalSidebarSessions(
+      records.map((session) =>
+        session.sessionId === "older-session-opened-now"
+          ? { ...session, updatedAt: "2026-07-28T00:00:00.000Z" }
+          : session,
+      ),
+    );
+    const afterOpening = selectPublicLocalSidebarSessions(records);
 
-    expect(sessions.map((session) => session.sessionId)).toEqual([
-      "newer-session",
-      "older-session-opened-now",
-    ]);
+    expect(afterOpening.map((session) => session.sessionId)).toEqual(
+      beforeOpening.map((session) => session.sessionId),
+    );
   });
 
   it("derives Scaffold destinations only from authoritative location metadata", () => {
@@ -133,9 +151,59 @@ describe("session fabric sidebar", () => {
     ]);
 
     expect(sessionFabricScaffoldLinks(session!)).toEqual({
-      sessionUrl: "https://scaffold.example/sessions/ses_scaffold",
-      webUrl: "https://scaffold.example/sessions/ses_scaffold/web",
-      tiltUrl: "https://scaffold.example/sessions/ses_scaffold/tilt",
+      sessionUrl: "https://scaffold-agent.example/?q=ses_scaffold",
+      agentUrl: "https://sandbox.example/sessions/ses_scaffold/agent",
+      webUrl: "https://sandbox.example/sessions/ses_scaffold/web",
+      tiltUrl: "https://sandbox.example/sessions/ses_scaffold/tilt",
+    });
+  });
+
+  it("shows only direct sandbox destinations for snapshots without detail metadata", () => {
+    const [session] = selectPublicLocalSidebarSessions([
+      record({ sessionId: "public-scaffold", publication: "public", environmentKind: "scaffold" }),
+    ]);
+
+    expect(
+      sessionFabricScaffoldLinks({
+        ...session!,
+        scaffoldSessionDetailUrl: null,
+      }),
+    ).toEqual({
+      sessionUrl: null,
+      agentUrl: "https://sandbox.example/sessions/ses_scaffold/agent",
+      webUrl: "https://sandbox.example/sessions/ses_scaffold/web",
+      tiltUrl: "https://sandbox.example/sessions/ses_scaffold/tilt",
+    });
+  });
+
+  it("normalizes one optional trailing slash on an authoritative Agent URL", () => {
+    const [session] = selectPublicLocalSidebarSessions([
+      record({ sessionId: "public-scaffold", publication: "public", environmentKind: "scaffold" }),
+    ]);
+
+    expect(
+      sessionFabricScaffoldLinks({
+        ...session!,
+        scaffoldSessionUrl: "https://sandbox.example/sessions/ses_scaffold/agent/",
+      }),
+    ).toEqual({
+      sessionUrl: "https://scaffold-agent.example/?q=ses_scaffold",
+      agentUrl: "https://sandbox.example/sessions/ses_scaffold/agent",
+      webUrl: "https://sandbox.example/sessions/ses_scaffold/web",
+      tiltUrl: "https://sandbox.example/sessions/ses_scaffold/tilt",
+    });
+  });
+
+  it("does not replace the explicit detail host when the direct URL is absent", () => {
+    const [session] = selectPublicLocalSidebarSessions([
+      record({ sessionId: "public-scaffold", publication: "public", environmentKind: "scaffold" }),
+    ]);
+
+    expect(sessionFabricScaffoldLinks({ ...session!, scaffoldSessionUrl: null })).toEqual({
+      sessionUrl: "https://scaffold-agent.example/?q=ses_scaffold",
+      agentUrl: null,
+      webUrl: null,
+      tiltUrl: null,
     });
   });
 
@@ -151,8 +219,55 @@ describe("session fabric sidebar", () => {
         environmentKind: "scaffold",
         scaffoldSessionId: "ses_scaffold",
         scaffoldSessionUrl: "javascript:alert(1)",
+        scaffoldSessionDetailUrl: null,
       }),
     ).toBeNull();
+
+    for (const scaffoldSessionUrl of [
+      "https://scaffold.example/?q=another-session",
+      "https://scaffold.example/?q=ses_scaffold&q=ses_scaffold",
+      "https://scaffold.example/sessions/another-session",
+      "https://user:password@scaffold.example/sessions/ses_scaffold",
+      "https://scaffold.example/not-sessions/ses_scaffold",
+      "https://scaffold.example/sessions/ses_scaffold/agent//",
+    ]) {
+      expect(
+        sessionFabricScaffoldLinks({
+          ...local!,
+          environmentKind: "scaffold",
+          scaffoldSessionId: "ses_scaffold",
+          scaffoldSessionUrl,
+          scaffoldSessionDetailUrl: null,
+        }),
+      ).toBeNull();
+    }
+    expect(
+      sessionFabricScaffoldLinks({
+        ...local!,
+        environmentKind: "scaffold",
+        scaffoldSessionId: "",
+        scaffoldSessionUrl: "https://scaffold.example/?q=",
+        scaffoldSessionDetailUrl: null,
+      }),
+    ).toBeNull();
+
+    for (const scaffoldSessionDetailUrl of [
+      "https://scaffold-agent.example/?q=another-session",
+      "https://scaffold-agent.example/?q=ses_scaffold&q=ses_scaffold",
+      "https://scaffold-agent.example/?q=ses_scaffold&extra=1",
+      "https://user:password@scaffold-agent.example/?q=ses_scaffold",
+      "https://scaffold-agent.example/session?q=ses_scaffold",
+    ]) {
+      expect(
+        sessionFabricScaffoldLinks({
+          ...local!,
+          environmentKind: "scaffold",
+          scaffoldSessionId: "ses_scaffold",
+          scaffoldSessionUrl: null,
+          scaffoldSessionDetailUrl,
+        }),
+      ).toBeNull();
+    }
   });
 
   it("recovers from an initial discovery failure after auth and network changes", async () => {
@@ -436,15 +551,18 @@ describe("session fabric sidebar", () => {
     ]);
     const connectedThreadKeys = new Set(["session-fabric:shared-session:shared-thread"]);
 
-    expect(selectShadowedSessionFabricThreadKeys(sessions, connectedThreadKeys)).toEqual(
-      new Set(["session-fabric:shared-session:shared-thread"]),
+    const shadowedShellKeys = selectShadowedSessionFabricThreadKeys(sessions, connectedThreadKeys);
+    const renderedCatalogRowKeys = selectVisibleSessionFabricSidebarSessions(sessions, {
+      connectedThreadKeys,
+      scopedProjectKeys: null,
+    }).map((session) => `session-fabric:${session.sessionId}`);
+    const renderedRelayShellKeys = [...connectedThreadKeys].filter(
+      (threadKey) => !shadowedShellKeys.has(threadKey),
     );
-    expect(
-      selectVisibleSessionFabricSidebarSessions(sessions, {
-        connectedThreadKeys,
-        scopedProjectKeys: null,
-      }),
-    ).toEqual(sessions);
+
+    expect([...renderedCatalogRowKeys, ...renderedRelayShellKeys]).toEqual([
+      "session-fabric:shared-session",
+    ]);
   });
 
   it("prefers a connected direct row over both the catalog row and a mounted relay shell", () => {
@@ -462,14 +580,17 @@ describe("session fabric sidebar", () => {
       "session-fabric:shared-session:shared-thread",
     ]);
 
-    expect(selectShadowedSessionFabricThreadKeys(sessions, connectedThreadKeys)).toEqual(
-      new Set(["session-fabric:shared-session:shared-thread"]),
+    const shadowedShellKeys = selectShadowedSessionFabricThreadKeys(sessions, connectedThreadKeys);
+    const renderedCatalogRowKeys = selectVisibleSessionFabricSidebarSessions(sessions, {
+      connectedThreadKeys,
+      scopedProjectKeys: null,
+    }).map((session) => `session-fabric:${session.sessionId}`);
+    const renderedConnectedRowKeys = [...connectedThreadKeys].filter(
+      (threadKey) => !shadowedShellKeys.has(threadKey),
     );
-    expect(
-      selectVisibleSessionFabricSidebarSessions(sessions, {
-        connectedThreadKeys,
-        scopedProjectKeys: null,
-      }),
-    ).toEqual([]);
+
+    expect([...renderedCatalogRowKeys, ...renderedConnectedRowKeys]).toEqual([
+      "direct-environment:shared-thread",
+    ]);
   });
 });

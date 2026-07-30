@@ -10,12 +10,14 @@ export interface SessionFabricSidebarSession {
   readonly runnerState: SessionFabricRunnerState;
   readonly scaffoldSessionId: string | null;
   readonly scaffoldSessionUrl: string | null;
+  readonly scaffoldSessionDetailUrl: string | null;
 }
 
 export interface SessionFabricScaffoldLinks {
-  readonly sessionUrl: string;
-  readonly webUrl: string;
-  readonly tiltUrl: string;
+  readonly sessionUrl: string | null;
+  readonly agentUrl: string | null;
+  readonly webUrl: string | null;
+  readonly tiltUrl: string | null;
 }
 
 export type SessionFabricSidebarDirectoryState =
@@ -158,6 +160,7 @@ export function selectPublicLocalSidebarSessions(
         runnerState: session.runnerState,
         scaffoldSessionId: session.location.scaffoldSessionId,
         scaffoldSessionUrl: session.location.scaffoldSessionUrl,
+        scaffoldSessionDetailUrl: session.location.scaffoldSessionDetailUrl ?? null,
       }))
   );
 }
@@ -168,23 +171,61 @@ export function sessionFabricScaffoldLinks(
   if (
     session.environmentKind !== "scaffold" ||
     session.scaffoldSessionId === null ||
-    session.scaffoldSessionUrl === null
+    !/^ses_[A-Za-z0-9_-]+$/u.test(session.scaffoldSessionId)
   ) {
     return null;
   }
 
-  try {
-    const sessionUrl = new URL(session.scaffoldSessionUrl);
-    if (sessionUrl.protocol !== "https:" && sessionUrl.protocol !== "http:") return null;
-    const sessionId = encodeURIComponent(session.scaffoldSessionId);
-    return {
-      sessionUrl: sessionUrl.toString(),
-      webUrl: new URL(`/sessions/${sessionId}/web`, sessionUrl.origin).toString(),
-      tiltUrl: new URL(`/sessions/${sessionId}/tilt`, sessionUrl.origin).toString(),
-    };
-  } catch {
-    return null;
-  }
+  const validHttpUrl = (value: string): URL | null => {
+    try {
+      const url = new URL(value);
+      if (
+        (url.protocol !== "https:" && url.protocol !== "http:") ||
+        url.username !== "" ||
+        url.password !== "" ||
+        url.hash !== ""
+      ) {
+        return null;
+      }
+      return url;
+    } catch {
+      return null;
+    }
+  };
+  const encodedSessionId = encodeURIComponent(session.scaffoldSessionId);
+  const authoritativeAgentPath = `/sessions/${encodedSessionId}/agent`;
+  const directUrl =
+    session.scaffoldSessionUrl === null ? null : validHttpUrl(session.scaffoldSessionUrl);
+  const directUrlIsAuthoritative =
+    directUrl !== null &&
+    directUrl.search === "" &&
+    (directUrl.pathname === authoritativeAgentPath ||
+      directUrl.pathname === `${authoritativeAgentPath}/`);
+  const detailUrl =
+    session.scaffoldSessionDetailUrl === null
+      ? null
+      : validHttpUrl(session.scaffoldSessionDetailUrl);
+  const detailUrlIsAuthoritative =
+    detailUrl !== null &&
+    detailUrl.pathname === "/" &&
+    [...detailUrl.searchParams.keys()].length === 1 &&
+    detailUrl.searchParams.getAll("q").length === 1 &&
+    detailUrl.searchParams.get("q") === session.scaffoldSessionId;
+
+  if (!directUrlIsAuthoritative && !detailUrlIsAuthoritative) return null;
+
+  return {
+    sessionUrl: detailUrlIsAuthoritative ? detailUrl.toString() : null,
+    agentUrl: directUrlIsAuthoritative
+      ? new URL(authoritativeAgentPath, directUrl.origin).toString()
+      : null,
+    webUrl: directUrlIsAuthoritative
+      ? new URL(`/sessions/${encodedSessionId}/web`, directUrl.origin).toString()
+      : null,
+    tiltUrl: directUrlIsAuthoritative
+      ? new URL(`/sessions/${encodedSessionId}/tilt`, directUrl.origin).toString()
+      : null,
+  };
 }
 
 export function selectVisibleSessionFabricSidebarSessions(

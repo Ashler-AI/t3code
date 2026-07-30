@@ -33,6 +33,17 @@ type ThreadTag = typeof ORCHESTRATION_WS_METHODS.subscribeThread;
 export interface UiSessionSourceCapabilities {
   readonly shellResumeCompletionMarker: boolean;
   readonly threadResumeCompletionMarker: boolean;
+  readonly threadSettlement: boolean;
+}
+
+export interface UiSessionSourceCapabilityConfig {
+  readonly shellResumeCompletionMarker?: boolean;
+  readonly threadResumeCompletionMarker?: boolean;
+  readonly environment?: {
+    readonly capabilities?: {
+      readonly threadSettlement?: boolean;
+    };
+  };
 }
 
 export interface UiSessionSourceSubscriptionOptions<E> {
@@ -47,6 +58,9 @@ export interface UiSessionListing {
 }
 
 export interface UiSessionSourceShape {
+  readonly capabilitiesFromServerConfig: (
+    config: UiSessionSourceCapabilityConfig | null,
+  ) => UiSessionSourceCapabilities;
   readonly authoritativeShellSnapshot: (
     prepared: PreparedConnection,
   ) => Effect.Effect<Option.Option<OrchestrationShellSnapshot>>;

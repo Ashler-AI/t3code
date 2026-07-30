@@ -174,6 +174,7 @@ describe("SessionFabricRunner", () => {
       overrideThreadId: Option.none(),
       scaffoldSessionId: Option.some("ses_scaffold"),
       scaffoldSessionUrl: Option.none(),
+      scaffoldSessionDetailUrl: Option.none(),
       scaffoldCapabilityBaseUrl: Option.some(new URL("https://worker.example.test/")),
       scaffoldLifecycleEpoch: Option.some(4),
       runtimeApiToken: Option.some("runtime-secret"),
@@ -258,7 +259,8 @@ describe("SessionFabricRunner", () => {
       environmentId: EnvironmentId.make("environment-1"),
       environmentKind: "scaffold",
       scaffoldSessionId: "ses_scaffold",
-      scaffoldSessionUrl: "https://scaffold.example.test/?q=ses_scaffold",
+      scaffoldSessionUrl: "https://scaffold.example.test/sessions/ses_scaffold/agent",
+      scaffoldSessionDetailUrl: "https://scaffold-agent.example.test/?q=ses_scaffold",
       scaffoldLifecycleEpoch: 3,
       publication: "public",
       acknowledgedEventSequence: 5,
@@ -277,6 +279,8 @@ describe("SessionFabricRunner", () => {
     expect(snapshot?.session.location).toMatchObject({
       environmentKind: "scaffold",
       scaffoldSessionId: "ses_scaffold",
+      scaffoldSessionUrl: "https://scaffold.example.test/sessions/ses_scaffold/agent",
+      scaffoldSessionDetailUrl: "https://scaffold-agent.example.test/?q=ses_scaffold",
       scaffoldLifecycleEpoch: 3,
     });
   });
@@ -447,6 +451,7 @@ describe("SessionFabricRunner", () => {
         overrideThreadId: Option.none(),
         scaffoldSessionId: Option.some("ses_scaffold"),
         scaffoldSessionUrl: Option.some("https://scaffold.example.test/?q=ses_scaffold"),
+        scaffoldSessionDetailUrl: Option.none(),
         scaffoldCapabilityBaseUrl: Option.some(new URL("https://worker.example.test/")),
         scaffoldLifecycleEpoch: Option.some(4),
         runtimeApiToken: Option.some("runtime-secret"),
@@ -731,6 +736,7 @@ describe("SessionFabricRunner", () => {
         overrideThreadId: Option.none(),
         scaffoldSessionId: Option.none(),
         scaffoldSessionUrl: Option.none(),
+        scaffoldSessionDetailUrl: Option.none(),
         scaffoldCapabilityBaseUrl: Option.some(new URL("https://worker.example.test/")),
         scaffoldLifecycleEpoch: Option.none(),
         runtimeApiToken: Option.none(),
@@ -751,6 +757,7 @@ describe("SessionFabricRunner", () => {
       overrideThreadId: Option.none(),
       scaffoldSessionId: Option.some("ses_scaffold"),
       scaffoldSessionUrl: Option.some("https://scaffold.example.test/?q=ses_scaffold"),
+      scaffoldSessionDetailUrl: Option.none(),
       scaffoldLifecycleEpoch: Option.some(4),
       runtimeApiToken: Option.some("runtime-secret"),
       authMode: "required" as const,
@@ -784,6 +791,9 @@ describe("SessionFabricRunner", () => {
       scaffoldSessionId: Option.some("ses_scaffold"),
       scaffoldSessionUrl: Option.some(
         "https://scaffold-staging.internal.ashler.com/sessions/ses_scaffold/agent/",
+      ),
+      scaffoldSessionDetailUrl: Option.some(
+        "https://scaffold-agent-staging.internal.ashler.com/?q=ses_scaffold",
       ),
       scaffoldCapabilityBaseUrl: Option.some(
         new URL("https://scaffold-control-plane-staging.workers.dev/"),

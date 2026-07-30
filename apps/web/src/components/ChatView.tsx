@@ -219,6 +219,7 @@ import { threadEnvironment } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import {
+  readEnvironmentSupportsSettlement,
   useProject,
   useProjects,
   useThread,
@@ -4329,7 +4330,8 @@ function ChatViewContent(props: ChatViewProps) {
     threadBranch: activeThread?.branch ?? null,
     gitStatus: gitStatusQuery.data ?? null,
   });
-  const supportsSettlement = serverConfig?.environment.capabilities.threadSettlement === true;
+  const supportsSettlement =
+    activeThread != null && readEnvironmentSupportsSettlement(activeThread.environmentId);
   const supportsSnooze = serverConfig?.environment.capabilities.threadSnooze === true;
   const nowMinute = useNowMinute();
   const activeThreadSnoozed =

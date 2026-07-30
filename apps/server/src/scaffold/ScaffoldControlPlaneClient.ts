@@ -37,6 +37,9 @@ export type ScaffoldSessionFabricCapabilityInput =
   | {
       readonly role: "controller";
       readonly fabricSessionId: SessionFabricSessionId;
+      readonly environmentKind: "scaffold";
+      readonly environmentId: EnvironmentId;
+      readonly threadId: ThreadId;
       readonly scaffoldSessionId: string;
       readonly scaffoldLifecycleEpoch: number;
     }
@@ -182,7 +185,10 @@ function validateCapabilityGrant(
   ) {
     throw invalidCapability();
   }
-  const scaffoldBindings = "environmentKind" in grant.bindings ? null : grant.bindings;
+  const scaffoldBindings =
+    !("environmentKind" in grant.bindings) || grant.bindings.environmentKind === "scaffold"
+      ? grant.bindings
+      : null;
   if (input.role === "viewer") {
     if (
       scaffoldBindings === null ||
@@ -196,7 +202,7 @@ function validateCapabilityGrant(
     return grant;
   }
   if (input.role === "controller") {
-    if ("environmentKind" in input) {
+    if (input.environmentKind === "local") {
       const localBindings = "environmentKind" in grant.bindings ? grant.bindings : null;
       if (
         localBindings === null ||
@@ -214,6 +220,9 @@ function validateCapabilityGrant(
       scaffoldBindings === null ||
       !hasExactScopes(grant.scopes, ["session:read", "session:command"]) ||
       scaffoldBindings.fabricSessionId !== input.fabricSessionId ||
+      scaffoldBindings.environmentKind !== "scaffold" ||
+      scaffoldBindings.environmentId !== input.environmentId ||
+      scaffoldBindings.threadId !== input.threadId ||
       scaffoldBindings.scaffoldSessionId !== input.scaffoldSessionId ||
       scaffoldBindings.scaffoldLifecycleEpoch !== input.scaffoldLifecycleEpoch
     ) {

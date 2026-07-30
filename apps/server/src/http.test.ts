@@ -95,12 +95,18 @@ describe("session fabric capability proxy", () => {
       decodeSessionFabricCapabilityProxyBody({
         role: "controller",
         fabricSessionId,
+        environmentKind: "scaffold",
+        environmentId: EnvironmentId.make("env_1"),
+        threadId: ThreadId.make("thread_1"),
         scaffoldSessionId: "ses_1",
         scaffoldLifecycleEpoch: 7,
       }),
     ).toEqual({
       role: "controller",
       fabricSessionId,
+      environmentKind: "scaffold",
+      environmentId: "env_1",
+      threadId: "thread_1",
       scaffoldSessionId: "ses_1",
       scaffoldLifecycleEpoch: 7,
     });

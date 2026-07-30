@@ -81,6 +81,11 @@ describe("environment commands", () => {
       const supervisor = yield* makeSupervisor([]);
       yield* SubscriptionRef.set(supervisor.session, Option.none());
       const source = UiSessionSource.of({
+        capabilitiesFromServerConfig: () => ({
+          shellResumeCompletionMarker: false,
+          threadResumeCompletionMarker: false,
+          threadSettlement: false,
+        }),
         authoritativeShellSnapshot: () => Effect.succeed(Option.none()),
         authoritativeThreadSnapshot: () => Effect.succeed(Option.none()),
         subscribeShell: () => Stream.never,

@@ -13,6 +13,9 @@ export type SessionFabricCapabilityRole = "viewer" | "controller";
 export type SessionFabricControllerBinding =
   | {
       readonly fabricSessionId: SessionFabricSessionId;
+      readonly environmentKind: "scaffold";
+      readonly environmentId: string;
+      readonly threadId: string;
       readonly scaffoldSessionId: string;
       readonly scaffoldLifecycleEpoch: number;
     }
@@ -160,7 +163,7 @@ function decodeGrant(
     return null;
   }
   const bindings = value.bindings;
-  if ("environmentKind" in binding) {
+  if (binding.environmentKind === "local") {
     if (
       !("environmentKind" in bindings) ||
       bindings.environmentKind !== "local" ||
@@ -173,8 +176,11 @@ function decodeGrant(
     return value;
   }
   if (
-    "environmentKind" in bindings ||
+    !("environmentKind" in bindings) ||
+    bindings.environmentKind !== "scaffold" ||
     bindings.fabricSessionId !== binding.fabricSessionId ||
+    bindings.environmentId !== binding.environmentId ||
+    bindings.threadId !== binding.threadId ||
     bindings.scaffoldSessionId !== binding.scaffoldSessionId ||
     bindings.scaffoldLifecycleEpoch !== binding.scaffoldLifecycleEpoch
   )
@@ -199,9 +205,9 @@ export function makeSessionFabricCapabilityAuthorization(
   ) => {
     if (role === "viewer") return role;
     if (binding === undefined) return `${role}:missing`;
-    return "environmentKind" in binding
+    return binding.environmentKind === "local"
       ? `${role}:local:${binding.fabricSessionId}:${binding.environmentId}:${binding.threadId}`
-      : `${role}:scaffold:${binding.fabricSessionId}:${binding.scaffoldSessionId}:${binding.scaffoldLifecycleEpoch}`;
+      : `${role}:scaffold:${binding.fabricSessionId}:${binding.environmentId}:${binding.threadId}:${binding.scaffoldSessionId}:${binding.scaffoldLifecycleEpoch}`;
   };
 
   const invalidate = (
