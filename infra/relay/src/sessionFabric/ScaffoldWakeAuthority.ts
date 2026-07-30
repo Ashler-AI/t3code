@@ -20,6 +20,8 @@ export interface ScaffoldWakeAuthorityConfig {
 export interface ScaffoldWakeAuthorityRequest {
   readonly fabricSessionId: string;
   readonly commandId: string;
+  readonly environmentId: string;
+  readonly threadId: string;
   readonly scaffoldSessionId: string;
   readonly expectedLifecycleEpoch: number;
   readonly actorId: string;
@@ -30,6 +32,8 @@ export interface ScaffoldWakeAuthorityResponse {
   readonly version: typeof RESPONSE_VERSION;
   readonly fabricSessionId: string;
   readonly commandId: string;
+  readonly environmentId: string;
+  readonly threadId: string;
   readonly scaffoldSessionId: string;
   readonly expectedLifecycleEpoch: number;
   readonly targetLifecycleEpoch: number;
@@ -139,6 +143,8 @@ function validRequest(input: ScaffoldWakeAuthorityRequest): boolean {
   return (
     nonEmptyString(input.fabricSessionId) &&
     nonEmptyString(input.commandId) &&
+    nonEmptyString(input.environmentId) &&
+    nonEmptyString(input.threadId) &&
     nonEmptyString(input.scaffoldSessionId) &&
     Number.isSafeInteger(input.expectedLifecycleEpoch) &&
     input.expectedLifecycleEpoch >= 0 &&
@@ -155,6 +161,8 @@ function isResponse(value: unknown): value is ScaffoldWakeAuthorityResponse {
     response.version === RESPONSE_VERSION &&
     nonEmptyString(response.fabricSessionId) &&
     nonEmptyString(response.commandId) &&
+    nonEmptyString(response.environmentId) &&
+    nonEmptyString(response.threadId) &&
     nonEmptyString(response.scaffoldSessionId) &&
     Number.isSafeInteger(response.expectedLifecycleEpoch) &&
     Number.isSafeInteger(response.targetLifecycleEpoch) &&
@@ -293,6 +301,8 @@ export async function wakeScaffoldSession(
   if (
     decoded.fabricSessionId !== input.fabricSessionId ||
     decoded.commandId !== input.commandId ||
+    decoded.environmentId !== input.environmentId ||
+    decoded.threadId !== input.threadId ||
     decoded.scaffoldSessionId !== input.scaffoldSessionId ||
     decoded.expectedLifecycleEpoch !== input.expectedLifecycleEpoch ||
     decoded.targetLifecycleEpoch !== input.expectedLifecycleEpoch + 1

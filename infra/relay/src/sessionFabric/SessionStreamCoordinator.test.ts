@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  ProviderInstanceId,
   ProjectId,
   SessionFabricRunnerId,
   SessionFabricSessionId,
@@ -23,8 +24,11 @@ import {
   localControllerMatchesPinnedAuthority,
   localRunnerCanClaimPinnedAuthority,
   localViewerCanReadPinnedAuthority,
+  legacyWakeIdentityFromStoredSnapshot,
   normalizeSnapshotToRelayCursor,
   scaffoldControllerMatchesSnapshotIdentity,
+  scaffoldWakeExpectedLifecycleEpoch,
+  scaffoldWakeIdentityMatches,
   snapshotAuthorityCanAdvance,
   type LocalSessionFabricPinnedAuthority,
 } from "./SessionStreamCoordinator.ts";
@@ -316,6 +320,9 @@ describe("SessionStreamCoordinator local authority", () => {
       role: "controller",
       scopes: ["session:read", "session:command"],
       fabricSessionId: sessionId,
+      environmentKind: "scaffold",
+      environmentId,
+      threadId,
       scaffoldSessionId: "scaffold-a",
       scaffoldLifecycleEpoch: 8,
       actorId: "actor-a",
@@ -345,6 +352,162 @@ describe("SessionStreamCoordinator local authority", () => {
         location: scaffoldLocation,
       }),
     ).toBe(false);
+  });
+
+  it("allows only an exact one-step settled-pause advance for a stale controller", () => {
+    const settledPause = {
+      expectedLifecycleEpoch: 7,
+      targetLifecycleEpoch: 8,
+      status: "completed",
+    } as const;
+
+    expect(
+      scaffoldWakeExpectedLifecycleEpoch({
+        durableLifecycleEpoch: 8,
+        controllerLifecycleEpoch: 7,
+        snapshotLifecycleEpoch: 7,
+        settlePauseProof: settledPause,
+      }),
+    ).toBe(8);
+    expect(
+      scaffoldWakeExpectedLifecycleEpoch({
+        durableLifecycleEpoch: 8,
+        controllerLifecycleEpoch: 7,
+        snapshotLifecycleEpoch: 7,
+        settlePauseProof: undefined,
+      }),
+    ).toBeNull();
+    expect(
+      scaffoldWakeExpectedLifecycleEpoch({
+        durableLifecycleEpoch: 9,
+        controllerLifecycleEpoch: 7,
+        snapshotLifecycleEpoch: 7,
+        settlePauseProof: settledPause,
+      }),
+    ).toBeNull();
+  });
+
+  it("backfills legacy wake identity only from a matching trusted retained snapshot", () => {
+    const snapshotJson = JSON.stringify({
+      session: {
+        sessionId,
+        title: "Session",
+        publication: "public",
+        runnerState: "offline",
+        location: {
+          ...location,
+          environmentKind: "scaffold",
+          scaffoldSessionId: "scaffold-a",
+          scaffoldSessionUrl: "https://scaffold.example/s/scaffold-a",
+          scaffoldLifecycleEpoch: 7,
+        },
+        initialPrompt: null,
+        searchableText: "Session",
+        summary: null,
+        cursor: { eventSequence: 0, snapshotSequence: 1 },
+        lastEventAt: null,
+        createdAt: "2026-07-24T20:00:00.000Z",
+        updatedAt: "2026-07-24T20:00:00.000Z",
+      },
+      shell: {
+        snapshotSequence: 1,
+        projects: [],
+        threads: [],
+        updatedAt: "2026-07-24T20:00:00.000Z",
+      },
+      thread: {
+        snapshotSequence: 1,
+        thread: {
+          id: threadId,
+          projectId: ProjectId.make("project-a"),
+          title: "Session",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("omp"),
+            model: "gpt-5.6-terra",
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: "main",
+          worktreePath: "/workspace/project-a",
+          latestTurn: null,
+          createdAt: "2026-07-24T20:00:00.000Z",
+          updatedAt: "2026-07-24T20:00:00.000Z",
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          deletedAt: null,
+          messages: [],
+          proposedPlans: [],
+          activities: [],
+          checkpoints: [],
+          session: null,
+        },
+      },
+      compactedThroughEventSequence: 0,
+    });
+
+    expect(
+      legacyWakeIdentityFromStoredSnapshot({ snapshotJson, scaffoldSessionId: "scaffold-a" }),
+    ).toEqual({ environmentId, threadId });
+    expect(
+      legacyWakeIdentityFromStoredSnapshot({ snapshotJson, scaffoldSessionId: "scaffold-b" }),
+    ).toBeNull();
+    expect(
+      legacyWakeIdentityFromStoredSnapshot({
+        snapshotJson: "not-json",
+        scaffoldSessionId: "scaffold-a",
+      }),
+    ).toBeNull();
+  });
+
+  it.each([
+    {
+      name: "another environment",
+      wakeEnvironmentId: "environment-b",
+      wakeThreadId: "thread-a",
+    },
+    {
+      name: "another thread",
+      wakeEnvironmentId: "environment-a",
+      wakeThreadId: "thread-b",
+    },
+    {
+      name: "a legacy null environment",
+      wakeEnvironmentId: null,
+      wakeThreadId: "thread-a",
+    },
+    {
+      name: "a legacy null thread",
+      wakeEnvironmentId: "environment-a",
+      wakeThreadId: null,
+    },
+  ])("does not share a Scaffold wake with $name at the same session and epoch", (wake) => {
+    expect(
+      scaffoldWakeIdentityMatches({
+        ...wake,
+        wakeScaffoldSessionId: "scaffold-a",
+        wakeExpectedLifecycleEpoch: 7,
+        environmentId: "environment-a",
+        threadId: "thread-a",
+        scaffoldSessionId: "scaffold-a",
+        expectedLifecycleEpoch: 7,
+      }),
+    ).toBe(false);
+  });
+
+  it("shares a Scaffold wake only for the exact non-null identity", () => {
+    expect(
+      scaffoldWakeIdentityMatches({
+        wakeEnvironmentId: "environment-a",
+        wakeThreadId: "thread-a",
+        wakeScaffoldSessionId: "scaffold-a",
+        wakeExpectedLifecycleEpoch: 7,
+        environmentId: "environment-a",
+        threadId: "thread-a",
+        scaffoldSessionId: "scaffold-a",
+        expectedLifecycleEpoch: 7,
+      }),
+    ).toBe(true);
   });
 
   it("reveals pinned local authority only to the same authenticated viewer actor", () => {

@@ -71,6 +71,7 @@ export const SessionFabricExecutionLocation = Schema.Struct({
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   scaffoldSessionId: Schema.NullOr(TrimmedNonEmptyString),
   scaffoldSessionUrl: Schema.NullOr(TrimmedNonEmptyString),
+  scaffoldSessionDetailUrl: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   scaffoldLifecycleEpoch: Schema.optional(Schema.NullOr(NonNegativeInt)),
 });
 export type SessionFabricExecutionLocation = typeof SessionFabricExecutionLocation.Type;
@@ -137,6 +138,9 @@ export const SessionFabricScaffoldControllerCapabilityClaims = Schema.Struct({
   actorId: TrimmedNonEmptyString,
   scopes: Schema.Tuple([Schema.Literal("session:read"), Schema.Literal("session:command")]),
   fabricSessionId: SessionFabricSessionId,
+  environmentKind: Schema.Literal("scaffold"),
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
   scaffoldSessionId: TrimmedNonEmptyString,
   scaffoldLifecycleEpoch: NonNegativeInt,
 });
@@ -206,6 +210,9 @@ export type SessionFabricCapabilityClaims = typeof SessionFabricCapabilityClaims
 
 const SessionFabricScaffoldCapabilityGrantBindings = Schema.Struct({
   fabricSessionId: Schema.optional(SessionFabricSessionId),
+  environmentKind: Schema.optional(Schema.Literal("scaffold")),
+  environmentId: Schema.optional(EnvironmentId),
+  threadId: Schema.optional(ThreadId),
   scaffoldSessionId: Schema.optional(TrimmedNonEmptyString),
   scaffoldLifecycleEpoch: Schema.optional(NonNegativeInt),
 }).annotate({ parseOptions: { onExcessProperty: "error" } });

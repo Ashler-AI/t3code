@@ -39,7 +39,8 @@ describe("session fabric contracts", () => {
         repositoryRoot: "/workspace/ashler-platform",
         worktreePath: null,
         scaffoldSessionId: "ses_123",
-        scaffoldSessionUrl: "https://scaffold.example/ses_123",
+        scaffoldSessionUrl: "https://scaffold.example/sessions/ses_123/agent",
+        scaffoldSessionDetailUrl: "https://scaffold-agent.example/?q=ses_123",
         scaffoldLifecycleEpoch: 7,
       },
       publication: "public",
@@ -52,7 +53,35 @@ describe("session fabric contracts", () => {
     expect(hello.location.environmentId).toBe(EnvironmentId.make("scaffold-environment-2"));
     expect(hello.location.projectId).toBe(ProjectId.make("project-1"));
     expect(hello.location.threadId).toBe(ThreadId.make("thread-9"));
+    expect(hello.location.scaffoldSessionDetailUrl).toBe(
+      "https://scaffold-agent.example/?q=ses_123",
+    );
     expect(hello.location.scaffoldLifecycleEpoch).toBe(7);
+  });
+
+  it("accepts execution locations published before Scaffold detail links existed", () => {
+    const hello = decodeRunnerHello({
+      protocolVersion: SESSION_FABRIC_PROTOCOL_VERSION,
+      sessionId: "global-session-1",
+      runnerId: "runner-1",
+      runnerGeneration: 2,
+      location: {
+        environmentKind: "scaffold",
+        environmentId: "scaffold-environment-2",
+        projectId: "project-1",
+        threadId: "thread-9",
+        repositoryRoot: "/workspace/ashler-platform",
+        worktreePath: null,
+        scaffoldSessionId: "ses_123",
+        scaffoldSessionUrl: "https://scaffold.example/sessions/ses_123/agent",
+        scaffoldLifecycleEpoch: 7,
+      },
+      publication: "public",
+      lastCommittedEventSequence: 41,
+      connectedAt: "2026-07-24T20:00:00.000Z",
+    });
+
+    expect(hello.location.scaffoldSessionDetailUrl).toBeUndefined();
   });
 
   it("keeps global viewer authority separate from exact controller and runner bindings", () => {

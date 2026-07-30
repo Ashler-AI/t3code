@@ -7,16 +7,17 @@ import type { ShellSnapshotLoader } from "../state/shellSnapshotHttp.ts";
 import type { ThreadSnapshotLoader } from "../state/threadSnapshotHttp.ts";
 import {
   UiSessionSource,
+  type UiSessionSourceCapabilityConfig,
   type UiSessionSourceCapabilities,
   type UiSessionSourceShape,
 } from "./source.ts";
 
-const capabilitiesFromConfig = (config: {
-  readonly shellResumeCompletionMarker?: boolean;
-  readonly threadResumeCompletionMarker?: boolean;
-}): UiSessionSourceCapabilities => ({
-  shellResumeCompletionMarker: config.shellResumeCompletionMarker === true,
-  threadResumeCompletionMarker: config.threadResumeCompletionMarker === true,
+const capabilitiesFromConfig = (
+  config: UiSessionSourceCapabilityConfig | null,
+): UiSessionSourceCapabilities => ({
+  shellResumeCompletionMarker: config?.shellResumeCompletionMarker === true,
+  threadResumeCompletionMarker: config?.threadResumeCompletionMarker === true,
+  threadSettlement: config?.environment?.capabilities?.threadSettlement === true,
 });
 
 export function makeDirectEnvironmentUiSessionSource(input: {
@@ -24,6 +25,7 @@ export function makeDirectEnvironmentUiSessionSource(input: {
   readonly threadSnapshotLoader: ThreadSnapshotLoader["Service"];
 }): UiSessionSourceShape {
   return UiSessionSource.of({
+    capabilitiesFromServerConfig: capabilitiesFromConfig,
     authoritativeShellSnapshot: (prepared) => input.shellSnapshotLoader.load(prepared),
     authoritativeThreadSnapshot: (prepared, threadId) =>
       input.threadSnapshotLoader.load(prepared, threadId),
@@ -33,7 +35,7 @@ export function makeDirectEnvironmentUiSessionSource(input: {
         (session) =>
           session.initialConfig.pipe(
             Effect.map(capabilitiesFromConfig),
-            Effect.orElseSucceed(() => capabilitiesFromConfig({})),
+            Effect.orElseSucceed(() => capabilitiesFromConfig(null)),
             Effect.flatMap(makeInput),
           ),
         options,
@@ -44,7 +46,7 @@ export function makeDirectEnvironmentUiSessionSource(input: {
         (session) =>
           session.initialConfig.pipe(
             Effect.map(capabilitiesFromConfig),
-            Effect.orElseSucceed(() => capabilitiesFromConfig({})),
+            Effect.orElseSucceed(() => capabilitiesFromConfig(null)),
             Effect.flatMap(makeInput),
           ),
         options,

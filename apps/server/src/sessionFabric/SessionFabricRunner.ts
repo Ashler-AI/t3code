@@ -82,6 +82,7 @@ const SessionFabricRunnerEnvConfig = Config.all({
   overrideThreadId: Config.string("T3CODE_SESSION_FABRIC_THREAD_ID").pipe(Config.option),
   scaffoldSessionId: Config.string("SCAFFOLD_SESSION_ID").pipe(Config.option),
   scaffoldSessionUrl: Config.string("SCAFFOLD_SESSION_URL").pipe(Config.option),
+  scaffoldSessionDetailUrl: Config.string("SCAFFOLD_SESSION_DETAIL_URL").pipe(Config.option),
   scaffoldCapabilityBaseUrl: Config.url("T3CODE_SESSION_FABRIC_CAPABILITY_BASE_URL").pipe(
     Config.option,
   ),
@@ -109,6 +110,7 @@ export interface SessionFabricRunnerConfig {
   readonly overrideThreadId: ThreadId | null;
   readonly scaffoldSessionId: string | null;
   readonly scaffoldSessionUrl: string | null;
+  readonly scaffoldSessionDetailUrl: string | null;
   readonly scaffoldCapabilityBaseUrl: URL | null;
   readonly scaffoldLifecycleEpoch: number | null;
   readonly runtimeApiToken: string | null;
@@ -167,6 +169,7 @@ export function resolveSessionFabricRunnerConfig(
     throw new Error("Scaffold lifecycle epoch must be non-negative.");
   }
   const scaffoldSessionUrl = optionValue(config.scaffoldSessionUrl);
+  const scaffoldSessionDetailUrl = optionValue(config.scaffoldSessionDetailUrl);
   const scaffoldCapabilityBaseUrl = normalizeScaffoldCapabilityBaseUrl(
     optionValue(config.scaffoldCapabilityBaseUrl),
   );
@@ -178,6 +181,7 @@ export function resolveSessionFabricRunnerConfig(
     environmentKind === "local" &&
     (scaffoldSessionId !== null ||
       scaffoldSessionUrl !== null ||
+      scaffoldSessionDetailUrl !== null ||
       scaffoldCapabilityBaseUrl !== null ||
       scaffoldLifecycleEpoch !== null ||
       runtimeApiToken !== null)
@@ -200,6 +204,7 @@ export function resolveSessionFabricRunnerConfig(
     overrideThreadId: overrideThreadId === null ? null : (overrideThreadId as ThreadId),
     scaffoldSessionId,
     scaffoldSessionUrl,
+    scaffoldSessionDetailUrl,
     scaffoldCapabilityBaseUrl,
     scaffoldLifecycleEpoch,
     runtimeApiToken,
@@ -395,6 +400,7 @@ export function buildSessionFabricSnapshot(input: {
   readonly environmentKind: SessionFabricEnvironmentKind;
   readonly scaffoldSessionId: string | null;
   readonly scaffoldSessionUrl: string | null;
+  readonly scaffoldSessionDetailUrl: string | null;
   readonly scaffoldLifecycleEpoch: number | null;
   readonly publication: "public" | "local_only";
   readonly acknowledgedEventSequence: number;
@@ -423,6 +429,7 @@ export function buildSessionFabricSnapshot(input: {
     worktreePath: input.detail.thread.worktreePath,
     scaffoldSessionId: input.scaffoldSessionId,
     scaffoldSessionUrl: input.scaffoldSessionUrl,
+    scaffoldSessionDetailUrl: input.scaffoldSessionDetailUrl,
     scaffoldLifecycleEpoch: input.scaffoldLifecycleEpoch,
   };
   return {
@@ -590,6 +597,7 @@ export const make = Effect.gen(function* () {
       environmentKind: config.environmentKind,
       scaffoldSessionId: config.scaffoldSessionId,
       scaffoldSessionUrl: config.scaffoldSessionUrl,
+      scaffoldSessionDetailUrl: config.scaffoldSessionDetailUrl,
       scaffoldLifecycleEpoch: config.scaffoldLifecycleEpoch,
       publication: config.publication,
       acknowledgedEventSequence,

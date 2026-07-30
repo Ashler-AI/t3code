@@ -252,6 +252,9 @@ describe("ScaffoldLifecycleService", () => {
         capability: {
           role: "controller",
           fabricSessionId: GLOBAL_SESSION_ID,
+          environmentKind: "scaffold",
+          environmentId: ENVIRONMENT_ID,
+          threadId: THREAD_ID,
           scaffoldSessionId: "ses_1",
           scaffoldLifecycleEpoch: 3,
         },
@@ -264,6 +267,9 @@ describe("ScaffoldLifecycleService", () => {
     expect(issueSessionFabricCapability).toHaveBeenNthCalledWith(2, {
       role: "controller",
       fabricSessionId: GLOBAL_SESSION_ID,
+      environmentKind: "scaffold",
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
       scaffoldSessionId: "ses_1",
       scaffoldLifecycleEpoch: 3,
     });

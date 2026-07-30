@@ -339,6 +339,9 @@ export function capabilityCanReadSession(
   }
   return (
     claims.fabricSessionId === snapshot.session.sessionId &&
+    claims.environmentKind === snapshot.session.location.environmentKind &&
+    claims.environmentId === snapshot.session.location.environmentId &&
+    claims.threadId === snapshot.session.location.threadId &&
     claims.scaffoldSessionId === snapshot.session.location.scaffoldSessionId &&
     claims.scaffoldLifecycleEpoch === snapshot.session.location.scaffoldLifecycleEpoch
   );
@@ -366,6 +369,9 @@ export function capabilityCanControlSession(input: {
   return (
     isPublicScaffoldLocation(location) &&
     claims.fabricSessionId === sessionId &&
+    claims.environmentKind === location.environmentKind &&
+    claims.environmentId === location.environmentId &&
+    claims.threadId === location.threadId &&
     claims.scaffoldSessionId === location.scaffoldSessionId &&
     claims.scaffoldLifecycleEpoch === location.scaffoldLifecycleEpoch
   );

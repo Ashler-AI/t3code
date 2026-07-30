@@ -70,8 +70,85 @@ export function scaffoldWakeKeepsCommandPending(status: string): boolean {
     status === "pending" ||
     status === "retrying" ||
     status === "joining" ||
+    status === "joining_pause" ||
     status === "awaiting_snapshot" ||
     status === "ready"
+  );
+}
+
+export function eventCancelsPendingSettlePause(eventType: string): boolean {
+  return (
+    eventType === "thread.unsettled" ||
+    eventType === "thread.turn-start-requested" ||
+    eventType === "thread.message-sent" ||
+    eventType === "thread.activity-appended"
+  );
+}
+
+export function settlePauseCancellationState(
+  status: string,
+): "cancelled" | "cancel_requested" | null {
+  if (status === "pending") return "cancelled";
+  if (status === "in_flight") return "cancel_requested";
+  return null;
+}
+
+export function settlePauseCanResettle(status: string): boolean {
+  return status === "cancelled" || status === "failed";
+}
+
+export function settlePauseLifecycleAuthority(input: {
+  readonly currentLifecycleEpoch: number;
+  readonly expectedLifecycleEpoch: number;
+  readonly targetLifecycleEpoch: number;
+}): number | null {
+  return input.currentLifecycleEpoch === input.expectedLifecycleEpoch &&
+    input.targetLifecycleEpoch === input.expectedLifecycleEpoch + 1
+    ? input.targetLifecycleEpoch
+    : null;
+}
+
+export function scaffoldWakeLifecycleAuthority(input: {
+  readonly durableLifecycleEpoch: number;
+  readonly controllerLifecycleEpoch: number;
+}): number {
+  return Math.max(input.durableLifecycleEpoch, input.controllerLifecycleEpoch);
+}
+
+export function settlePauseNeedsCompensatingWake(input: {
+  readonly cancellationRequested: boolean;
+  readonly joinedCommandCount: number;
+}): boolean {
+  return input.cancellationRequested && input.joinedCommandCount === 0;
+}
+
+export function settlePauseCompensationCommandId(settlementEventId: string): string {
+  return `settled-pause:${settlementEventId}`;
+}
+
+export function settlementEventIdFromCompensationCommand(commandId: string): string | null {
+  return commandId.startsWith("settled-pause:")
+    ? commandId.slice("settled-pause:".length) || null
+    : null;
+}
+
+export function settledEventCanQueueScaffoldPause(input: {
+  readonly eventType: string;
+  readonly eventThreadId: string;
+  readonly snapshotThreadId: string;
+  readonly publication: string;
+  readonly environmentKind: string;
+  readonly scaffoldSessionId: string | null;
+  readonly lifecycleEpoch: number | null | undefined;
+  readonly runnerGeneration: number;
+}): boolean {
+  return (
+    input.eventType === "thread.settled" &&
+    input.eventThreadId === input.snapshotThreadId &&
+    input.publication === "public" &&
+    input.environmentKind === "scaffold" &&
+    input.scaffoldSessionId !== null &&
+    input.lifecycleEpoch === input.runnerGeneration
   );
 }
 
@@ -94,10 +171,12 @@ export function scaffoldWakeFollowerStatus(input: {
 export function nextSessionFabricMaintenanceDueAt(input: {
   readonly directoryDueAt: number | null;
   readonly wakeDueAt: number | null;
+  readonly pauseDueAt?: number | null;
 }): number | null {
-  if (input.directoryDueAt === null) return input.wakeDueAt;
-  if (input.wakeDueAt === null) return input.directoryDueAt;
-  return Math.min(input.directoryDueAt, input.wakeDueAt);
+  const due = [input.directoryDueAt, input.wakeDueAt, input.pauseDueAt ?? null].filter(
+    (value): value is number => value !== null,
+  );
+  return due.length === 0 ? null : Math.min(...due);
 }
 
 export function offlineScaffoldCommandCanWake(input: {
@@ -126,10 +205,14 @@ export function offlineScaffoldCommandCanWake(input: {
 
 export function snapshotProvesScaffoldWakeTarget(input: {
   readonly wakeFabricSessionId: string;
+  readonly wakeEnvironmentId: string;
+  readonly wakeThreadId: string;
   readonly wakeScaffoldSessionId: string;
   readonly wakeTargetLifecycleEpoch: number | null;
   readonly snapshotFabricSessionId: string;
   readonly snapshotEnvironmentKind: string;
+  readonly snapshotEnvironmentId: string;
+  readonly snapshotThreadId: string;
   readonly snapshotScaffoldSessionId: string | null;
   readonly snapshotLifecycleEpoch: number | null | undefined;
   readonly runnerGeneration: number;
@@ -138,6 +221,8 @@ export function snapshotProvesScaffoldWakeTarget(input: {
     input.wakeTargetLifecycleEpoch !== null &&
     input.snapshotFabricSessionId === input.wakeFabricSessionId &&
     input.snapshotEnvironmentKind === "scaffold" &&
+    input.snapshotEnvironmentId === input.wakeEnvironmentId &&
+    input.snapshotThreadId === input.wakeThreadId &&
     input.snapshotScaffoldSessionId === input.wakeScaffoldSessionId &&
     input.snapshotLifecycleEpoch === input.wakeTargetLifecycleEpoch &&
     input.runnerGeneration === input.wakeTargetLifecycleEpoch

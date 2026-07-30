@@ -68,6 +68,9 @@ const controller = {
   actorId: "user-1",
   scopes: ["session:read", "session:command"],
   fabricSessionId: SessionFabricSessionId.make("sf:env:thread"),
+  environmentKind: "scaffold",
+  environmentId: EnvironmentId.make("environment-1"),
+  threadId: ThreadId.make("thread-1"),
   scaffoldSessionId: "ses_1",
   scaffoldLifecycleEpoch: 7,
 } as const satisfies SessionFabricCapabilityClaims;

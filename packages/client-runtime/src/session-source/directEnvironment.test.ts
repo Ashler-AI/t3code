@@ -55,6 +55,15 @@ describe("direct environment UI session source", () => {
         }),
       });
 
+      expect(
+        source.capabilitiesFromServerConfig({
+          environment: { capabilities: { threadSettlement: true } },
+        }),
+      ).toMatchObject({ threadSettlement: true });
+      expect(source.capabilitiesFromServerConfig(null)).toMatchObject({
+        threadSettlement: false,
+      });
+
       const threads = yield* source.listThreads(PREPARED);
       const sessions = yield* source.listSessions(PREPARED);
 

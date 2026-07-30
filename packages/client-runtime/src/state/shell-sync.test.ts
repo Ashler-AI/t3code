@@ -86,6 +86,11 @@ describe("environment shell synchronization", () => {
         clear: () => Effect.void,
       });
       const source = UiSessionSource.of({
+        capabilitiesFromServerConfig: () => ({
+          shellResumeCompletionMarker: false,
+          threadResumeCompletionMarker: false,
+          threadSettlement: false,
+        }),
         authoritativeShellSnapshot: () => Effect.succeed(Option.some(LIVE_SHELL_SNAPSHOT)),
         authoritativeThreadSnapshot: () => Effect.succeed(Option.none()),
         subscribeShell: (makeInput) =>
@@ -93,6 +98,7 @@ describe("environment shell synchronization", () => {
             makeInput({
               shellResumeCompletionMarker: false,
               threadResumeCompletionMarker: false,
+              threadSettlement: false,
             }).pipe(
               Effect.tap((input) => Ref.set(capturedAfterSequence, input.afterSequence)),
               Effect.as(Stream.never),

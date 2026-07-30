@@ -340,6 +340,9 @@ describe("ScaffoldControlPlaneClient", () => {
           keyId: "proof-1",
           bindings: {
             fabricSessionId,
+            environmentKind: "scaffold",
+            environmentId: "environment-1",
+            threadId: "thread-1",
             scaffoldSessionId: "ses_1",
             scaffoldLifecycleEpoch: 7,
           },
@@ -350,6 +353,9 @@ describe("ScaffoldControlPlaneClient", () => {
       client.issueSessionFabricCapability({
         role: "controller",
         fabricSessionId,
+        environmentKind: "scaffold",
+        environmentId: EnvironmentId.make("environment-1"),
+        threadId: ThreadId.make("thread-1"),
         scaffoldSessionId: "ses_1",
         scaffoldLifecycleEpoch: 7,
       }),
@@ -358,6 +364,9 @@ describe("ScaffoldControlPlaneClient", () => {
       JSON.stringify({
         role: "controller",
         fabricSessionId,
+        environmentKind: "scaffold",
+        environmentId: "environment-1",
+        threadId: "thread-1",
         scaffoldSessionId: "ses_1",
         scaffoldLifecycleEpoch: 7,
       }),

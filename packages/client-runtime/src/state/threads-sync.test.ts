@@ -433,6 +433,11 @@ describe("EnvironmentThreads", () => {
         title: "Injected source title",
       };
       const source = UiSessionSource.of({
+        capabilitiesFromServerConfig: () => ({
+          shellResumeCompletionMarker: false,
+          threadResumeCompletionMarker: false,
+          threadSettlement: false,
+        }),
         authoritativeShellSnapshot: () => Effect.succeed(Option.none()),
         authoritativeThreadSnapshot: (_prepared, threadId) =>
           Ref.update(authoritativeCalls, (count) => count + 1).pipe(
@@ -448,6 +453,7 @@ describe("EnvironmentThreads", () => {
             makeInput({
               shellResumeCompletionMarker: false,
               threadResumeCompletionMarker: false,
+              threadSettlement: false,
             }).pipe(
               Effect.tap((input) => Ref.set(subscribeAfterSequence, input.afterSequence)),
               Effect.as(Stream.never),

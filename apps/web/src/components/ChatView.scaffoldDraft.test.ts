@@ -8,6 +8,15 @@ import {
 } from "./BranchToolbar.logic";
 
 describe("Scaffold draft controls", () => {
+  it("uses the source-aware settlement capability for the open-thread banner and action", () => {
+    expect(chatViewSource).toMatch(
+      /const supportsSettlement =\s*activeThread != null &&\s*readEnvironmentSupportsSettlement\(activeThread\.environmentId\);/u,
+    );
+    expect(chatViewSource).toMatch(
+      /if \(activeThreadShell === null \|\| !supportsSettlement\) return false;[\s\S]*?handleUnsettleActiveThread/u,
+    );
+  });
+
   it("keeps the composer independent from sandbox startup", () => {
     expect(chatViewSource).toContain("isConnecting={composerIsConnecting}");
     expect(chatViewSource).toContain("isSendBusy || composerIsConnecting || isRevertingCheckpoint");

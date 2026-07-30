@@ -44,6 +44,7 @@ import type { UiSessionSourceCapabilities, UiSessionSourceShape } from "./source
 const CAPABILITIES: UiSessionSourceCapabilities = {
   shellResumeCompletionMarker: true,
   threadResumeCompletionMarker: true,
+  threadSettlement: true,
 };
 
 const decodeSnapshot = Schema.decodeUnknownEffect(SessionFabricSnapshotSchema);
@@ -305,6 +306,9 @@ export function makeRelaySessionFabricUiSessionSource(
     }
     return {
       fabricSessionId: options.sessionId,
+      environmentKind: "scaffold",
+      environmentId: location.environmentId,
+      threadId: location.threadId,
       scaffoldSessionId: location.scaffoldSessionId,
       scaffoldLifecycleEpoch: location.scaffoldLifecycleEpoch,
     } satisfies SessionFabricControllerBinding;
@@ -709,6 +713,7 @@ export function makeRelaySessionFabricUiSessionSource(
   };
 
   return {
+    capabilitiesFromServerConfig: () => CAPABILITIES,
     authoritativeShellSnapshot: () =>
       loadSnapshot().pipe(Effect.map(Option.map((snapshot) => snapshot.shell))),
     authoritativeThreadSnapshot: (_prepared, threadId) =>

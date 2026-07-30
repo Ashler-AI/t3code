@@ -72,11 +72,27 @@ describe("Sidebar v2 default", () => {
     expect(sidebarV2Source).toContain("environmentId: `session-fabric:${session.sessionId}`");
     expect(sidebarV2Source).not.toContain("window.location.assign(");
     expect(sidebarV2Source).toContain('["Session", scaffoldLinks.sessionUrl]');
+    expect(sidebarV2Source).toContain('["Agent", scaffoldLinks.agentUrl]');
     expect(sidebarV2Source).toContain('["Web", scaffoldLinks.webUrl]');
     expect(sidebarV2Source).toContain('["Tilt", scaffoldLinks.tiltUrl]');
+    expect(sidebarV2Source).toContain("Mirror");
     expect(sidebarV2Source).toContain("onClick={(event) => event.stopPropagation()}");
     expect(sidebarV2Source).toContain(
       "event.stopPropagation();\n                                  navigateToFabricSession(session);",
     );
+  });
+
+  it("keeps one stable shared-session row through shell hydration and dispatches its lifecycle control once", () => {
+    expect(sidebarV2Source).toContain("key={`session-fabric:${session.sessionId}`}");
+    expect(sidebarV2Source).toContain("sessionFabricThreadBySessionId.get(session.sessionId)");
+    expect(sidebarV2Source).toContain("selectShadowedSessionFabricThreadKeys(");
+    expect(sidebarV2Source).toContain(
+      'fabricThreadIsSettled ? "Un-settle thread" : "Settle thread"',
+    );
+    expect(sidebarV2Source).toContain(
+      "if (fabricThreadIsSettled) attemptUnsettle(fabricThreadRef)",
+    );
+    expect(sidebarV2Source).toContain("else attemptSettle(fabricThreadRef)");
+    expect(sidebarV2Source).toContain("runSidebarThreadActionOnce(");
   });
 });
