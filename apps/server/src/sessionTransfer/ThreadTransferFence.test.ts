@@ -51,6 +51,7 @@ const SAFE_COMMAND_TYPES = [
   "thread.turn.diff.complete",
   "thread.activity.append",
   "thread.revert.complete",
+  "thread.title.regeneration.complete",
 ] as const satisfies ReadonlyArray<OrchestrationCommand["type"]>;
 
 type UnclassifiedCommandType = Exclude<
