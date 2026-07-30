@@ -1,14 +1,20 @@
 import { DraftId } from "../composerDraftStore";
-import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import type { ScaffoldLifecycleActionStore } from "@t3tools/client-runtime/scaffold";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   createIndexedDbScaffoldLifecycleActionStore,
   createMemoryScaffoldLifecycleActionStore,
+  createScaffoldLifecycleDrainRunner,
   drainScaffoldLifecycleActions,
   enqueueScaffoldLifecycleAction,
   makeScaffoldCreateAction,
+  makeScaffoldPauseAction,
   retryScaffoldLifecycleAction,
+  resolveScaffoldLifecycleRetryDelay,
+  scaffoldPauseInputFromAction,
+  subscribeScaffoldLifecycleDrain,
 } from "./scaffoldLifecycleOutbox";
 
 function makeIndexedDbWithRows(initial: ReadonlyArray<unknown>): {
@@ -84,6 +90,116 @@ function makeSerializedNavigatorLocks() {
 describe("Scaffold lifecycle browser outbox", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("reruns a drain when a wake arrives while the current pass is active", async () => {
+    let releaseFirstRun: (() => void) | undefined;
+    const firstRun = new Promise<void>((resolve) => {
+      releaseFirstRun = resolve;
+    });
+    const runs: Array<string | undefined> = [];
+    const onIdle = vi.fn(async () => undefined);
+    const runner = createScaffoldLifecycleDrainRunner({
+      run: async (actionId) => {
+        runs.push(actionId);
+        if (runs.length === 1) await firstRun;
+      },
+      onIdle,
+      onError: (error) => {
+        throw error;
+      },
+    });
+
+    const active = runner.drain("op_first");
+    await vi.waitFor(() => expect(runs).toEqual(["op_first"]));
+    const queued = runner.drain("op_second");
+    releaseFirstRun?.();
+    await Promise.all([active, queued]);
+
+    expect(runs).toEqual(["op_first", undefined]);
+    expect(onIdle).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a queued wake and rearms retry scheduling after a rejected drain", async () => {
+    let rejectFirstRun: ((error: Error) => void) | undefined;
+    const firstRun = new Promise<void>((_resolve, reject) => {
+      rejectFirstRun = reject;
+    });
+    const runs: Array<string | undefined> = [];
+    const onIdle = vi.fn(async () => undefined);
+    const onError = vi.fn();
+    const runner = createScaffoldLifecycleDrainRunner({
+      run: async (actionId) => {
+        runs.push(actionId);
+        if (runs.length === 1) await firstRun;
+      },
+      onIdle,
+      onError,
+    });
+
+    const active = runner.drain("op_first");
+    await vi.waitFor(() => expect(runs).toEqual(["op_first"]));
+    const queued = runner.drain("op_second");
+    rejectFirstRun?.(new Error("temporary failure"));
+    await Promise.all([active, queued]);
+
+    expect(runs).toEqual(["op_first", undefined]);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onIdle).toHaveBeenCalledOnce();
+  });
+
+  it("does not schedule a retry after disposal wins a pending outbox read", async () => {
+    let releaseList:
+      | ((actions: Awaited<ReturnType<ScaffoldLifecycleActionStore["list"]>>) => void)
+      | undefined;
+    const list = new Promise<Awaited<ReturnType<ScaffoldLifecycleActionStore["list"]>>>(
+      (resolve) => {
+        releaseList = resolve;
+      },
+    );
+    const store: ScaffoldLifecycleActionStore = {
+      list: () => list,
+      put: async () => undefined,
+      remove: async () => undefined,
+    };
+    let disposed = false;
+    const retryDelay = resolveScaffoldLifecycleRetryDelay({
+      store,
+      isDisposed: () => disposed,
+      now: () => 100,
+    });
+
+    disposed = true;
+    releaseList?.([
+      makeScaffoldCreateAction({
+        draftId: DraftId.make("draft-disposed"),
+        deployment: "production",
+        sourceEnvironmentId: EnvironmentId.make("source-environment"),
+        sourceProjectId: ProjectId.make("source-project"),
+        create: { name: "Disposed", modelRouteId: "openai/gpt-5.6-sol", agentEffort: "high" },
+        createdAt: "2026-07-29T00:00:00.000Z",
+      }),
+    ]);
+
+    await expect(retryDelay).resolves.toBeNull();
+  });
+
+  it("wakes overdue lifecycle work when the page returns to the foreground", () => {
+    vi.stubGlobal("window", new EventTarget());
+    vi.stubGlobal(
+      "document",
+      Object.assign(new EventTarget(), { visibilityState: "visible" as DocumentVisibilityState }),
+    );
+    const listener = vi.fn();
+    const unsubscribe = subscribeScaffoldLifecycleDrain(listener);
+
+    window.dispatchEvent(new Event("pageshow"));
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    expect(listener).toHaveBeenCalledTimes(2);
+    unsubscribe();
+    window.dispatchEvent(new Event("pageshow"));
+    expect(listener).toHaveBeenCalledTimes(2);
   });
 
   it("decodes structured-cloned actions and ignores malformed persisted rows", async () => {
@@ -332,6 +448,15 @@ describe("Scaffold lifecycle browser outbox", () => {
       lastErrorCode: "legacy_create_missing_authority",
     });
     expect(rows.get(current.actionId)).not.toHaveProperty("deployment");
+    const migratedRow = rows.get(current.actionId);
+    await expect(store.list()).resolves.toMatchObject([
+      {
+        actionId: current.actionId,
+        blocked: true,
+        lastErrorCode: "legacy_create_missing_authority",
+      },
+    ]);
+    expect(rows.get(current.actionId)).toBe(migratedRow);
   });
 
   it("refuses to retry an authoritative create from mismatched UI identity", async () => {
@@ -701,6 +826,59 @@ describe("Scaffold lifecycle browser outbox", () => {
     expect(attempts).toEqual([
       { actionId: "op_action", sessionId: "ses_session" },
       { actionId: "op_action", sessionId: "ses_session" },
+    ]);
+    await expect(store.list()).resolves.toEqual([]);
+  });
+
+  it("retries a pause with one stable operation id until authoritative convergence", async () => {
+    const action = makeScaffoldPauseAction({
+      environmentId: EnvironmentId.make("scaffold-environment"),
+      sourceThreadId: ThreadId.make("thread-pause"),
+      sessionId: "ses_pause",
+      expectedLifecycleEpoch: 4,
+      createdAt: "2026-07-29T00:00:00.000Z",
+      uuid: () => "stable-pause",
+    });
+    const store = createMemoryScaffoldLifecycleActionStore();
+    await enqueueScaffoldLifecycleAction(store, action);
+    const requests: Array<{ operationId: string; sessionId: string }> = [];
+    let attempt = 0;
+
+    const execute = async (
+      pending: Parameters<typeof scaffoldPauseInputFromAction>[0]["action"],
+    ) => {
+      const request = scaffoldPauseInputFromAction({ action: pending, deployment: "staging" });
+      requests.push({ operationId: request.operationId, sessionId: request.sessionId });
+      attempt += 1;
+      return attempt === 1
+        ? ({ _tag: "wait", retryAfterMs: 100, errorCode: "network" } as const)
+        : ({ _tag: "acknowledged" } as const);
+    };
+
+    await drainScaffoldLifecycleActions({
+      store,
+      now: () => 1_000,
+      execute: async (pending) =>
+        pending.kind === "pause"
+          ? execute(pending)
+          : { _tag: "blocked", errorCode: "unexpected_action" },
+    });
+    await expect(store.list()).resolves.toMatchObject([
+      { actionId: "op_stable-pause", attempt: 0, nextAttemptAt: 1_100 },
+    ]);
+
+    await drainScaffoldLifecycleActions({
+      store,
+      now: () => 1_100,
+      execute: async (pending) =>
+        pending.kind === "pause"
+          ? execute(pending)
+          : { _tag: "blocked", errorCode: "unexpected_action" },
+    });
+
+    expect(requests).toEqual([
+      { operationId: "op_stable-pause", sessionId: "ses_pause" },
+      { operationId: "op_stable-pause", sessionId: "ses_pause" },
     ]);
     await expect(store.list()).resolves.toEqual([]);
   });

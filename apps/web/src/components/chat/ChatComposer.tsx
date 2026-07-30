@@ -788,14 +788,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Model state
   // ------------------------------------------------------------------
+  const lockedScaffoldModelSelection =
+    routeKind === "draft" && lockedProvider === "omp" && composerDraft.activeProvider
+      ? (composerDraft.modelSelectionByProvider[composerDraft.activeProvider] ?? null)
+      : null;
   const providerStatuses = useMemo(
     () =>
       resolveSessionFabricComposerProviders({
         environmentId,
         providers: reportedProviderStatuses,
         thread: activeThread,
+        lockedModelSelection: lockedScaffoldModelSelection,
       }),
-    [activeThread, environmentId, reportedProviderStatuses],
+    [activeThread, environmentId, lockedScaffoldModelSelection, reportedProviderStatuses],
   );
   // Instance-aware projection of the wire provider list. One entry per
   // configured instance (default built-in + any custom `providerInstances.*`),

@@ -725,6 +725,14 @@ export function createServerEnvironmentAtoms<R, E>(
         key: ({ environmentId, input }) => `${environmentId}:${input.sessionId}`,
       },
     }),
+    renameScaffold: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:scaffold:rename",
+      tag: WS_METHODS.scaffoldRename,
+      concurrency: {
+        mode: "serial",
+        key: ({ environmentId, input }) => `${environmentId}:${input.sessionId}`,
+      },
+    }),
     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:trace-diagnostics",
       tag: WS_METHODS.serverGetTraceDiagnostics,

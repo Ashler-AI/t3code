@@ -38,6 +38,7 @@ import {
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
+import { findThreadById } from "../commandInvariants.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -350,6 +351,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     // consistent, committed value — reassignment of `commandReadModel` is
     // atomic on the single-threaded event loop.
     latestSequence: Effect.sync(() => commandReadModel.snapshotSequence),
+    getAuthoritativeThreadById: (threadId) =>
+      Effect.sync(() => Option.fromNullishOr(findThreadById(commandReadModel, threadId))),
   } satisfies OrchestrationEngineShape;
 });
 

@@ -30,7 +30,8 @@ import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
 
 const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
-const CONNECTION_ESTABLISHMENT_TIMEOUT = "15 seconds";
+const CONNECTION_TRANSPORT_ESTABLISHMENT_TIMEOUT_SECONDS = 15;
+const SCAFFOLD_LIFECYCLE_PREPARE_TIMEOUT_SECONDS = 65;
 const CONNECTION_PROBE_TIMEOUT = "15 seconds";
 const MOBILE_CONNECTION_PROBE_TIMEOUT = "3 seconds";
 const BACKOFF_RESET_AFTER_MS = 30_000;
@@ -103,6 +104,13 @@ export interface EnvironmentSupervisorOptions {
 
 function retryDelayMs(failureCount: number): number {
   return RETRY_DELAYS_MS[Math.min(failureCount, RETRY_DELAYS_MS.length - 1)] ?? 16_000;
+}
+
+function connectionEstablishmentTimeout(target: ConnectionTarget): number {
+  const timeoutSeconds =
+    CONNECTION_TRANSPORT_ESTABLISHMENT_TIMEOUT_SECONDS +
+    (target._tag === "ScaffoldConnectionTarget" ? SCAFFOLD_LIFECYCLE_PREPARE_TIMEOUT_SECONDS : 0);
+  return timeoutSeconds * 1_000;
 }
 
 function annotateTarget(target: ConnectionTarget) {
@@ -506,7 +514,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }),
         ),
       ),
-      Effect.sleep(CONNECTION_ESTABLISHMENT_TIMEOUT).pipe(
+      Effect.sleep(connectionEstablishmentTimeout(target)).pipe(
         Effect.as<EstablishmentEvent>({ _tag: "TimedOut" }),
       ),
     ]);

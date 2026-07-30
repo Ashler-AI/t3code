@@ -12,6 +12,11 @@ import { useThreadDetail, useThreadShell, useThreadStatus } from "../state/entit
 import { useEnvironmentQuery } from "../state/query";
 import { environmentShell } from "../state/shell";
 import { environmentCatalog } from "../connection/catalog";
+import {
+  configuredSessionFabricRelayUrl,
+  shouldAwaitSessionFabricRouteRegistration,
+} from "../connection/sessionFabricBootstrap";
+import { readRuntimeBasePath } from "../runtimeBasePath";
 
 function ChatThreadRouteView() {
   const navigate = useNavigate();
@@ -25,6 +30,16 @@ function ChatThreadRouteView() {
   const platformReconciliationComplete = useAtomValue(
     environmentCatalog.platformReconciledValueAtom,
   );
+  const routeEnvironmentRegistered =
+    threadRef !== null && environmentCatalogState.entries.has(threadRef.environmentId);
+  const routeAwaitingFabricRegistration = shouldAwaitSessionFabricRouteRegistration({
+    pathname: window.location.pathname,
+    runtimeBasePath: readRuntimeBasePath(),
+    relayBaseUrl: configuredSessionFabricRelayUrl(
+      import.meta.env.VITE_T3CODE_SESSION_FABRIC_RELAY_URL,
+    ),
+    routeEnvironmentRegistered,
+  });
   const serverThreadShell = useThreadShell(threadRef);
   const serverThreadDetail = useThreadDetail(threadRef);
   const serverThreadStatus = useThreadStatus(threadRef);
@@ -37,9 +52,9 @@ function ChatThreadRouteView() {
   );
   const renderState = resolveThreadRouteRenderState({
     bootstrapComplete,
-    platformReconciliationComplete,
-    routeEnvironmentRegistered:
-      threadRef !== null && environmentCatalogState.entries.has(threadRef.environmentId),
+    platformReconciliationComplete:
+      platformReconciliationComplete && !routeAwaitingFabricRegistration,
+    routeEnvironmentRegistered,
     serverThreadShellExists: serverThreadShell !== null,
     serverThreadDetailExists: serverThreadDetail !== null,
     serverThreadDetailDeleted: serverThreadStatus === "deleted",

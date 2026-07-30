@@ -6,6 +6,7 @@ import {
   ScaffoldLifecycleError,
   type ScaffoldObserveInput,
   type ScaffoldPauseInput,
+  type ScaffoldRenameInput,
   ScaffoldPreparedConnection,
   ScaffoldSessionLinks,
   type ScaffoldSessionObservation,
@@ -18,7 +19,11 @@ import {
   type ScaffoldControlPlaneClient,
   type ScaffoldSessionFabricCapabilityInput,
 } from "./ScaffoldControlPlaneClient.ts";
-import { resolveScaffoldTarget, ScaffoldConfigurationError } from "./ScaffoldConfig.ts";
+import {
+  invalidateScaffoldOauthCredential,
+  resolveScaffoldTarget,
+  ScaffoldConfigurationError,
+} from "./ScaffoldConfig.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
@@ -69,6 +74,19 @@ function terminalError(observation: ScaffoldSessionObservation): ScaffoldLifecyc
   });
 }
 
+function isRemoteCodeWriteCredentialDenial(error: ScaffoldLifecycleError): boolean {
+  if (error.status !== 403) return false;
+  const code = error.code.toLowerCase();
+  return (
+    code === "remote_code_token_forbidden" ||
+    code === "remote_code_insufficient_scope" ||
+    code === "oauth_insufficient_scope" ||
+    (code.includes("remote_code") &&
+      code.includes("write") &&
+      (code.includes("forbidden") || code.includes("missing") || code.includes("required")))
+  );
+}
+
 function stableLinks(baseUrl: string, sessionId: string): ScaffoldSessionLinks {
   const origin = new URL(baseUrl).origin;
   const encoded = encodeURIComponent(sessionId);
@@ -83,6 +101,7 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
   const serviceEnvironment = options.environment ?? process.env;
   const now = options.now ?? Date.now;
   const readinessIntervalMs = options.readinessIntervalMs ?? DEFAULT_READINESS_INTERVAL_MS;
+  const renameFlights = new Map<string, Promise<ScaffoldSessionObservation>>();
 
   const clientFor = (deployment: ScaffoldDeployment): ScaffoldControlPlaneClient => {
     if (options.client) return options.client(deployment);
@@ -131,12 +150,14 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
       { readonly _tag: "ScaffoldResumeAndPrepareInput" }
     >,
   ): Promise<ScaffoldSessionObservation> => {
-    try {
-      return await client.resumeSession({
+    const resumeAtEpoch = (lifecycleEpoch: number) =>
+      client.resumeSession({
         sessionId: input.sessionId,
         operationId: input.operationId,
-        lifecycleEpoch: input.expectedLifecycleEpoch,
+        lifecycleEpoch,
       });
+    try {
+      return await resumeAtEpoch(input.expectedLifecycleEpoch);
     } catch (error) {
       if (!isScaffoldLifecycleError(error) || error.status !== 409) throw error;
       const current = await client.getSession(input.sessionId);
@@ -144,7 +165,41 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
         throw terminalError(current);
       }
       if (current.lifecycleEpoch < input.expectedLifecycleEpoch) throw error;
-      return current;
+      if (current.status === "ready" || current.status === "agent_running") return current;
+      if (current.status !== "paused" || current.lifecycleEpoch === input.expectedLifecycleEpoch) {
+        throw new ScaffoldLifecycleError({
+          reason: error.reason,
+          message: error.message,
+          status: error.status,
+          code: error.code,
+          ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+          observation: current,
+        });
+      }
+
+      // A saved target can legitimately lag a pause completed by another tab.
+      // Retry once at the authoritative paused epoch, preserving the original
+      // operation id so the control plane retains idempotent mutation fencing.
+      try {
+        return await resumeAtEpoch(current.lifecycleEpoch);
+      } catch (retryError) {
+        if (!isScaffoldLifecycleError(retryError) || retryError.status !== 409) throw retryError;
+        const refreshed = await client.getSession(input.sessionId);
+        if (refreshed.status === "failed" || refreshed.status === "stopped") {
+          throw terminalError(refreshed);
+        }
+        if (refreshed.status === "ready" || refreshed.status === "agent_running") return refreshed;
+        throw new ScaffoldLifecycleError({
+          reason: retryError.reason,
+          message: retryError.message,
+          status: retryError.status,
+          code: retryError.code,
+          ...(retryError.retryAfterMs !== undefined
+            ? { retryAfterMs: retryError.retryAfterMs }
+            : {}),
+          observation: refreshed,
+        });
+      }
     }
   };
 
@@ -223,17 +278,50 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
 
   const pause = async (input: ScaffoldPauseInput): Promise<ScaffoldEnvironmentBinding> => {
     const client = clientFor(input.deployment);
-    let observation: ScaffoldSessionObservation;
-    try {
-      observation = await client.pauseSession({
+    const pauseAtEpoch = (lifecycleEpoch: number) =>
+      client.pauseSession({
         sessionId: input.sessionId,
         operationId: input.operationId,
-        lifecycleEpoch: input.expectedLifecycleEpoch,
+        lifecycleEpoch,
       });
+    let observation: ScaffoldSessionObservation;
+    try {
+      observation = await pauseAtEpoch(input.expectedLifecycleEpoch);
     } catch (error) {
       if (!isScaffoldLifecycleError(error) || error.status !== 409) throw error;
       observation = await client.getSession(input.sessionId);
-      if (observation.status !== "paused" && observation.status !== "stopped") throw error;
+      if (
+        (observation.status === "ready" || observation.status === "agent_running") &&
+        observation.lifecycleEpoch > input.expectedLifecycleEpoch
+      ) {
+        try {
+          observation = await pauseAtEpoch(observation.lifecycleEpoch);
+        } catch (retryError) {
+          if (!isScaffoldLifecycleError(retryError) || retryError.status !== 409) throw retryError;
+          observation = await client.getSession(input.sessionId);
+          if (observation.status !== "paused" && observation.status !== "stopped") {
+            throw new ScaffoldLifecycleError({
+              reason: retryError.reason,
+              message: retryError.message,
+              status: retryError.status,
+              code: retryError.code,
+              ...(retryError.retryAfterMs !== undefined
+                ? { retryAfterMs: retryError.retryAfterMs }
+                : {}),
+              observation,
+            });
+          }
+        }
+      } else if (observation.status !== "paused" && observation.status !== "stopped") {
+        throw new ScaffoldLifecycleError({
+          reason: error.reason,
+          message: error.message,
+          status: error.status,
+          code: error.code,
+          ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+          observation,
+        });
+      }
     }
     return new ScaffoldEnvironmentBinding({
       deployment: input.deployment,
@@ -251,12 +339,49 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
   const observe = async (input: ScaffoldObserveInput): Promise<ScaffoldSessionObservation> =>
     clientFor(input.deployment).getSession(input.sessionId);
 
+  const rename = (input: ScaffoldRenameInput): Promise<ScaffoldSessionObservation> => {
+    const key = `${input.deployment}:${input.sessionId}`;
+    const currentFlight = renameFlights.get(key);
+    if (currentFlight) return currentFlight;
+
+    const client = clientFor(input.deployment);
+    const operation = (async () => {
+      const current = await client.getSession(input.sessionId);
+      if (current.name === input.name) return current;
+      // The project title is the create-time fallback. A different current
+      // value is a user-authored/manual name and must never be overwritten by
+      // automatic thread-title synchronization.
+      if (current.name !== undefined && current.name !== input.expectedCurrentName) return current;
+      return client.renameSession({
+        sessionId: input.sessionId,
+        operationId: input.operationId,
+        name: input.name,
+      });
+    })();
+    const flight = operation.finally(() => {
+      if (renameFlights.get(key) === flight) renameFlights.delete(key);
+    });
+    renameFlights.set(key, flight);
+    return flight;
+  };
+
   const issueSessionFabricCapability = async (input: {
     readonly deployment?: ScaffoldDeployment;
     readonly capability: ScaffoldSessionFabricCapabilityInput;
   }): Promise<SessionFabricCapabilityGrant> => {
     const deployment = configuredCapabilityDeployment(input.deployment, serviceEnvironment);
-    return clientFor(deployment).issueSessionFabricCapability(input.capability);
+    try {
+      return await clientFor(deployment).issueSessionFabricCapability(input.capability);
+    } catch (error) {
+      if (
+        input.capability.role === "controller" &&
+        isScaffoldLifecycleError(error) &&
+        isRemoteCodeWriteCredentialDenial(error)
+      ) {
+        invalidateScaffoldOauthCredential(deployment, serviceEnvironment);
+      }
+      throw error;
+    }
   };
 
   const deploymentCapabilities = async (): Promise<ScaffoldDeploymentCapabilities> => ({
@@ -310,7 +435,7 @@ export function makeScaffoldLifecycleService(options: ScaffoldLifecycleServiceOp
     ),
   });
 
-  return { prepare, observe, pause, issueSessionFabricCapability, deploymentCapabilities };
+  return { prepare, observe, pause, rename, issueSessionFabricCapability, deploymentCapabilities };
 }
 
 export type ScaffoldLifecycleService = ReturnType<typeof makeScaffoldLifecycleService>;

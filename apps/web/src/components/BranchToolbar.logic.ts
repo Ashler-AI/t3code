@@ -70,11 +70,18 @@ export function resolveScaffoldDraftTargetPresentation(input: {
   connectionPhase?: EnvironmentConnectionPhase;
   replacementRequired?: boolean;
   retryable?: boolean;
-}): { targetLabel: string; statusLabel: string; actionLabel: string | null } {
+  error?: string | null;
+}): {
+  targetLabel: string;
+  statusLabel: string;
+  detailLabel: string | null;
+  actionLabel: string | null;
+} {
   if (input.replacementRequired) {
     return {
       targetLabel: "Scaffold",
       statusLabel: "Target not recorded",
+      detailLabel: input.error?.trim() || null,
       actionLabel: "New session",
     };
   }
@@ -98,6 +105,7 @@ export function resolveScaffoldDraftTargetPresentation(input: {
   return {
     targetLabel,
     statusLabel,
+    detailLabel: input.phase === "failed" ? input.error?.trim() || null : null,
     actionLabel: input.phase === "failed" && input.retryable !== false ? "Retry" : null,
   };
 }

@@ -2,13 +2,17 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   EnvironmentId,
   SessionFabricSessionId,
   ThreadId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { HttpBody, HttpClient, HttpRouter } from "effect/unstable/http";
 import { afterEach, vi } from "vite-plus/test";
 
@@ -43,10 +47,14 @@ const testLayer = makeEnvironmentAuthLayer().pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 
+const JsonRecordFromString = Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown));
+const decodeJsonRecord = Schema.decodeUnknownSync(JsonRecordFromString);
+const encodeJsonRecord = Schema.encodeSync(JsonRecordFromString);
+
 const authenticatedCookie = Effect.gen(function* () {
   const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
   const pairing = yield* serverAuth.issuePairingCredential({
-    scopes: [AuthOrchestrationOperateScope],
+    scopes: [AuthOrchestrationReadScope, AuthOrchestrationOperateScope],
   });
   const session = yield* serverAuth.createBrowserSession(pairing.credential, {
     deviceType: "desktop",
@@ -75,7 +83,7 @@ describe("POST /api/session-fabric/capabilities", () => {
       vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
         const url = requestUrl(input);
         if (url.origin !== "https://staging.scaffold.test") return nativeFetch(input, init);
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        const body = decodeJsonRecord(String(init?.body));
         forwardedBodies.push(body);
         const local = body.environmentKind === "local";
         return Response.json({
@@ -88,7 +96,12 @@ describe("POST /api/session-fabric/capabilities", () => {
           audience: "session-fabric",
           keyId: "proof-1",
           bindings: local
-            ? { ...body, role: undefined, actorId: "actor_1" }
+            ? {
+                fabricSessionId: body.fabricSessionId,
+                environmentKind: body.environmentKind,
+                environmentId: body.environmentId,
+                threadId: body.threadId,
+              }
             : {
                 fabricSessionId: body.fabricSessionId,
                 scaffoldSessionId: body.scaffoldSessionId,
@@ -174,6 +187,75 @@ describe("POST /api/session-fabric/capabilities", () => {
           ([input]) => requestUrl(input).origin === "https://staging.scaffold.test",
         ),
       ).toEqual([]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("preserves controller scope denials and invalidates the cached OAuth credential", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempDirectory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-scaffold-oauth-",
+      });
+      const tokenFile = path.join(tempDirectory, "token.json");
+      yield* fileSystem.writeFileString(
+        tokenFile,
+        encodeJsonRecord({
+          accessToken: "cached-token",
+          tokenType: "Bearer",
+          resource: "https://staging.scaffold.test/",
+          scope:
+            "remote_code:create remote_code:read remote_code:write remote_code:exec remote_code:lifecycle",
+        }),
+        { mode: 0o600 },
+      );
+      vi.stubEnv("T3CODE_SCAFFOLD_STAGING_URL", "https://staging.scaffold.test");
+      vi.stubEnv("T3CODE_SCAFFOLD_STAGING_AUTH_MODE", "oauth");
+      vi.stubEnv("T3CODE_SCAFFOLD_STAGING_OAUTH_TOKEN_FILE", tokenFile);
+
+      const nativeFetch = globalThis.fetch.bind(globalThis);
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const url = requestUrl(input);
+        if (url.origin !== "https://staging.scaffold.test") return nativeFetch(input, init);
+        const body = decodeJsonRecord(String(init?.body));
+        if (body.role === "controller") {
+          return Response.json({ error: "remote_code_token_forbidden" }, { status: 403 });
+        }
+        return Response.json({
+          capability: "header.payload.signature",
+          tokenType: "Bearer",
+          role: "viewer",
+          scopes: ["directory:read", "session:read"],
+          expiresAt: "2099-07-24T20:01:00.000Z",
+          issuer: "scaffold",
+          audience: "session-fabric",
+          keyId: "proof-1",
+          bindings: {},
+        });
+      });
+
+      yield* makeRouteLayer().pipe(Layer.build);
+      const cookie = yield* authenticatedCookie;
+      const viewerResponse = yield* HttpClient.post("/api/session-fabric/capabilities", {
+        headers: { cookie },
+        body: yield* HttpBody.json({ role: "viewer", deployment: "staging" }),
+      });
+      expect(viewerResponse.status).toBe(200);
+      expect(yield* fileSystem.exists(tokenFile)).toBe(true);
+
+      const controllerResponse = yield* HttpClient.post("/api/session-fabric/capabilities", {
+        headers: { cookie },
+        body: yield* HttpBody.json({
+          role: "controller",
+          deployment: "staging",
+          fabricSessionId: "sf:scaffold-env:scaffold-thread",
+          scaffoldSessionId: "ses_1",
+          scaffoldLifecycleEpoch: 7,
+        }),
+      });
+      expect(controllerResponse.status).toBe(403);
+      expect(yield* controllerResponse.json).toEqual({ error: "remote_code_token_forbidden" });
+      expect(yield* fileSystem.exists(tokenFile)).toBe(false);
     }).pipe(Effect.provide(testLayer)),
   );
 });

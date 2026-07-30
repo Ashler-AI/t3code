@@ -8,12 +8,24 @@ import {
   type SessionFabricRunnerHello,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vitest";
+
+vi.mock("alchemy/Cloudflare", () => ({
+  DurableObject: () => () =>
+    class {
+      readonly mocked = true;
+    },
+}));
 
 import {
+  clientHelloShouldSynchronize,
   localAuthorityViewForViewer,
   localControllerMatchesPinnedAuthority,
   localRunnerCanClaimPinnedAuthority,
   localViewerCanReadPinnedAuthority,
+  normalizeSnapshotToRelayCursor,
+  scaffoldControllerMatchesSnapshotIdentity,
+  snapshotAuthorityCanAdvance,
   type LocalSessionFabricPinnedAuthority,
 } from "./SessionStreamCoordinator.ts";
 import { decideAuthorizedCommandSubmit, decideCommandSubmit } from "./SessionStreamModel.ts";
@@ -84,7 +96,143 @@ const controller = (actorId: string): SessionFabricCapabilityClaims => ({
 });
 
 describe("SessionStreamCoordinator local authority", () => {
-  it("pins runner actor A and accepts only controller actor A for the exact local identity", () => {
+  it("normalizes retained snapshots to the durable relay cursor", () => {
+    const normalized = normalizeSnapshotToRelayCursor(
+      {
+        session: {
+          sessionId,
+          title: "Session",
+          publication: "public",
+          runnerState: "online",
+          location,
+          initialPrompt: null,
+          searchableText: "Session",
+          summary: null,
+          cursor: { eventSequence: 99, snapshotSequence: 7 },
+          lastEventAt: null,
+          createdAt: "2026-07-24T20:00:00.000Z",
+          updatedAt: "2026-07-24T20:00:00.000Z",
+        },
+        shell: {
+          snapshotSequence: 7,
+          projects: [],
+          threads: [],
+          updatedAt: "2026-07-24T20:00:00.000Z",
+        },
+        thread: {
+          snapshotSequence: 7,
+          thread: {
+            id: threadId,
+          } as never,
+        },
+        compactedThroughEventSequence: 99,
+      },
+      12,
+    );
+
+    expect(normalized.session.cursor).toEqual({ eventSequence: 12, snapshotSequence: 7 });
+    expect(normalized.compactedThroughEventSequence).toBe(12);
+
+    const interleaved = normalizeSnapshotToRelayCursor(
+      {
+        ...normalized,
+        session: {
+          ...normalized.session,
+          cursor: { ...normalized.session.cursor, eventSequence: 11 },
+        },
+        compactedThroughEventSequence: 11,
+      },
+      12,
+    );
+    expect(interleaved.session.cursor.eventSequence).toBe(11);
+    expect(interleaved.compactedThroughEventSequence).toBe(11);
+  });
+
+  it.each([
+    { incomingCoverage: 3, durableEventSequence: 14, expectedCoverage: 12 },
+    { incomingCoverage: 13, durableEventSequence: 14, expectedCoverage: 13 },
+    { incomingCoverage: 12, durableEventSequence: 13, expectedCoverage: 12 },
+  ])(
+    "merges reconnect coverage monotonically (incoming $incomingCoverage, durable $durableEventSequence)",
+    ({ incomingCoverage, durableEventSequence, expectedCoverage }) => {
+      const storedCoverage = 12;
+      const normalized = normalizeSnapshotToRelayCursor(
+        {
+          session: {
+            sessionId,
+            title: "Reconnected session",
+            publication: "public",
+            runnerState: "online",
+            location,
+            initialPrompt: null,
+            searchableText: "Reconnected session",
+            summary: null,
+            cursor: { eventSequence: incomingCoverage, snapshotSequence: 8 },
+            lastEventAt: null,
+            createdAt: "2026-07-24T20:00:00.000Z",
+            updatedAt: "2026-07-24T20:01:00.000Z",
+          },
+          shell: {
+            snapshotSequence: 8,
+            projects: [],
+            threads: [],
+            updatedAt: "2026-07-24T20:01:00.000Z",
+          },
+          thread: {
+            snapshotSequence: 8,
+            thread: {
+              id: threadId,
+            } as never,
+          },
+          compactedThroughEventSequence: incomingCoverage,
+        },
+        durableEventSequence,
+        storedCoverage,
+      );
+
+      expect(normalized.session.cursor.eventSequence).toBe(expectedCoverage);
+      expect(normalized.compactedThroughEventSequence).toBe(expectedCoverage);
+    },
+  );
+
+  it("keeps synchronization backward compatible and rejects stale snapshot authority", () => {
+    const baseHello = {
+      protocolVersion: 1,
+      sessionId,
+      clientId: "client-a" as never,
+      afterEventSequence: 12,
+      connectedAt: "2026-07-24T20:00:00.000Z",
+    } as const;
+
+    expect(clientHelloShouldSynchronize(baseHello)).toBe(true);
+    expect(clientHelloShouldSynchronize({ ...baseHello, synchronize: false })).toBe(false);
+    expect(
+      snapshotAuthorityCanAdvance({
+        currentSnapshotSequence: 7,
+        currentUpdatedAt: "2026-07-24T20:01:00.000Z",
+        incomingSnapshotSequence: 6,
+        incomingUpdatedAt: "2026-07-24T20:02:00.000Z",
+      }),
+    ).toBe(false);
+    expect(
+      snapshotAuthorityCanAdvance({
+        currentSnapshotSequence: 7,
+        currentUpdatedAt: "2026-07-24T20:01:00.000Z",
+        incomingSnapshotSequence: 7,
+        incomingUpdatedAt: "2026-07-24T20:00:00.000Z",
+      }),
+    ).toBe(false);
+    expect(
+      snapshotAuthorityCanAdvance({
+        currentSnapshotSequence: 7,
+        currentUpdatedAt: "2026-07-24T20:01:00.000Z",
+        incomingSnapshotSequence: 8,
+        incomingUpdatedAt: "2026-07-24T20:00:00.000Z",
+      }),
+    ).toBe(true);
+  });
+
+  it("pins runner actor A while accepting any authenticated controller for the exact public identity", () => {
     expect(
       localRunnerCanClaimPinnedAuthority({
         claims: runner,
@@ -105,24 +253,35 @@ describe("SessionStreamCoordinator local authority", () => {
     const controllerA = localControllerMatchesPinnedAuthority({
       claims: controller("actor-a"),
       sessionId,
+      publication: "public",
       location,
       pinned,
     });
     const controllerB = localControllerMatchesPinnedAuthority({
       claims: controller("actor-b"),
       sessionId,
+      publication: "public",
       location,
       pinned,
     });
     const wrongThread = localControllerMatchesPinnedAuthority({
       claims: controller("actor-a"),
       sessionId,
+      publication: "public",
       location: { ...location, threadId: ThreadId.make("thread-b") },
       pinned,
     });
+    const localOnly = localControllerMatchesPinnedAuthority({
+      claims: controller("actor-b"),
+      sessionId,
+      publication: "local_only",
+      location,
+      pinned,
+    });
     expect(controllerA).toBe(true);
-    expect(controllerB).toBe(false);
+    expect(controllerB).toBe(true);
     expect(wrongThread).toBe(false);
+    expect(localOnly).toBe(false);
     expect(
       decideAuthorizedCommandSubmit({
         controllerMatchesSession: controllerA,
@@ -136,12 +295,56 @@ describe("SessionStreamCoordinator local authority", () => {
         runnerState: "online",
         eligibleRunnerCount: 1,
       }),
-    ).toEqual({ type: "rejected", detail: "Controller capability required" });
+    ).toEqual({ type: "accepted" });
   });
 
   it("returns the original terminal receipt for an accepted duplicate command", () => {
     const existing = { status: "accepted" as const, resultSequence: 42, detail: null };
     expect(decideCommandSubmit(existing)).toEqual({ type: "duplicate", existing });
+  });
+
+  it("authorizes a Scaffold wake by stable identity without trusting a stale snapshot epoch", () => {
+    const scaffoldLocation = {
+      ...location,
+      environmentKind: "scaffold",
+      scaffoldSessionId: "scaffold-a",
+      scaffoldSessionUrl: "https://scaffold.example/s/scaffold-a",
+      scaffoldLifecycleEpoch: 7,
+    } as const;
+    const scaffoldController = {
+      ...base,
+      role: "controller",
+      scopes: ["session:read", "session:command"],
+      fabricSessionId: sessionId,
+      scaffoldSessionId: "scaffold-a",
+      scaffoldLifecycleEpoch: 8,
+      actorId: "actor-a",
+    } as const satisfies SessionFabricCapabilityClaims;
+
+    expect(
+      scaffoldControllerMatchesSnapshotIdentity({
+        claims: scaffoldController,
+        sessionId,
+        publication: "public",
+        location: scaffoldLocation,
+      }),
+    ).toBe(true);
+    expect(
+      scaffoldControllerMatchesSnapshotIdentity({
+        claims: { ...scaffoldController, scaffoldSessionId: "scaffold-b" },
+        sessionId,
+        publication: "public",
+        location: scaffoldLocation,
+      }),
+    ).toBe(false);
+    expect(
+      scaffoldControllerMatchesSnapshotIdentity({
+        claims: scaffoldController,
+        sessionId,
+        publication: "local_only",
+        location: scaffoldLocation,
+      }),
+    ).toBe(false);
   });
 
   it("reveals pinned local authority only to the same authenticated viewer actor", () => {

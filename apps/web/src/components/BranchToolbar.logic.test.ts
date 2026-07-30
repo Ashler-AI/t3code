@@ -37,17 +37,36 @@ describe("Scaffold draft presentation", () => {
   it("shows the selected deployment and starting phase instead of a local worktree", () => {
     expect(
       resolveScaffoldDraftTargetPresentation({ deployment: "production", phase: "creating" }),
-    ).toEqual({ targetLabel: "Scaffold production", statusLabel: "Starting", actionLabel: null });
+    ).toEqual({
+      targetLabel: "Scaffold production",
+      statusLabel: "Starting",
+      detailLabel: null,
+      actionLabel: null,
+    });
     expect(
-      resolveScaffoldDraftTargetPresentation({ deployment: "staging", phase: "failed" }),
-    ).toEqual({ targetLabel: "Scaffold staging", statusLabel: "Failed", actionLabel: "Retry" });
+      resolveScaffoldDraftTargetPresentation({
+        deployment: "staging",
+        phase: "failed",
+        error: "Scaffold authentication is required.",
+      }),
+    ).toEqual({
+      targetLabel: "Scaffold staging",
+      statusLabel: "Failed",
+      detailLabel: "Scaffold authentication is required.",
+      actionLabel: "Retry",
+    });
     expect(
       resolveScaffoldDraftTargetPresentation({
         deployment: "production",
         phase: "failed",
         retryable: false,
       }),
-    ).toEqual({ targetLabel: "Scaffold production", statusLabel: "Failed", actionLabel: null });
+    ).toEqual({
+      targetLabel: "Scaffold production",
+      statusLabel: "Failed",
+      detailLabel: null,
+      actionLabel: null,
+    });
     expect(
       resolveScaffoldDraftTargetPresentation({
         deployment: "staging",
@@ -57,6 +76,7 @@ describe("Scaffold draft presentation", () => {
     ).toEqual({
       targetLabel: "Scaffold",
       statusLabel: "Target not recorded",
+      detailLabel: null,
       actionLabel: "New session",
     });
   });
@@ -154,6 +174,15 @@ describe("Scaffold draft presentation", () => {
         scaffoldPhase: "paused",
         boundToTarget: true,
         targetConnected: false,
+        hasProject: true,
+      }),
+    ).toEqual({ blocked: false, deliveryDeferred: true, shouldResume: true });
+    expect(
+      resolveScaffoldSendDecision({
+        hasScaffoldSession: true,
+        scaffoldPhase: "paused",
+        boundToTarget: true,
+        targetConnected: true,
         hasProject: true,
       }),
     ).toEqual({ blocked: false, deliveryDeferred: true, shouldResume: true });

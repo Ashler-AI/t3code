@@ -381,6 +381,42 @@ describe("environment grouping", () => {
     ).toEqual([]);
   });
 
+  it("keeps an available local fallback when the preferred remote project is unrelated", () => {
+    const local = makeProject({ repositoryIdentity });
+    const remote = makeProject({
+      id: ProjectId.make("project-unrelated-remote"),
+      environmentId: remoteEnvironmentId,
+      title: "unrelated remote",
+      workspaceRoot: "/tmp/unrelated-remote",
+      repositoryIdentity: {
+        ...repositoryIdentity,
+        canonicalKey: "github.com/ashler/unrelated",
+      },
+    });
+    const groups = buildSidebarProjectSnapshots({
+      projects: [local, remote],
+      settings: defaultGroupingSettings,
+      primaryEnvironmentId,
+      resolveEnvironmentLabel: () => null,
+    });
+
+    const entries = buildLocalSidebarProjectPickerEntries({
+      groups,
+      preferredProjectRef: {
+        environmentId: remoteEnvironmentId,
+        projectId: remote.id,
+      },
+      primaryEnvironmentId,
+    });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.targetProject).toMatchObject({
+      environmentId: primaryEnvironmentId,
+      id: local.id,
+    });
+    expect(entries[0]?.isPreferred).toBe(false);
+  });
+
   it("preserves the preferred local worktree within a grouped repository", () => {
     const primary = makeProject({ repositoryIdentity });
     const preferredWorktree = makeProject({

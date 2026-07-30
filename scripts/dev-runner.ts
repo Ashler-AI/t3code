@@ -326,6 +326,18 @@ function isLoopbackDevHostname(hostname: string): boolean {
   return normalized === "localhost" || normalized === "::1" || isIpv4Loopback;
 }
 
+function isLoopbackSessionFabricRelay(value: string | undefined): boolean {
+  if (value === undefined || value.trim().length === 0) return true;
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") && isLoopbackDevHostname(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function createDevRunnerEnv({
   mode,
   baseEnv,
@@ -457,7 +469,15 @@ export function createDevRunnerEnv({
     const configuredSessionFabricAuthMode =
       output.T3CODE_SESSION_FABRIC_AUTH_MODE?.trim().toLowerCase();
     if (isCombinedLoopbackDev) {
-      if (configuredSessionFabricAuthMode === undefined || configuredSessionFabricAuthMode === "") {
+      if (!isLoopbackSessionFabricRelay(output.T3CODE_SESSION_FABRIC_RELAY_URL)) {
+        // The browser may be local while the session fabric is not. Keep both
+        // runner and browser capability-backed so a protected remote relay is
+        // never opened anonymously by the localhost dev convenience path.
+        output.T3CODE_SESSION_FABRIC_AUTH_MODE = "required";
+      } else if (
+        configuredSessionFabricAuthMode === undefined ||
+        configuredSessionFabricAuthMode === ""
+      ) {
         output.T3CODE_SESSION_FABRIC_AUTH_MODE = "disabled";
       }
     } else if (configuredSessionFabricAuthMode === "disabled") {

@@ -216,6 +216,56 @@ describe("SessionFabricAuthorization", () => {
     }),
   );
 
+  it.effect("treats a controller OAuth scope denial as reconnect-required, not read-only", () =>
+    Effect.gen(function* () {
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "http://127.0.0.1:5733/api/session-fabric/capabilities",
+        fetch: (async (_input, init) => {
+          const body = JSON.parse(String(init?.body)) as { role: "viewer" | "controller" };
+          return body.role === "viewer"
+            ? Response.json(grant("viewer", "viewer-secret"))
+            : Response.json({ error: "remote_code_token_forbidden" }, { status: 403 });
+        }) as typeof fetch,
+      });
+
+      expect((yield* authorization.viewer())?.role).toBe("viewer");
+      const error = yield* authorization
+        .controller({
+          fabricSessionId: SessionFabricSessionId.make("fabric-1"),
+          scaffoldSessionId: "ses-1",
+          scaffoldLifecycleEpoch: 2,
+        })
+        .pipe(Effect.flip);
+      expect(error.reason).toBe("authentication");
+      expect(error.status).toBe(403);
+      expect(error.detail).toContain("Reconnect Scaffold");
+      expect(error.detail).not.toContain("read-only");
+    }),
+  );
+
+  it.effect("keeps a Scaffold control ownership denial classified as read-only", () =>
+    Effect.gen(function* () {
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "http://127.0.0.1:5733/api/session-fabric/capabilities",
+        fetch: (async () =>
+          Response.json(
+            { error: "session_fabric_control_forbidden" },
+            { status: 403 },
+          )) as typeof fetch,
+      });
+      const error = yield* authorization
+        .controller({
+          fabricSessionId: SessionFabricSessionId.make("fabric-1"),
+          scaffoldSessionId: "ses-1",
+          scaffoldLifecycleEpoch: 2,
+        })
+        .pipe(Effect.flip);
+      expect(error.reason).toBe("permission");
+      expect(error.detail).toContain("read-only");
+      expect(error.detail).not.toContain("Reconnect Scaffold");
+    }),
+  );
+
   it.effect("acquires a local controller capability without any Scaffold binding", () =>
     Effect.gen(function* () {
       const bodies: unknown[] = [];
@@ -238,7 +288,6 @@ describe("SessionFabricAuthorization", () => {
               environmentKind: "local",
               environmentId: "environment-local",
               threadId: "thread-local",
-              actorId: "user-1",
             },
           });
         }) as typeof fetch,
@@ -251,7 +300,6 @@ describe("SessionFabricAuthorization", () => {
       });
       expect(result?.bindings).toMatchObject({
         environmentKind: "local",
-        actorId: "user-1",
       });
       expect(bodies).toEqual([
         {
@@ -262,6 +310,42 @@ describe("SessionFabricAuthorization", () => {
           threadId: "thread-local",
         },
       ]);
+    }),
+  );
+
+  it.effect("rejects a local controller capability with a different response binding", () =>
+    Effect.gen(function* () {
+      const authorization = makeSessionFabricCapabilityAuthorization({
+        endpoint: "http://127.0.0.1:5733/api/session-fabric/capabilities",
+        fetch: (async () =>
+          Response.json({
+            capability: "local.controller.token",
+            tokenType: "Bearer",
+            role: "controller",
+            scopes: ["session:read", "session:command"],
+            expiresAt,
+            issuer: "scaffold",
+            audience: "session-fabric",
+            keyId: "key-1",
+            bindings: {
+              fabricSessionId: "fabric-local",
+              environmentKind: "local",
+              environmentId: "environment-other",
+              threadId: "thread-local",
+            },
+          })) as typeof fetch,
+      });
+
+      const error = yield* authorization
+        .controller({
+          fabricSessionId: SessionFabricSessionId.make("fabric-local"),
+          environmentKind: "local",
+          environmentId: "environment-local",
+          threadId: "thread-local",
+        })
+        .pipe(Effect.flip);
+
+      expect(error.reason).toBe("invalid-response");
     }),
   );
 

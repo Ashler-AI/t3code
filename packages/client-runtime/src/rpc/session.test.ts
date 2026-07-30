@@ -217,6 +217,37 @@ const completeInitialConfig = Effect.fn("TestRpcSessionFactory.completeInitialCo
 });
 
 describe("RpcSessionFactory", () => {
+  it.effect("accepts initial config responses from servers that stringify request ids", () =>
+    Effect.gen(function* () {
+      const { factory, sockets } = yield* makeFactory();
+      const session = yield* factory.connect(PREPARED);
+      const readyFiber = yield* Effect.forkChild(session.ready);
+      const socket = yield* awaitSocket(sockets);
+
+      socket.open();
+      const request = yield* awaitRequest(socket);
+      expect(request).toMatchObject({
+        _tag: "Request",
+        tag: WS_METHODS.serverGetConfig,
+        payload: {},
+      });
+      expect(typeof request.id).toBe("string");
+      socket.serverMessage(
+        encodeJson({
+          _tag: "Exit",
+          requestId: String(BigInt(request.id)),
+          exit: {
+            _tag: "Success",
+            value: ENCODED_SERVER_CONFIG,
+          },
+        }),
+      );
+
+      yield* Fiber.join(readyFiber);
+      expect(yield* session.initialConfig).toEqual(SERVER_CONFIG);
+    }),
+  );
+
   it.effect("owns one scoped websocket attempt and exposes readiness and closure", () =>
     Effect.gen(function* () {
       const { factory, sockets } = yield* makeFactory();

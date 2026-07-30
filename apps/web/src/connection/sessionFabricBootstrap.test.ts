@@ -3,8 +3,11 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   configuredSessionFabricRelayUrl,
   isConfiguredSessionFabricRoute,
+  notifySessionFabricRouteChanged,
   sessionFabricRegistrationFromRoute,
   sessionFabricRoutePath,
+  shouldAwaitSessionFabricRouteRegistration,
+  subscribeSessionFabricRouteChanges,
 } from "./sessionFabricBootstrap";
 
 describe("session fabric route bootstrap", () => {
@@ -56,6 +59,62 @@ describe("session fabric route bootstrap", () => {
     ).toBeNull();
   });
 
+  it("fails closed when the browser path belongs to a different Scaffold mount", () => {
+    expect(
+      sessionFabricRegistrationFromRoute({
+        pathname: "/sessions/ses_other/agent/session-fabric%3Aglobal-session-1/thread-1",
+        runtimeBasePath: "/sessions/ses_scaffold/agent",
+        relayBaseUrl: "https://relay.example/fabric/",
+        clientId: "browser-window-scaffold",
+      }),
+    ).toBeNull();
+  });
+
+  it("notifies route-derived connection subscribers after SPA navigation", () => {
+    const eventTarget = new EventTarget();
+    let changes = 0;
+    const unsubscribe = subscribeSessionFabricRouteChanges({
+      eventTarget,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+
+    notifySessionFabricRouteChanged(eventTarget);
+    expect(changes).toBe(1);
+    unsubscribe();
+    notifySessionFabricRouteChanged(eventTarget);
+    expect(changes).toBe(1);
+  });
+
+  it("waits for reactive registration only on a valid unregistered fabric route", () => {
+    const route = {
+      pathname: "/sessions/ses_scaffold/agent/session-fabric%3Aglobal-session-1/thread-1",
+      runtimeBasePath: "/sessions/ses_scaffold/agent",
+      relayBaseUrl: "https://relay.example/fabric/",
+    } as const;
+
+    expect(
+      shouldAwaitSessionFabricRouteRegistration({
+        ...route,
+        routeEnvironmentRegistered: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldAwaitSessionFabricRouteRegistration({
+        ...route,
+        routeEnvironmentRegistered: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldAwaitSessionFabricRouteRegistration({
+        ...route,
+        runtimeBasePath: "/sessions/ses_other/agent",
+        routeEnvironmentRegistered: false,
+      }),
+    ).toBe(false);
+  });
+
   it("does not turn an ordinary local route into a fabric connection", () => {
     expect(
       sessionFabricRegistrationFromRoute({
@@ -81,11 +140,32 @@ describe("session fabric route bootstrap", () => {
     ).toBe(false);
   });
 
-  it("accepts only configured HTTP Relay endpoints", () => {
-    expect(configuredSessionFabricRelayUrl(" https://relay.example/base ")).toBe(
-      "https://relay.example/base",
+  it("accepts clean HTTPS origins and explicit loopback HTTP development origins", () => {
+    expect(configuredSessionFabricRelayUrl(" https://relay.example/// ")).toBe(
+      "https://relay.example",
     );
-    expect(configuredSessionFabricRelayUrl("file:///tmp/fabric")).toBeNull();
+    expect(configuredSessionFabricRelayUrl("http://localhost:8788///")).toBe(
+      "http://localhost:8788",
+    );
+    expect(configuredSessionFabricRelayUrl("http://127.0.0.1:8788/")).toBe("http://127.0.0.1:8788");
+    expect(configuredSessionFabricRelayUrl("http://[::1]:8788/")).toBe("http://[::1]:8788");
     expect(configuredSessionFabricRelayUrl(undefined)).toBeNull();
+  });
+
+  it.each([
+    "file:///tmp/fabric",
+    "http://relay.example",
+    "http://localhost:8788/path",
+    "http://localhost:8788?query=value",
+    "http://localhost:8788#fragment",
+    "http://user:password@localhost:8788",
+    "http://127.1:8788",
+    "http://0177.0.0.1:8788",
+    "https://relay.example/path",
+    "https://relay.example?query=value",
+    "https://relay.example#fragment",
+    "https://user:password@relay.example",
+  ])("rejects unsafe session fabric relay URL %s", (value) => {
+    expect(configuredSessionFabricRelayUrl(value)).toBeNull();
   });
 });

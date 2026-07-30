@@ -213,7 +213,7 @@ describe("server state projection", () => {
     }),
   );
 
-  it("exposes Scaffold pause without duplicating HTTP connection preparation", () => {
+  it("exposes Scaffold lifecycle mutations without duplicating HTTP connection preparation", () => {
     const runtime = Atom.runtime(Layer.empty) as unknown as Atom.AtomRuntime<
       EnvironmentRegistry | Persistence.EnvironmentCacheStore,
       never
@@ -223,6 +223,7 @@ describe("server state projection", () => {
     });
 
     expect(atoms).toHaveProperty("pauseScaffold");
+    expect(atoms).toHaveProperty("renameScaffold");
     expect(atoms).not.toHaveProperty("prepareScaffoldConnection");
   });
 

@@ -1,4 +1,5 @@
 import {
+  AuthStandardClientScopes,
   EnvironmentAuthInvalidError,
   type AuthBrowserSessionResult,
   type AuthCreatePairingCredentialInput,
@@ -41,9 +42,13 @@ const unauthenticatedSession = (auth: AuthSessionState["auth"]): AuthSessionStat
   auth,
 });
 
-const authenticatedSession = (auth: AuthSessionState["auth"]): AuthSessionState => ({
+const authenticatedSession = (
+  auth: AuthSessionState["auth"],
+  scopes: NonNullable<AuthSessionState["scopes"]> = [...AuthStandardClientScopes],
+): AuthSessionState => ({
   authenticated: true,
   auth,
+  scopes,
   sessionMethod: "browser-session-cookie",
   expiresAt: SESSION_EXPIRES_AT,
 });
@@ -265,6 +270,33 @@ describe("resolveInitialServerAuthGateState", () => {
     });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(testApi.calls.browserSession).toEqual([]);
+    expect(testApi.calls.session).toBe(2);
+  });
+
+  it("upgrades an authenticated local dev session that lacks standard client scopes", async () => {
+    const nextSession = sequence(
+      authenticatedSession(LOOPBACK_AUTH, ["orchestration:read"]),
+      authenticatedSession(LOOPBACK_AUTH, [...AuthStandardClientScopes]),
+    );
+    const testApi = await installAuthApi({ session: nextSession });
+    vi.stubEnv("VITE_T3CODE_LOCAL_DEV_AUTO_AUTH_ENABLED", "true");
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(input).toBe("/__t3/local-dev/browser-session");
+      expect(init).toMatchObject({
+        method: "POST",
+        credentials: "include",
+        headers: { "x-t3-local-dev-bootstrap": "1" },
+      });
+      return new Response(null, { status: 204 });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const { resolveInitialServerAuthGateState } = await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(testApi.calls.session).toBe(2);
   });
 

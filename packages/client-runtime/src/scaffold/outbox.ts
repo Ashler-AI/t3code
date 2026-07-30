@@ -7,7 +7,6 @@ import {
   ScaffoldPauseLifecycleAction,
   ScaffoldResumeLifecycleAction,
   type ScaffoldDeployment,
-  type ScaffoldLifecycleActionKind,
 } from "./model.ts";
 
 export interface ScaffoldLifecycleActionStore {
@@ -189,7 +188,16 @@ type MakeScaffoldLifecycleActionInput = MakeScaffoldLifecycleActionBase &
         };
       }
     | {
-        readonly kind: Exclude<ScaffoldLifecycleActionKind, "create">;
+        readonly kind: "resume";
+        readonly deployment?: never;
+        readonly create?: never;
+      }
+    | {
+        readonly kind: "pause";
+        readonly sourceThreadId: Extract<
+          ScaffoldLifecycleAction,
+          { readonly kind: "pause" }
+        >["sourceThreadId"];
         readonly deployment?: never;
         readonly create?: never;
       }
@@ -224,6 +232,10 @@ export function makeScaffoldLifecycleAction(
     case "resume":
       return new ScaffoldResumeLifecycleAction({ ...fields, kind: "resume" });
     case "pause":
-      return new ScaffoldPauseLifecycleAction({ ...fields, kind: "pause" });
+      return new ScaffoldPauseLifecycleAction({
+        ...fields,
+        kind: "pause",
+        sourceThreadId: input.sourceThreadId,
+      });
   }
 }

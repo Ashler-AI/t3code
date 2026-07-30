@@ -3,11 +3,20 @@ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime"
 import type {
   ScaffoldLifecycleAction,
   ScaffoldLifecycleActionStore,
+  ScaffoldOutboxExecutionResult,
 } from "@t3tools/client-runtime/scaffold";
-import { mapScaffoldLifecycleError } from "@t3tools/client-runtime/scaffold";
+import {
+  mapScaffoldLifecycleError,
+  reconcileScaffoldLifecycle,
+  scaffoldOutboxResultFromReconciliation,
+} from "@t3tools/client-runtime/scaffold";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import {
   ConnectionBlockedError,
   ConnectionTransientError,
+  type ConnectionTarget,
+  type EnvironmentConnectionPhase,
+  type ScaffoldConnectionTarget,
 } from "@t3tools/client-runtime/connection";
 import * as Schema from "effect/Schema";
 import { Atom } from "effect/unstable/reactivity";
@@ -57,17 +66,24 @@ import {
   scaffoldSessionUiEntryFromCreateAction,
   scaffoldSessionUiEntryMatchesCreateAction,
   scaffoldSessionUiEntryMatchesPendingCreateAction,
+  scaffoldSessionForEnvironment,
   useScaffoldSessionUiStore,
 } from "../scaffoldSessionUiStore";
 import type { ScaffoldSessionUiEntry } from "../scaffoldSessionUiStore";
 import { DraftId, useComposerDraftStore } from "../composerDraftStore";
-import { readThreadShell, useProjects } from "../state/entities";
-import { useEnvironments } from "../state/environments";
+import {
+  readThreadShell,
+  useAllEnvironmentShellsBootstrapped,
+  useProjects,
+  useThreadShells,
+} from "../state/entities";
+import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
 import { threadEnvironment } from "../state/threads";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   ScaffoldLifecycleError,
   ScaffoldObserveInput,
+  ScaffoldRenameInput,
   type ScaffoldSessionObservation,
   type EnvironmentId,
   type ModelSelection,
@@ -82,8 +98,12 @@ import { requestScaffoldSessionObservation } from "../connection/scaffold";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import {
   browserScaffoldLifecycleActionStore,
+  createScaffoldLifecycleDrainRunner,
   drainScaffoldLifecycleActions,
   LEGACY_CREATE_MISSING_AUTHORITY,
+  requestScaffoldLifecycleDrain,
+  resolveScaffoldLifecycleRetryDelay,
+  scaffoldPauseInputFromAction,
   subscribeScaffoldLifecycleDrain,
 } from "../connection/scaffoldLifecycleOutbox";
 import {
@@ -96,6 +116,11 @@ import {
 } from "../connection/pendingTurnOutbox";
 import { resolveScaffoldDraftModelSelection } from "../hooks/useHandleNewThread";
 import { SCAFFOLD_UNSUPPORTED_DRAFT_MESSAGE } from "./BranchToolbar.logic";
+import {
+  createScaffoldSessionTitleSyncRunner,
+  scaffoldSessionTitleSyncTargetAvailability,
+  selectScaffoldSessionTitleSyncCandidates,
+} from "../connection/scaffoldSessionTitleSync";
 
 const MACOS_TRAFFIC_LIGHTS_LEFT_INSET = "90px";
 const notifiedTerminalPendingTurns = new Set<string>();
@@ -183,13 +208,66 @@ export function classifyScaffoldCreateFailure(error: unknown): {
   }
   if (isConnectionTransientError(error)) {
     return {
-      result: { _tag: "retry", retryAfterMs: 1_000, errorCode: error.reason },
+      result: { _tag: "wait", retryAfterMs: 1_000, errorCode: error.reason },
       detail: error.detail,
     };
   }
   return {
     result: { _tag: "retry", retryAfterMs: 1_000, errorCode: "scaffold_create_failed" },
   };
+}
+
+type ScaffoldPauseLifecycleAction = Extract<ScaffoldLifecycleAction, { readonly kind: "pause" }>;
+
+export function authorizeScaffoldPause(input: {
+  readonly action: ScaffoldPauseLifecycleAction;
+  readonly threadShells: ReadonlyArray<
+    Pick<EnvironmentThreadShell, "environmentId" | "id" | "settledOverride">
+  >;
+  readonly shellsReady: boolean;
+}): "execute" | "wait" | "acknowledge" {
+  if (!input.shellsReady) return "wait";
+  const environmentThreads = input.threadShells.filter(
+    (thread) => thread.environmentId === input.action.environmentId,
+  );
+  // `effectiveSettled` also classifies threads from client-observed PR state
+  // and elapsed inactivity. Those signals are appropriate for sidebar
+  // placement, but they must not authorize a remote sandbox lifecycle
+  // mutation. Pause only after every thread in the shared environment has a
+  // durable, server-projected explicit settlement.
+  const source = environmentThreads.find((thread) => thread.id === input.action.sourceThreadId);
+  if (source?.settledOverride !== "settled") return "acknowledge";
+  return environmentThreads.some(
+    (thread) => thread.id !== input.action.sourceThreadId && thread.settledOverride !== "settled",
+  )
+    ? "acknowledge"
+    : "execute";
+}
+
+export function reconcileScaffoldPauseAction(input: {
+  readonly action: ScaffoldPauseLifecycleAction;
+  readonly observation?: ScaffoldSessionObservation;
+  readonly error?: unknown;
+}): ScaffoldOutboxExecutionResult {
+  const error = isScaffoldLifecycleError(input.error) ? input.error : undefined;
+  const observation = input.observation ?? error?.observation;
+  return scaffoldOutboxResultFromReconciliation(
+    reconcileScaffoldLifecycle({
+      kind: "pause",
+      expectedLifecycleEpoch: input.action.expectedLifecycleEpoch,
+      ...(observation ? { observation } : {}),
+      ...(error
+        ? {
+            httpStatus: error.status,
+            errorCode: error.code,
+            ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+          }
+        : input.error !== undefined
+          ? { httpStatus: 0, errorCode: "scaffold_pause_failed" }
+          : {}),
+    }),
+    error?.code ?? "scaffold_pause_failed",
+  );
 }
 
 function blockedScaffoldCreateDetail(errorCode: string | null): string {
@@ -296,13 +374,32 @@ export function scaffoldCreateConnectionRequest(
 export async function reconcileScaffoldLifecycleStartup(input: {
   readonly store: ScaffoldLifecycleActionStore;
   readonly entriesByDraftId: Readonly<Record<string, ScaffoldSessionUiEntry>>;
+  readonly volatileCreateActionsByDraftId?: Readonly<
+    Record<string, ScaffoldLifecycleAction | undefined>
+  >;
+  readonly catalogReady?: boolean;
+  readonly registeredScaffoldTargets?: ReadonlyArray<ScaffoldConnectionTarget>;
   readonly recover: (entry: ScaffoldSessionUiEntry) => void;
   readonly rebind?: (entry: ScaffoldSessionUiEntry) => void;
+  readonly adoptRegisteredTarget?: (
+    entry: ScaffoldSessionUiEntry,
+    target: ScaffoldConnectionTarget,
+  ) => void;
   readonly fail: (draftId: ScaffoldSessionUiEntry["draftId"], error: string) => void;
 }): Promise<void> {
   const actions = await input.store.list();
   const createActions = actions.filter((action) => action.kind === "create");
   const entriesByDraftId = { ...input.entriesByDraftId };
+  const volatileCreateActionsByDraftId = input.volatileCreateActionsByDraftId ?? {};
+  const catalogReady = input.catalogReady ?? true;
+  const registeredScaffoldTargets = input.registeredScaffoldTargets ?? [];
+  const matchingRegisteredTarget = (entry: ScaffoldSessionUiEntry) =>
+    entry.sessionId === null
+      ? undefined
+      : registeredScaffoldTargets.find(
+          (target) =>
+            target.deployment === entry.deployment && target.sessionId === entry.sessionId,
+        );
 
   for (const action of createActions) {
     const matchingEntry = Object.values(entriesByDraftId).find(
@@ -324,12 +421,24 @@ export async function reconcileScaffoldLifecycleStartup(input: {
         // create by its immutable action identity; Scaffold may have minted a
         // different session id than the provisional request used.
         await input.store.remove(action.actionId);
-      } else if (
-        matchingEntry.sessionId !== action.sessionId ||
-        matchingEntry.lifecycleEpoch !== action.expectedLifecycleEpoch
-      ) {
-        const rebound = scaffoldSessionUiEntryFromCreateAction(action);
-        if (rebound) (input.rebind ?? input.recover)(rebound);
+      } else {
+        let currentEntry = matchingEntry;
+        if (
+          matchingEntry.sessionId !== action.sessionId ||
+          matchingEntry.lifecycleEpoch !== action.expectedLifecycleEpoch
+        ) {
+          const rebound = scaffoldSessionUiEntryFromCreateAction(action);
+          if (rebound) {
+            (input.rebind ?? input.recover)(rebound);
+            currentEntry = rebound;
+            entriesByDraftId[rebound.draftId] = rebound;
+          }
+        }
+        const target = matchingRegisteredTarget(currentEntry);
+        if (target && input.adoptRegisteredTarget) {
+          input.adoptRegisteredTarget(currentEntry, target);
+          await input.store.remove(action.actionId);
+        }
       }
       continue;
     }
@@ -346,14 +455,47 @@ export async function reconcileScaffoldLifecycleStartup(input: {
     }
     input.recover(recovered);
     entriesByDraftId[recovered.draftId] = recovered;
+    const target = matchingRegisteredTarget(recovered);
+    if (target && input.adoptRegisteredTarget) {
+      input.adoptRegisteredTarget(recovered, target);
+      await input.store.remove(action.actionId);
+    }
   }
 
   const actionIds = new Set(createActions.map((action) => action.actionId));
   for (const entry of Object.values(entriesByDraftId)) {
     if (entry.phase === "creating" && !actionIds.has(entry.actionId)) {
-      input.fail(entry.draftId, blockedScaffoldCreateDetail("missing_scaffold_create_action"));
+      const volatileAction = volatileCreateActionsByDraftId[entry.draftId];
+      if (
+        volatileAction !== undefined &&
+        (!scaffoldSessionUiEntryMatchesPendingCreateAction(entry, volatileAction) ||
+          entry.lifecycleEpoch !== volatileAction.expectedLifecycleEpoch)
+      ) {
+        input.fail(
+          entry.draftId,
+          blockedScaffoldCreateDetail("scaffold_create_projection_mismatch"),
+        );
+        continue;
+      }
+      const target = matchingRegisteredTarget(entry);
+      if (target && input.adoptRegisteredTarget) {
+        input.adoptRegisteredTarget(entry, target);
+      } else if (volatileAction === undefined && catalogReady) {
+        input.fail(entry.draftId, blockedScaffoldCreateDetail("missing_scaffold_create_action"));
+      }
     }
   }
+}
+
+export function registeredScaffoldTargets(
+  environments: ReadonlyArray<{
+    readonly connection: { readonly phase: EnvironmentConnectionPhase };
+    readonly entry: { readonly target: ConnectionTarget };
+  }>,
+): ScaffoldConnectionTarget[] {
+  return environments.flatMap((environment) =>
+    environment.entry.target._tag === "ScaffoldConnectionTarget" ? [environment.entry.target] : [],
+  );
 }
 
 function subscribeToViewportWidth(onChange: () => void): () => void {
@@ -443,9 +585,29 @@ export async function reconcileLegacyFailedScaffoldSessions(input: {
 function ScaffoldSessionCoordinator() {
   const entriesByDraftId = useScaffoldSessionUiStore((state) => state.entriesByDraftId);
   const projects = useProjects();
+  const threadShells = useThreadShells();
+  const threadShellsReady = useAllEnvironmentShellsBootstrapped();
+  const { environments, isReady: environmentCatalogReady } = useEnvironments();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
   const providerCatalogs = useAtomValue(environmentProviderCatalogsAtom);
   const connectScaffold = useAtomCommand(connectScaffoldEnvironment, { reportFailure: false });
+  const pauseScaffold = useAtomCommand(serverEnvironment.pauseScaffold, { reportFailure: false });
+  const renameScaffold = useAtomCommand(serverEnvironment.renameScaffold, { reportFailure: false });
   const attemptedLegacyDraftIds = useRef(new Set<string>());
+  const syncScaffoldSessionTitle = useMemo(
+    () =>
+      createScaffoldSessionTitleSyncRunner(async (candidate) => {
+        if (primaryEnvironmentId === null) {
+          throw new Error("The primary environment is not ready for Scaffold session naming.");
+        }
+        const result = await renameScaffold({
+          environmentId: primaryEnvironmentId,
+          input: new ScaffoldRenameInput(candidate),
+        });
+        if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      }),
+    [primaryEnvironmentId, renameScaffold],
+  );
 
   useEffect(() => {
     void reconcileLegacyFailedScaffoldSessions({
@@ -466,15 +628,20 @@ function ScaffoldSessionCoordinator() {
   useEffect(() => {
     let disposed = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    let running: Promise<void> | null = null;
 
-    const drain = (actionId?: string) => {
-      if (disposed || running !== null) return;
-      running = (async () => {
+    const runner = createScaffoldLifecycleDrainRunner({
+      run: async (actionId) => {
+        if (retryTimer !== undefined) {
+          clearTimeout(retryTimer);
+          retryTimer = undefined;
+        }
         const initialUi = useScaffoldSessionUiStore.getState();
         await reconcileScaffoldLifecycleStartup({
           store: browserScaffoldLifecycleActionStore,
           entriesByDraftId: initialUi.entriesByDraftId,
+          volatileCreateActionsByDraftId: initialUi.volatileCreateActionsByDraftId,
+          catalogReady: environmentCatalogReady,
+          registeredScaffoldTargets: registeredScaffoldTargets(environments),
           recover: (entry) => {
             initialUi.begin({
               draftId: entry.draftId,
@@ -487,6 +654,9 @@ function ScaffoldSessionCoordinator() {
             });
           },
           fail: initialUi.fail,
+          adoptRegisteredTarget: (entry, target) => {
+            initialUi.adoptRegisteredTarget(entry.draftId, target);
+          },
           rebind: (entry) => {
             if (entry.sessionId === null) return;
             initialUi.rebindCreating(
@@ -501,6 +671,61 @@ function ScaffoldSessionCoordinator() {
           store: browserScaffoldLifecycleActionStore,
           ...(actionId ? { actionId } : {}),
           execute: async (action) => {
+            if (action.kind === "pause") {
+              const authorization = authorizeScaffoldPause({
+                action,
+                threadShells,
+                shellsReady: threadShellsReady,
+              });
+              if (authorization === "acknowledge") return { _tag: "acknowledged" };
+              if (authorization === "wait") {
+                return {
+                  _tag: "wait",
+                  retryAfterMs: 1_000,
+                  errorCode: "scaffold_thread_state_unavailable",
+                };
+              }
+              const scaffoldEnvironment = environments.find(
+                (environment) => environment.environmentId === action.environmentId,
+              );
+              if (
+                primaryEnvironmentId === null ||
+                scaffoldEnvironment?.entry.target._tag !== "ScaffoldConnectionTarget" ||
+                scaffoldEnvironment.entry.target.sessionId !== action.sessionId
+              ) {
+                return {
+                  _tag: "wait",
+                  retryAfterMs: 1_000,
+                  errorCode: "scaffold_pause_target_unavailable",
+                };
+              }
+              const result = await pauseScaffold({
+                environmentId: primaryEnvironmentId,
+                input: scaffoldPauseInputFromAction({
+                  action,
+                  deployment: scaffoldEnvironment.entry.target.deployment,
+                }),
+              });
+              if (result._tag === "Failure") {
+                return reconcileScaffoldPauseAction({
+                  action,
+                  error: squashAtomCommandFailure(result),
+                });
+              }
+              const executionResult = reconcileScaffoldPauseAction({
+                action,
+                observation: result.value,
+              });
+              if (executionResult._tag === "acknowledged") {
+                const scaffoldUi = useScaffoldSessionUiStore.getState();
+                const entry = scaffoldSessionForEnvironment(
+                  scaffoldUi.entriesByDraftId,
+                  action.environmentId,
+                );
+                if (entry) scaffoldUi.connected(entry.draftId, result.value);
+              }
+              return executionResult;
+            }
             if (action.kind !== "create") {
               return { _tag: "blocked", errorCode: "unsupported_lifecycle_action" };
             }
@@ -525,7 +750,7 @@ function ScaffoldSessionCoordinator() {
               }
               return failure.result;
             }
-            scaffoldUi.connected(entry.draftId, result.value.binding);
+            scaffoldUi.registered(entry.draftId, result.value.binding);
             if (result.value.binding.deployment !== request.input.deployment) {
               return { _tag: "blocked", errorCode: "scaffold_binding_deployment_mismatch" };
             }
@@ -552,36 +777,100 @@ function ScaffoldSessionCoordinator() {
             }
           },
         });
-      })()
-        .catch((error: unknown) => {
-          console.error("Could not drain the Scaffold lifecycle outbox.", error);
-        })
-        .finally(async () => {
-          running = null;
-          if (disposed) return;
-          try {
-            const pending = await browserScaffoldLifecycleActionStore.list();
-            const readyAt = pending
-              .filter((action) => !action.blocked)
-              .map((action) => action.nextAttemptAt ?? Date.now())
-              .sort((left, right) => left - right)[0];
-            if (readyAt !== undefined) {
-              retryTimer = setTimeout(drain, Math.max(0, readyAt - Date.now()));
-            }
-          } catch (error) {
-            console.error("Could not schedule the Scaffold lifecycle retry.", error);
+      },
+      onIdle: async () => {
+        try {
+          const retryDelayMs = await resolveScaffoldLifecycleRetryDelay({
+            store: browserScaffoldLifecycleActionStore,
+            isDisposed: () => disposed,
+          });
+          if (retryDelayMs !== null) {
+            retryTimer = setTimeout(() => void runner.drain(), retryDelayMs);
           }
-        });
-    };
+        } catch (error) {
+          console.error("Could not schedule the Scaffold lifecycle retry.", error);
+        }
+      },
+      onError: (error) => {
+        console.error("Could not drain the Scaffold lifecycle outbox.", error);
+      },
+    });
 
-    const unsubscribe = subscribeScaffoldLifecycleDrain(drain);
-    drain();
+    const unsubscribe = subscribeScaffoldLifecycleDrain((actionId) => {
+      void runner.drain(actionId);
+    });
+    void runner.drain();
     return () => {
       disposed = true;
+      runner.dispose();
       if (retryTimer) clearTimeout(retryTimer);
       unsubscribe();
     };
-  }, [connectScaffold]);
+  }, [
+    connectScaffold,
+    environmentCatalogReady,
+    environments,
+    pauseScaffold,
+    primaryEnvironmentId,
+    threadShells,
+    threadShellsReady,
+  ]);
+
+  useEffect(() => {
+    // Zustand persistence hydrates after the coordinator's first mount. Wake
+    // the durable outbox once after hydration so a Scaffold create that
+    // survived a reload is not left permanently in "creating". Entry updates
+    // are outputs of the drain and must not recursively wake another pass.
+    let disposed = false;
+    let woke = false;
+    const wakeAfterHydration = () => {
+      if (disposed || woke) return;
+      woke = true;
+      requestScaffoldLifecycleDrain();
+    };
+    const unsubscribe = useScaffoldSessionUiStore.persist.onFinishHydration(wakeAfterHydration);
+    if (useScaffoldSessionUiStore.persist.hasHydrated()) wakeAfterHydration();
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    const scaffoldUi = useScaffoldSessionUiStore.getState();
+    for (const environment of environments) {
+      const target = environment.entry.target;
+      if (target._tag !== "ScaffoldConnectionTarget") continue;
+      for (const entry of Object.values(scaffoldUi.entriesByDraftId)) {
+        if (
+          entry.deployment !== target.deployment ||
+          entry.sessionId !== target.sessionId ||
+          (entry.environmentId !== null && entry.environmentId !== target.environmentId)
+        ) {
+          continue;
+        }
+        scaffoldUi.syncRegisteredTarget(entry.draftId, target, environment.connection);
+      }
+    }
+  }, [entriesByDraftId, environments]);
+
+  useEffect(() => {
+    const availability = scaffoldSessionTitleSyncTargetAvailability({
+      primaryEnvironmentId,
+      environments,
+    });
+    syncScaffoldSessionTitle.reconcileAvailability(availability);
+    const candidates = selectScaffoldSessionTitleSyncCandidates({
+      targets: availability.filter((entry) => entry.usable).map((entry) => entry.target),
+      projects,
+      threads: threadShells,
+    });
+    for (const candidate of candidates) {
+      void syncScaffoldSessionTitle.run(candidate).catch((error: unknown) => {
+        console.error("Could not synchronize the Scaffold session title.", error);
+      });
+    }
+  }, [environments, primaryEnvironmentId, projects, syncScaffoldSessionTitle, threadShells]);
 
   useEffect(() => {
     let disposed = false;

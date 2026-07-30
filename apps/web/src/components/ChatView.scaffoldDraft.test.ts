@@ -20,9 +20,9 @@ describe("Scaffold draft controls", () => {
     );
   });
 
-  it("starts one paused-session resume before accepting the queued turn", () => {
+  it("durably queues a paused-session turn before starting one resume", () => {
     expect(chatViewSource).toMatch(
-      /resolveScaffoldSendDecision\(\{[\s\S]*?scaffoldPhase: effectiveScaffoldSession\?\.phase[\s\S]*?if \(scaffoldSendDecision\.shouldResume && activeScaffoldSession\) \{[\s\S]*?setPhase\(activeScaffoldSession\.draftId, "resuming"\);[\s\S]*?handleReconnectActiveEnvironment\(activeThread\.environmentId\);[\s\S]*?sendInFlightRef\.current = true;[\s\S]*?enqueuePendingTurn/,
+      /resolveScaffoldSendDecision\(\{[\s\S]*?scaffoldPhase: effectiveScaffoldSession\?\.phase[\s\S]*?sendInFlightRef\.current = true;[\s\S]*?await enqueuePendingTurn[\s\S]*?messagePersistedToOutbox = true;[\s\S]*?if \(scaffoldSendDecision\.shouldResume && activeScaffoldSession\) \{[\s\S]*?setPhase\(activeScaffoldSession\.draftId, "resuming"\);[\s\S]*?handleReconnectActiveEnvironment\(activeThread\.environmentId\)/,
     );
     expect(chatViewSource).toMatch(
       /!activeThread \|\|[\s\S]*?isSendBusy \|\|[\s\S]*?sendInFlightRef\.current/,
@@ -76,6 +76,12 @@ describe("Scaffold draft controls", () => {
     );
   });
 
+  it("does not project a local environment connection onto a remote Scaffold draft", () => {
+    expect(chatViewSource).toMatch(
+      /session\?\.phase !== "resuming"[\s\S]*?if \(!scaffoldDraftBoundToTarget\) return;[\s\S]*?activeEnvironmentConnectionPhase === "connected"/,
+    );
+  });
+
   it("rehydrates a draft-scoped queue before binding and gates all dispatch behind drain mode", () => {
     expect(chatViewSource).toContain(
       "const effectiveScaffoldSession = scaffoldSessionUi ?? activeScaffoldSession",
@@ -108,7 +114,10 @@ describe("Scaffold draft controls", () => {
     ).toBe(true);
   });
 
-  it("retries only the failed draft's durable lifecycle action", () => {
+  it("reconnects an existing failed target and replays creation only while unbound", () => {
+    expect(chatViewSource).toMatch(
+      /resolveFailedScaffoldDraftRetryMode\(entry\)[\s\S]*?retryMode === "reconnect"[\s\S]*?\.setPhase\(entry\.draftId, "resuming"\)[\s\S]*?handleReconnectActiveEnvironment\(targetEnvironmentId\)/,
+    );
     expect(chatViewSource).toMatch(
       /retryScaffoldLifecycleAction\(\{[\s\S]*?store: browserScaffoldLifecycleActionStore,[\s\S]*?actionId: entry\.actionId,[\s\S]*?expectedDeployment: entry\.deployment/,
     );

@@ -58,6 +58,92 @@ export function shouldReplayCommand(status: string): boolean {
   return status === "queued" || status === "delivered";
 }
 
+export const SESSION_FABRIC_WAKE_MAX_ATTEMPTS = 6;
+
+export function scaffoldWakeRetryDelayMs(attemptCount: number): number {
+  const boundedAttempt = Math.max(1, Math.min(attemptCount, SESSION_FABRIC_WAKE_MAX_ATTEMPTS));
+  return Math.min(30_000, 1_000 * 2 ** (boundedAttempt - 1));
+}
+
+export function scaffoldWakeKeepsCommandPending(status: string): boolean {
+  return (
+    status === "pending" ||
+    status === "retrying" ||
+    status === "joining" ||
+    status === "awaiting_snapshot" ||
+    status === "ready"
+  );
+}
+
+export function scaffoldWakeRequestsAuthority(status: string): boolean {
+  return status === "pending" || status === "retrying" || status === "awaiting_snapshot";
+}
+
+export function scaffoldWakeHasAttemptsRemaining(attemptCount: number): boolean {
+  return attemptCount < SESSION_FABRIC_WAKE_MAX_ATTEMPTS;
+}
+
+export function scaffoldWakeFollowerStatus(input: {
+  readonly leaderStatus: string;
+  readonly targetLifecycleEpoch: number | null;
+}): "joining" | "awaiting_snapshot" | "ready" {
+  if (input.targetLifecycleEpoch === null) return "joining";
+  return input.leaderStatus === "ready" ? "ready" : "awaiting_snapshot";
+}
+
+export function nextSessionFabricMaintenanceDueAt(input: {
+  readonly directoryDueAt: number | null;
+  readonly wakeDueAt: number | null;
+}): number | null {
+  if (input.directoryDueAt === null) return input.wakeDueAt;
+  if (input.wakeDueAt === null) return input.directoryDueAt;
+  return Math.min(input.directoryDueAt, input.wakeDueAt);
+}
+
+export function offlineScaffoldCommandCanWake(input: {
+  readonly controllerMatchesSnapshotIdentity: boolean;
+  readonly runnerState: string;
+  readonly eligibleRunnerCount: number;
+  readonly wakeAlreadyActive: boolean;
+  readonly publication: string;
+  readonly environmentKind: string;
+  readonly scaffoldSessionId: string | null;
+  readonly controllerLifecycleEpoch: number | null | undefined;
+  readonly wakeAuthorityConfigured: boolean;
+}): boolean {
+  return (
+    input.controllerMatchesSnapshotIdentity &&
+    (input.runnerState !== "online" || input.wakeAlreadyActive) &&
+    input.eligibleRunnerCount === 0 &&
+    input.publication === "public" &&
+    input.environmentKind === "scaffold" &&
+    input.scaffoldSessionId !== null &&
+    Number.isSafeInteger(input.controllerLifecycleEpoch) &&
+    (input.controllerLifecycleEpoch ?? -1) >= 0 &&
+    input.wakeAuthorityConfigured
+  );
+}
+
+export function snapshotProvesScaffoldWakeTarget(input: {
+  readonly wakeFabricSessionId: string;
+  readonly wakeScaffoldSessionId: string;
+  readonly wakeTargetLifecycleEpoch: number | null;
+  readonly snapshotFabricSessionId: string;
+  readonly snapshotEnvironmentKind: string;
+  readonly snapshotScaffoldSessionId: string | null;
+  readonly snapshotLifecycleEpoch: number | null | undefined;
+  readonly runnerGeneration: number;
+}): boolean {
+  return (
+    input.wakeTargetLifecycleEpoch !== null &&
+    input.snapshotFabricSessionId === input.wakeFabricSessionId &&
+    input.snapshotEnvironmentKind === "scaffold" &&
+    input.snapshotScaffoldSessionId === input.wakeScaffoldSessionId &&
+    input.snapshotLifecycleEpoch === input.wakeTargetLifecycleEpoch &&
+    input.runnerGeneration === input.wakeTargetLifecycleEpoch
+  );
+}
+
 export function isCurrentRunnerAttachment(input: {
   readonly attachmentGeneration: number | null;
   readonly attachmentRunnerId: string | null;

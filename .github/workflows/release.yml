@@ -187,6 +187,10 @@ jobs:
       clerk_jwt_template: ${{ steps.public_config.outputs.clerk_jwt_template }}
       clerk_cli_oauth_client_id: ${{ steps.public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ steps.public_config.outputs.relay_url }}
+      session_fabric_relay_url: ${{ steps.public_config.outputs.session_fabric_relay_url }}
+      scaffold_staging_url: ${{ steps.public_config.outputs.scaffold_staging_url }}
+      scaffold_production_url: ${{ steps.public_config.outputs.scaffold_production_url }}
+      scaffold_default_deployment: ${{ steps.public_config.outputs.scaffold_default_deployment }}
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -195,6 +199,10 @@ jobs:
       CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
       CLERK_JWT_TEMPLATE: ${{ vars.CLERK_JWT_TEMPLATE }}
       CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+      T3CODE_SESSION_FABRIC_RELAY_URL: ${{ vars.T3CODE_SESSION_FABRIC_RELAY_URL }}
+      T3CODE_SCAFFOLD_STAGING_URL: ${{ vars.T3CODE_SCAFFOLD_STAGING_URL }}
+      T3CODE_SCAFFOLD_PRODUCTION_URL: ${{ vars.T3CODE_SCAFFOLD_PRODUCTION_URL }}
+      T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT: ${{ vars.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -213,6 +221,27 @@ jobs:
           run-install: |
             args:
               - --filter=t3code-relay...
+
+      - name: Resolve Ashler public distribution config
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE' >> "$GITHUB_ENV"
+          import { loadRepoEnv } from "./scripts/lib/public-config.ts";
+
+          const baseEnv = Object.fromEntries(
+            Object.entries(process.env).filter(([, value]) => value?.trim()),
+          );
+          const config = loadRepoEnv({ baseEnv });
+          const names = [
+            "T3CODE_SESSION_FABRIC_RELAY_URL",
+            "T3CODE_SCAFFOLD_STAGING_URL",
+            "T3CODE_SCAFFOLD_PRODUCTION_URL",
+            "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT",
+          ];
+          for (const name of names) {
+            process.stdout.write(`${name}=${config[name] ?? ""}\n`);
+          }
+          NODE
 
       - id: relay_state
         name: Read production relay tracing config
@@ -259,10 +288,41 @@ jobs:
             exit 1
           fi
 
+          mapfile -t normalized_public_origins < <(
+            node --input-type=module <<'NODE'
+            import { normalizeSecureRelayUrl } from "./packages/shared/src/relayUrl.ts";
+
+            for (const [name, value] of [
+              ["T3CODE_SESSION_FABRIC_RELAY_URL", process.env.T3CODE_SESSION_FABRIC_RELAY_URL],
+              ["T3CODE_SCAFFOLD_STAGING_URL", process.env.T3CODE_SCAFFOLD_STAGING_URL],
+              ["T3CODE_SCAFFOLD_PRODUCTION_URL", process.env.T3CODE_SCAFFOLD_PRODUCTION_URL],
+            ]) {
+              const normalized = normalizeSecureRelayUrl(value ?? "");
+              if (normalized === null) throw new Error(`${name} must be a secure HTTPS origin.`);
+              process.stdout.write(`${normalized}\n`);
+            }
+            NODE
+          )
+          if (( ${#normalized_public_origins[@]} != 3 )); then
+            echo "Ashler public distribution URLs could not be normalized." >&2
+            exit 1
+          fi
+
+          node -e '
+            const [deployment] = process.argv.slice(1);
+            if (!new Set(["staging", "production"]).has(deployment)) {
+              throw new Error("T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT is invalid.");
+            }
+          ' "$T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT"
+
           echo "clerk_publishable_key=$CLERK_PUBLISHABLE_KEY" >> "$GITHUB_OUTPUT"
           echo "clerk_jwt_template=$CLERK_JWT_TEMPLATE" >> "$GITHUB_OUTPUT"
           echo "clerk_cli_oauth_client_id=$CLERK_CLI_OAUTH_CLIENT_ID" >> "$GITHUB_OUTPUT"
           echo "relay_url=https://$relay_domain" >> "$GITHUB_OUTPUT"
+          echo "session_fabric_relay_url=${normalized_public_origins[0]}" >> "$GITHUB_OUTPUT"
+          echo "scaffold_staging_url=${normalized_public_origins[1]}" >> "$GITHUB_OUTPUT"
+          echo "scaffold_production_url=${normalized_public_origins[2]}" >> "$GITHUB_OUTPUT"
+          echo "scaffold_default_deployment=$T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT" >> "$GITHUB_OUTPUT"
 
   # node-pty publishes no Linux prebuilt and the WSL backend runs under the
   # distro's own (Linux) Node, which can't load the Windows/Electron binary. We
@@ -334,6 +394,13 @@ jobs:
       T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.relay_public_config.outputs.clerk_jwt_template }}
       T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       T3CODE_RELAY_URL: ${{ needs.relay_public_config.outputs.relay_url }}
+      T3CODE_SESSION_FABRIC_RELAY_URL: ${{ needs.relay_public_config.outputs.session_fabric_relay_url }}
+      T3CODE_SESSION_FABRIC_AUTH_MODE: required
+      T3CODE_SCAFFOLD_STAGING_URL: ${{ needs.relay_public_config.outputs.scaffold_staging_url }}
+      T3CODE_SCAFFOLD_STAGING_AUTH_MODE: oauth
+      T3CODE_SCAFFOLD_PRODUCTION_URL: ${{ needs.relay_public_config.outputs.scaffold_production_url }}
+      T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE: oauth
+      T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT: ${{ needs.relay_public_config.outputs.scaffold_default_deployment }}
     strategy:
       fail-fast: false
       matrix:
@@ -676,6 +743,13 @@ jobs:
       T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.relay_public_config.outputs.clerk_jwt_template }}
       T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       T3CODE_RELAY_URL: ${{ needs.relay_public_config.outputs.relay_url }}
+      T3CODE_SESSION_FABRIC_RELAY_URL: ${{ needs.relay_public_config.outputs.session_fabric_relay_url }}
+      T3CODE_SESSION_FABRIC_AUTH_MODE: required
+      T3CODE_SCAFFOLD_STAGING_URL: ${{ needs.relay_public_config.outputs.scaffold_staging_url }}
+      T3CODE_SCAFFOLD_STAGING_AUTH_MODE: oauth
+      T3CODE_SCAFFOLD_PRODUCTION_URL: ${{ needs.relay_public_config.outputs.scaffold_production_url }}
+      T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE: oauth
+      T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT: ${{ needs.relay_public_config.outputs.scaffold_default_deployment }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -873,6 +947,13 @@ jobs:
       T3CODE_CLERK_JWT_TEMPLATE: ${{ needs.relay_public_config.outputs.clerk_jwt_template }}
       T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       T3CODE_RELAY_URL: ${{ needs.relay_public_config.outputs.relay_url }}
+      T3CODE_SESSION_FABRIC_RELAY_URL: ${{ needs.relay_public_config.outputs.session_fabric_relay_url }}
+      T3CODE_SESSION_FABRIC_AUTH_MODE: required
+      T3CODE_SCAFFOLD_STAGING_URL: ${{ needs.relay_public_config.outputs.scaffold_staging_url }}
+      T3CODE_SCAFFOLD_STAGING_AUTH_MODE: oauth
+      T3CODE_SCAFFOLD_PRODUCTION_URL: ${{ needs.relay_public_config.outputs.scaffold_production_url }}
+      T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE: oauth
+      T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT: ${{ needs.relay_public_config.outputs.scaffold_default_deployment }}
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
       VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
@@ -962,6 +1043,13 @@ jobs:
               --build-env "T3CODE_CLERK_JWT_TEMPLATE=${T3CODE_CLERK_JWT_TEMPLATE:-}" \
               --build-env "T3CODE_CLERK_CLI_OAUTH_CLIENT_ID=${T3CODE_CLERK_CLI_OAUTH_CLIENT_ID:-}" \
               --build-env "T3CODE_RELAY_URL=${T3CODE_RELAY_URL:-}" \
+              --build-env "T3CODE_SESSION_FABRIC_RELAY_URL=${T3CODE_SESSION_FABRIC_RELAY_URL:-}" \
+              --build-env "T3CODE_SESSION_FABRIC_AUTH_MODE=required" \
+              --build-env "T3CODE_SCAFFOLD_STAGING_URL=${T3CODE_SCAFFOLD_STAGING_URL:-}" \
+              --build-env "T3CODE_SCAFFOLD_STAGING_AUTH_MODE=oauth" \
+              --build-env "T3CODE_SCAFFOLD_PRODUCTION_URL=${T3CODE_SCAFFOLD_PRODUCTION_URL:-}" \
+              --build-env "T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE=oauth" \
+              --build-env "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT=${T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT:-}" \
               --build-env "T3CODE_RELAY_CLIENT_OTLP_TRACES_URL=${T3CODE_RELAY_CLIENT_OTLP_TRACES_URL:-}" \
               --build-env "T3CODE_RELAY_CLIENT_OTLP_TRACES_DATASET=${T3CODE_RELAY_CLIENT_OTLP_TRACES_DATASET:-}" \
               --build-env "T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN=${T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN:-}" \

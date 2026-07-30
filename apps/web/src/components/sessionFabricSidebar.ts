@@ -2,11 +2,20 @@ import type { SessionFabricRunnerState, SessionFabricSessionRecord } from "@t3to
 
 export interface SessionFabricSidebarSession {
   readonly sessionId: string;
+  readonly environmentKind: "local" | "scaffold";
   readonly environmentId: string;
   readonly projectId: string;
   readonly threadId: string;
   readonly title: string;
   readonly runnerState: SessionFabricRunnerState;
+  readonly scaffoldSessionId: string | null;
+  readonly scaffoldSessionUrl: string | null;
+}
+
+export interface SessionFabricScaffoldLinks {
+  readonly sessionUrl: string;
+  readonly webUrl: string;
+  readonly tiltUrl: string;
 }
 
 export type SessionFabricSidebarDirectoryState =
@@ -127,19 +136,55 @@ export function sessionFabricRunnerStateLabel(state: SessionFabricRunnerState): 
 export function selectPublicLocalSidebarSessions(
   sessions: ReadonlyArray<SessionFabricSessionRecord>,
 ): ReadonlyArray<SessionFabricSidebarSession> {
-  return sessions
-    .filter(
-      (session) => session.publication === "public" && session.location.environmentKind === "local",
-    )
-    .toSorted((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-    .map((session) => ({
-      sessionId: session.sessionId,
-      environmentId: session.location.environmentId,
-      projectId: session.location.projectId,
-      threadId: session.location.threadId,
-      title: session.title,
-      runnerState: session.runnerState,
-    }));
+  return (
+    sessions
+      .filter((session) => session.publication === "public")
+      // Opening or attaching to a session advances updatedAt. Ordering by that
+      // activity timestamp made the selected row jump through the sidebar on
+      // navigation. Match native thread rows: creation order is stable for the
+      // lifetime of the session, with the id as a deterministic tie-breaker.
+      .toSorted(
+        (left, right) =>
+          right.createdAt.localeCompare(left.createdAt) ||
+          left.sessionId.localeCompare(right.sessionId),
+      )
+      .map((session) => ({
+        sessionId: session.sessionId,
+        environmentKind: session.location.environmentKind,
+        environmentId: session.location.environmentId,
+        projectId: session.location.projectId,
+        threadId: session.location.threadId,
+        title: session.title,
+        runnerState: session.runnerState,
+        scaffoldSessionId: session.location.scaffoldSessionId,
+        scaffoldSessionUrl: session.location.scaffoldSessionUrl,
+      }))
+  );
+}
+
+export function sessionFabricScaffoldLinks(
+  session: SessionFabricSidebarSession,
+): SessionFabricScaffoldLinks | null {
+  if (
+    session.environmentKind !== "scaffold" ||
+    session.scaffoldSessionId === null ||
+    session.scaffoldSessionUrl === null
+  ) {
+    return null;
+  }
+
+  try {
+    const sessionUrl = new URL(session.scaffoldSessionUrl);
+    if (sessionUrl.protocol !== "https:" && sessionUrl.protocol !== "http:") return null;
+    const sessionId = encodeURIComponent(session.scaffoldSessionId);
+    return {
+      sessionUrl: sessionUrl.toString(),
+      webUrl: new URL(`/sessions/${sessionId}/web`, sessionUrl.origin).toString(),
+      tiltUrl: new URL(`/sessions/${sessionId}/tilt`, sessionUrl.origin).toString(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function selectVisibleSessionFabricSidebarSessions(
@@ -152,7 +197,6 @@ export function selectVisibleSessionFabricSidebarSessions(
   return sessions.filter(
     (session) =>
       !options.connectedThreadKeys.has(`${session.environmentId}:${session.threadId}`) &&
-      !options.connectedThreadKeys.has(`session-fabric:${session.sessionId}:${session.threadId}`) &&
       (options.scopedProjectKeys === null ||
         options.scopedProjectKeys.has(`${session.environmentId}:${session.projectId}`)),
   );
@@ -164,7 +208,7 @@ export function selectShadowedSessionFabricThreadKeys(
 ): ReadonlySet<string> {
   return new Set(
     sessions.flatMap((session) =>
-      connectedThreadKeys.has(`${session.environmentId}:${session.threadId}`)
+      connectedThreadKeys.has(`session-fabric:${session.sessionId}:${session.threadId}`)
         ? [`session-fabric:${session.sessionId}:${session.threadId}`]
         : [],
     ),

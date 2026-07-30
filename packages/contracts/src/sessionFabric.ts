@@ -210,6 +210,13 @@ const SessionFabricScaffoldCapabilityGrantBindings = Schema.Struct({
   scaffoldLifecycleEpoch: Schema.optional(NonNegativeInt),
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 
+const SessionFabricLocalCapabilityGrantBindings = Schema.Struct({
+  fabricSessionId: SessionFabricSessionId,
+  environmentKind: Schema.Literal("local"),
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+
 export const SessionFabricCapabilityGrant = Schema.Struct({
   capability: TrimmedNonEmptyString,
   tokenType: Schema.Literal("Bearer"),
@@ -221,8 +228,7 @@ export const SessionFabricCapabilityGrant = Schema.Struct({
   keyId: TrimmedNonEmptyString,
   bindings: Schema.Union([
     SessionFabricScaffoldCapabilityGrantBindings,
-    SessionFabricLocalControllerAuthorityBinding,
-    SessionFabricLocalAuthorityBinding,
+    SessionFabricLocalCapabilityGrantBindings,
   ]).annotate({ parseOptions: { onExcessProperty: "error" } }),
 });
 export type SessionFabricCapabilityGrant = typeof SessionFabricCapabilityGrant.Type;
@@ -306,6 +312,7 @@ export const SessionFabricClientHello = Schema.Struct({
   sessionId: SessionFabricSessionId,
   clientId: SessionFabricClientId,
   afterEventSequence: NonNegativeInt,
+  synchronize: Schema.optional(Schema.Boolean),
   connectedAt: IsoDateTime,
 });
 export type SessionFabricClientHello = typeof SessionFabricClientHello.Type;

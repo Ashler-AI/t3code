@@ -27,6 +27,8 @@ const isLifecycleError = Schema.is(ScaffoldLifecycleError);
 /** Allows the server's 60-second readiness window to complete before transport cancellation. */
 export const DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS = 65_000;
 
+const inFlightResumePrepares = new Map<string, Promise<ScaffoldPreparedConnection>>();
+
 function operationId(): string {
   return randomUUID();
 }
@@ -45,7 +47,7 @@ const requestPreparedEffect = (input: ScaffoldPrepareConnectionInput) =>
           }),
   });
 
-export async function requestScaffoldPreparedConnection(
+async function requestScaffoldPreparedConnectionUncoalesced(
   input: ScaffoldPrepareConnectionInput,
   fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
   lifecycleUrl: string = resolvePrimaryEnvironmentHttpUrl("/api/scaffold/connection"),
@@ -101,6 +103,42 @@ export async function requestScaffoldPreparedConnection(
     });
   }
   return prepared.value;
+}
+
+export function requestScaffoldPreparedConnection(
+  input: ScaffoldPrepareConnectionInput,
+  fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
+  lifecycleUrl: string = resolvePrimaryEnvironmentHttpUrl("/api/scaffold/connection"),
+  timeoutMs: number = DEFAULT_LOCAL_LIFECYCLE_TIMEOUT_MS,
+): Promise<ScaffoldPreparedConnection> {
+  if (input._tag !== "ScaffoldResumeAndPrepareInput") {
+    return requestScaffoldPreparedConnectionUncoalesced(input, fetchImpl, lifecycleUrl, timeoutMs);
+  }
+
+  const key = JSON.stringify([
+    lifecycleUrl,
+    input.deployment,
+    input.environmentId,
+    input.sessionId,
+    input.expectedLifecycleEpoch,
+  ]);
+  const existing = inFlightResumePrepares.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const request = requestScaffoldPreparedConnectionUncoalesced(
+    input,
+    fetchImpl,
+    lifecycleUrl,
+    timeoutMs,
+  ).finally(() => {
+    if (inFlightResumePrepares.get(key) === request) {
+      inFlightResumePrepares.delete(key);
+    }
+  });
+  inFlightResumePrepares.set(key, request);
+  return request;
 }
 
 export async function requestScaffoldDeploymentCapabilities(

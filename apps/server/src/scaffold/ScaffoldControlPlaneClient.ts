@@ -96,6 +96,7 @@ export function parseScaffoldSessionObservation(
   // Scaffold's session resource is keyed by `id`. Do not revive the old
   // prototype's invented `sessionId` response field.
   const sessionId = stringValue(session.id);
+  const name = stringValue(session.name);
   const rawStatus = stringValue(session.status);
   const status =
     rawStatus && ScaffoldSessionStatus.literals.includes(rawStatus as never)
@@ -108,6 +109,7 @@ export function parseScaffoldSessionObservation(
     sessionId,
     status,
     lifecycleEpoch,
+    ...(name ? { name } : {}),
     ...(updatedAt ? { updatedAt } : {}),
   });
 }
@@ -455,6 +457,22 @@ export function makeScaffoldControlPlaneClient(options: {
       mutate({ ...input, kind: "resume" }),
     pauseSession: (input: Omit<Parameters<typeof mutate>[0], "kind">) =>
       mutate({ ...input, kind: "pause" }),
+    renameSession: async (input: {
+      readonly sessionId: string;
+      readonly operationId: string;
+      readonly name: string;
+    }) =>
+      expectObservation(
+        await request(
+          `${options.target.collectionPath}/${encodeURIComponent(input.sessionId)}/name`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", "idempotency-key": input.operationId },
+            body: JSON.stringify({ name: input.name }),
+          },
+        ),
+        input.sessionId,
+      ),
     issueSessionFabricCapability: async (
       input: ScaffoldSessionFabricCapabilityInput,
     ): Promise<SessionFabricCapabilityGrant> => {

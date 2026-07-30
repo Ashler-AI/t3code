@@ -46,6 +46,10 @@ describe("loadRepoEnv", () => {
   it("applies process, root local, and root precedence in that order", () => {
     const repoRoot = makeTemporaryDirectory();
     NodeFS.writeFileSync(
+      NodePath.join(repoRoot, ".env.defaults"),
+      "T3CODE_RELAY_URL=https://defaults.example.test\nT3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT=staging\n",
+    );
+    NodeFS.writeFileSync(
       NodePath.join(repoRoot, ".env"),
       "T3CODE_CLERK_PUBLISHABLE_KEY=pk_root\nT3CODE_CLERK_JWT_TEMPLATE=template_root\nT3CODE_CLERK_CLI_OAUTH_CLIENT_ID=oauth_root\nT3CODE_RELAY_URL=https://root.example.test\n",
     );
@@ -56,6 +60,9 @@ describe("loadRepoEnv", () => {
 
     expect(loadRepoEnv({ baseEnv: {}, repoRoot }).T3CODE_RELAY_URL).toBe(
       "https://local.example.test",
+    );
+    expect(loadRepoEnv({ baseEnv: {}, repoRoot }).T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT).toBe(
+      "staging",
     );
     expect(
       loadRepoEnv({
@@ -77,6 +84,42 @@ describe("loadRepoEnv", () => {
       EXPO_PUBLIC_CLERK_JWT_TEMPLATE: "template_ci",
       T3CODE_RELAY_URL: "https://ci.example.test",
       VITE_T3CODE_RELAY_URL: "https://ci.example.test",
+    });
+  });
+
+  it("loads tracked public defaults at the lowest precedence", () => {
+    const repoRoot = makeTemporaryDirectory();
+    NodeFS.writeFileSync(
+      NodePath.join(repoRoot, ".env.defaults"),
+      [
+        "T3CODE_SESSION_FABRIC_RELAY_URL=https://proof.example.test",
+        "T3CODE_SESSION_FABRIC_AUTH_MODE=required",
+        "T3CODE_SCAFFOLD_STAGING_URL=https://staging.example.test",
+        "T3CODE_SCAFFOLD_STAGING_AUTH_MODE=oauth",
+        "T3CODE_SCAFFOLD_PRODUCTION_URL=https://production.example.test",
+        "T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE=oauth",
+        "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT=staging",
+      ].join("\n"),
+    );
+    NodeFS.writeFileSync(
+      NodePath.join(repoRoot, ".env"),
+      "T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT=production\n",
+    );
+
+    expect(
+      loadRepoEnv({
+        baseEnv: { T3CODE_SCAFFOLD_STAGING_URL: "https://ci-staging.example.test" },
+        repoRoot,
+      }),
+    ).toMatchObject({
+      T3CODE_SESSION_FABRIC_RELAY_URL: "https://proof.example.test",
+      VITE_T3CODE_SESSION_FABRIC_RELAY_URL: "https://proof.example.test",
+      T3CODE_SESSION_FABRIC_AUTH_MODE: "required",
+      T3CODE_SCAFFOLD_STAGING_URL: "https://ci-staging.example.test",
+      T3CODE_SCAFFOLD_STAGING_AUTH_MODE: "oauth",
+      T3CODE_SCAFFOLD_PRODUCTION_URL: "https://production.example.test",
+      T3CODE_SCAFFOLD_PRODUCTION_AUTH_MODE: "oauth",
+      T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT: "production",
     });
   });
 

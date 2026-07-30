@@ -193,6 +193,15 @@ describe("ServerSettings worktree defaults", () => {
   });
 });
 
+describe("ServerSettings assistant streaming", () => {
+  it("streams assistant output by default while preserving an explicit buffered opt-out", () => {
+    expect(decodeServerSettings({}).enableAssistantStreaming).toBe(true);
+    expect(decodeServerSettings({ enableAssistantStreaming: false }).enableAssistantStreaming).toBe(
+      false,
+    );
+  });
+});
+
 describe("ServerSettings.sourceControlWritingStyle", () => {
   it("defaults all style settings for legacy configs", () => {
     const settings = decodeServerSettings({});

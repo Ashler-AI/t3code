@@ -1297,6 +1297,19 @@ function OpenCommandPaletteDialog(props: {
       }),
     [activeDraftThread, activeThread, defaultProjectRef, handleNewThread],
   );
+  const projectPickerEntries = useMemo(
+    () =>
+      buildLocalSidebarProjectPickerEntries({
+        groups: projectGroups,
+        preferredProjectRef: contextualProjectRef,
+        primaryEnvironmentId,
+      }),
+    [contextualProjectRef, primaryEnvironmentId, projectGroups],
+  );
+  const scaffoldSourceProject =
+    projectPickerEntries.find((entry) => entry.isPreferred)?.targetProject ??
+    projectPickerEntries[0]?.targetProject ??
+    null;
   const scaffoldCapabilityByDeployment = useMemo(
     () =>
       new Map(
@@ -1310,45 +1323,41 @@ function OpenCommandPaletteDialog(props: {
   const scaffoldNewSessionActionPresentation = useCallback(
     (deployment: ScaffoldDeployment) =>
       getScaffoldNewSessionActionPresentation({
-        hasContextualProject: contextualProjectRef !== null,
+        hasContextualProject: scaffoldSourceProject !== null,
         capability: scaffoldCapabilityByDeployment.get(deployment) ?? null,
       }),
-    [contextualProjectRef, scaffoldCapabilityByDeployment],
+    [scaffoldCapabilityByDeployment, scaffoldSourceProject],
   );
   const startScaffoldThread = useCallback(
     (deployment: ScaffoldDeployment) => {
-      if (contextualProjectRef === null) return Promise.resolve();
+      if (scaffoldSourceProject === null) return Promise.resolve();
       const defaultScaffoldModelSelection = resolveScaffoldDraftModelSelection(providers, null);
       if (defaultScaffoldModelSelection === null) {
         return Promise.reject(new Error("OMP models are not ready for Scaffold yet."));
       }
-      const sourceProject = projects.find(
-        (project) =>
-          project.environmentId === contextualProjectRef.environmentId &&
-          project.id === contextualProjectRef.projectId,
+      const sourceModelSelection =
+        composerHandleRef?.current?.getSendContext().selectedModelSelection ?? null;
+      const launchModelSelection =
+        resolveScaffoldDraftModelSelection(providers, sourceModelSelection) ??
+        defaultScaffoldModelSelection;
+      const scaffoldSourceProjectRef = scopeProjectRef(
+        scaffoldSourceProject.environmentId,
+        scaffoldSourceProject.id,
       );
       return runScaffoldLaunchFlight({
         deployment,
         execute: async (context) => {
           const scaffoldUi = useScaffoldSessionUiStore.getState();
-          let launchModelSelection = defaultScaffoldModelSelection;
           await runScaffoldDraftLaunch<
             DraftId,
             Extract<ScaffoldLifecycleAction, { readonly kind: "create" }>
           >({
             createDraft: async (prepareDraftBeforeNavigation) => {
-              await handleNewThread(contextualProjectRef, {
+              await handleNewThread(scaffoldSourceProjectRef, {
                 envMode: "local",
                 forceNew: true,
                 onDraftCreated: (draftId) => {
                   const composerDrafts = useComposerDraftStore.getState();
-                  const draft = composerDrafts.getComposerDraft(draftId);
-                  const sourceModelSelection = draft?.activeProvider
-                    ? (draft.modelSelectionByProvider[draft.activeProvider] ?? null)
-                    : null;
-                  launchModelSelection =
-                    resolveScaffoldDraftModelSelection(providers, sourceModelSelection) ??
-                    defaultScaffoldModelSelection;
                   composerDrafts.setModelSelection(draftId, launchModelSelection, {
                     replaceOptions: true,
                   });
@@ -1365,11 +1374,11 @@ function OpenCommandPaletteDialog(props: {
               return makeScaffoldCreateAction({
                 draftId,
                 deployment: locked.deployment,
-                sourceEnvironmentId: contextualProjectRef.environmentId,
-                sourceProjectId: contextualProjectRef.projectId,
+                sourceEnvironmentId: scaffoldSourceProject.environmentId,
+                sourceProjectId: scaffoldSourceProject.id,
                 create: {
                   ...modelGrant,
-                  ...(sourceProject?.title ? { name: sourceProject.title } : {}),
+                  ...(scaffoldSourceProject.title ? { name: scaffoldSourceProject.title } : {}),
                 },
               });
             },
@@ -1382,8 +1391,8 @@ function OpenCommandPaletteDialog(props: {
                 draftId,
                 deployment: action.deployment,
                 actionId: action.actionId,
-                sourceEnvironmentId: contextualProjectRef.environmentId,
-                sourceProjectId: contextualProjectRef.projectId,
+                sourceEnvironmentId: scaffoldSourceProject.environmentId,
+                sourceProjectId: scaffoldSourceProject.id,
                 sessionId: action.sessionId,
                 createdAt: action.createdAt,
               });
@@ -1402,16 +1411,7 @@ function OpenCommandPaletteDialog(props: {
         },
       });
     },
-    [contextualProjectRef, handleNewThread, projects, providers],
-  );
-  const projectPickerEntries = useMemo(
-    () =>
-      buildLocalSidebarProjectPickerEntries({
-        groups: projectGroups,
-        preferredProjectRef: contextualProjectRef,
-        primaryEnvironmentId,
-      }),
-    [contextualProjectRef, primaryEnvironmentId, projectGroups],
+    [handleNewThread, providers, scaffoldSourceProject],
   );
   const pickerProjects = useMemo(
     () =>
@@ -1960,6 +1960,19 @@ function OpenCommandPaletteDialog(props: {
 
   const startAddProjectSourceSelection = useCallback(
     (environmentId: EnvironmentId): void => {
+      const environment = environments.find(
+        (candidate) => candidate.environmentId === environmentId,
+      );
+      if (!canCreateProjectInEnvironment(environment?.connection.phase)) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Environment unavailable",
+            description: `${environment?.label ?? "The selected environment"} is not connected.`,
+          }),
+        );
+        return;
+      }
       setAddProjectEnvironmentId(environmentId);
       setAddProjectCloneFlow(null);
       pushPaletteView({
@@ -1975,6 +1988,7 @@ function OpenCommandPaletteDialog(props: {
     [
       browseEnvironmentId,
       buildAddProjectSourceGroups,
+      environments,
       pushPaletteView,
       sourceControlDiscovery.data,
     ],
@@ -1986,7 +2000,12 @@ function OpenCommandPaletteDialog(props: {
       value: `action:add-project:environment:${option.environmentId}`,
       searchTerms: [option.label, option.environmentId, option.isPrimary ? "this device" : ""],
       title: option.label,
-      description: option.isPrimary ? "This device" : option.environmentId,
+      description: option.isConnected
+        ? option.isPrimary
+          ? "This device"
+          : option.environmentId
+        : option.status,
+      disabled: !option.isConnected,
       icon: <FolderPlusIcon className={ITEM_ICON_CLASS} />,
       keepOpen: true,
       run: async () => {
@@ -2007,7 +2026,7 @@ function OpenCommandPaletteDialog(props: {
   );
 
   const openAddProjectFlow = useCallback(() => {
-    if (addProjectEnvironmentOptions.length > 1) {
+    if (addProjectEnvironmentOptions.length > 1 || defaultAddProjectEnvironmentId === null) {
       pushPaletteView({
         addonIcon: <FolderPlusIcon className={ADDON_ICON_CLASS} />,
         groups: addProjectEnvironmentGroups,
@@ -2092,15 +2111,21 @@ function OpenCommandPaletteDialog(props: {
         label: "Run on",
         items: [
           {
-            kind: "submenu",
+            kind: "action",
             value: "action:new-session:local",
             searchTerms: ["local", "worktree", "project"],
             title: "Local",
-            description: "New worktree",
+            description:
+              scaffoldSourceProject === null ? "Add or open a local project first" : "New worktree",
             icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
-            addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
-            disabled: projects.length === 0,
-            groups: [{ value: "projects", label: "Project", items: newLocalSessionProjectItems }],
+            disabled: scaffoldSourceProject === null,
+            run: async () => {
+              if (scaffoldSourceProject === null) return;
+              await handleNewThread(
+                scopeProjectRef(scaffoldSourceProject.environmentId, scaffoldSourceProject.id),
+                { forceNew: true },
+              );
+            },
           },
           {
             kind: "action",
@@ -2126,9 +2151,9 @@ function OpenCommandPaletteDialog(props: {
       },
     ];
   }, [
-    newLocalSessionProjectItems,
-    projects.length,
+    handleNewThread,
     scaffoldNewSessionActionPresentation,
+    scaffoldSourceProject,
     startScaffoldThread,
   ]);
   const newSessionItem: CommandPaletteSubmenuItem = {
@@ -2485,6 +2510,19 @@ function OpenCommandPaletteDialog(props: {
       readonly platform: string;
       readonly currentProjectCwd: string | null;
     }) => {
+      const environment = environments.find(
+        (candidate) => candidate.environmentId === input.environmentId,
+      );
+      if (!canCreateProjectInEnvironment(environment?.connection.phase)) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Environment unavailable",
+            description: `${environment?.label ?? "The selected environment"} is not connected.`,
+          }),
+        );
+        return;
+      }
       const rawCwd = input.rawCwd;
 
       if (isUnsupportedWindowsProjectPath(rawCwd.trim(), input.platform)) {
@@ -2635,6 +2673,16 @@ function OpenCommandPaletteDialog(props: {
 
   async function submitAddProjectCloneFlow(destinationPathInput?: string): Promise<void> {
     if (!addProjectCloneFlow) {
+      return;
+    }
+    if (!canCreateProjectInEnvironment(browseEnvironment?.connection.phase)) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Environment unavailable",
+          description: `${browseEnvironment?.label ?? "The selected environment"} is not connected.`,
+        }),
+      );
       return;
     }
 
@@ -2841,7 +2889,10 @@ function OpenCommandPaletteDialog(props: {
     getCommandPaletteInputPlaceholder(paletteMode);
   const isSubmenu = paletteMode === "submenu" || paletteMode === "submenu-browse";
   const hasHighlightedBrowseItem = highlightedItemValue?.startsWith("browse:") ?? false;
-  const canSubmitBrowsePath = isBrowsing && !relativePathNeedsActiveProject;
+  const canSubmitBrowsePath =
+    isBrowsing &&
+    !relativePathNeedsActiveProject &&
+    canCreateProjectInEnvironment(browseEnvironment?.connection.phase);
   const willCreateProjectPath =
     canSubmitBrowsePath &&
     !isBrowsePending &&
@@ -2868,6 +2919,7 @@ function OpenCommandPaletteDialog(props: {
   const canSubmitRemoteProjectFlow =
     addProjectCloneFlow?.step === "repository" &&
     query.trim().length > 0 &&
+    canCreateProjectInEnvironment(browseEnvironment?.connection.phase) &&
     !isRemoteProjectPending;
   const fileManagerName = getLocalFileManagerName(navigator.platform);
   const canOpenProjectFromFileManager =

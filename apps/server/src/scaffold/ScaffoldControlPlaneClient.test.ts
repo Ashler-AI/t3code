@@ -66,6 +66,49 @@ describe("ScaffoldControlPlaneClient", () => {
     ).toBeUndefined();
   });
 
+  it("renames through the authenticated collection route with a stable idempotency key", async () => {
+    let request: { readonly url: string; readonly init?: RequestInit } | undefined;
+    const client = makeScaffoldControlPlaneClient({
+      target: {
+        ...target,
+        authMode: "oauth",
+        collectionPath: "/api/code-sandboxes/agent-sessions",
+      },
+      fetch: async (input, init) => {
+        request = { url: String(input), ...(init ? { init } : {}) };
+        return json({
+          sandbox: {
+            id: "ses_1",
+            status: "ready",
+            lifecycleEpoch: 3,
+            name: "Fix Scaffold resume failures",
+          },
+        });
+      },
+    });
+
+    await expect(
+      client.renameSession({
+        sessionId: "ses_1",
+        operationId: "scaffold-title-sync:ses_1:thread_1",
+        name: "Fix Scaffold resume failures",
+      }),
+    ).resolves.toMatchObject({
+      sessionId: "ses_1",
+      name: "Fix Scaffold resume failures",
+    });
+    expect(request?.url).toBe(
+      "https://scaffold-staging.example.com/api/code-sandboxes/agent-sessions/ses_1/name",
+    );
+    expect(new Headers(request?.init?.headers).get("authorization")).toBe("Bearer server-only");
+    expect(new Headers(request?.init?.headers).get("idempotency-key")).toBe(
+      "scaffold-title-sync:ses_1:thread_1",
+    );
+    expect(JSON.parse(String(request?.init?.body))).toEqual({
+      name: "Fix Scaffold resume failures",
+    });
+  });
+
   it("creates agent_t3_omp sessions server-side and never places auth in the body", async () => {
     let request: { readonly url: string; readonly init?: RequestInit } | undefined;
     const client = makeScaffoldControlPlaneClient({
@@ -344,7 +387,6 @@ describe("ScaffoldControlPlaneClient", () => {
             environmentKind: "local",
             environmentId: "env_1",
             threadId: "thread_1",
-            actorId: "actor_1",
           },
         });
       },

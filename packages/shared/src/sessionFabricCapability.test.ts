@@ -271,13 +271,23 @@ describe("session fabric capabilities", () => {
       capabilityCanControlSession({
         claims: controller,
         sessionId: controller.fabricSessionId,
+        publication: snapshot.session.publication,
         location,
       }),
     ).toBe(true);
     expect(
       capabilityCanControlSession({
+        claims: viewer,
+        sessionId: controller.fabricSessionId,
+        publication: snapshot.session.publication,
+        location,
+      }),
+    ).toBe(false);
+    expect(
+      capabilityCanControlSession({
         claims: { ...controller, scaffoldLifecycleEpoch: 6 },
         sessionId: controller.fabricSessionId,
+        publication: snapshot.session.publication,
         location,
       }),
     ).toBe(false);
@@ -321,6 +331,7 @@ describe("session fabric capabilities", () => {
       capabilityCanControlSession({
         claims: controller,
         sessionId: controller.fabricSessionId,
+        publication: legacySnapshot.session.publication,
         location: legacySnapshot.session.location,
       }),
     ).toBe(false);
@@ -384,7 +395,7 @@ describe("session fabric capabilities", () => {
     ).toBe(false);
   });
 
-  it("does not let a local controller name a runner or cross an environment or thread", () => {
+  it("lets any authenticated controller command an exact public local session without naming its runner", () => {
     const controller = {
       ...base,
       role: "controller",
@@ -407,24 +418,32 @@ describe("session fabric capabilities", () => {
       capabilityCanControlSession({
         claims: controller,
         sessionId: controller.fabricSessionId,
+        publication: "public",
         location,
-        localAuthority: { actorId: "user-1" },
       }),
     ).toBe(true);
     expect(
       capabilityCanControlSession({
         claims: controller,
         sessionId: controller.fabricSessionId,
+        publication: "public",
         location: { ...location, threadId: ThreadId.make("thread-other") },
-        localAuthority: { actorId: "user-1" },
       }),
     ).toBe(false);
     expect(
       capabilityCanControlSession({
         claims: controller,
         sessionId: controller.fabricSessionId,
+        publication: "public",
         location: { ...location, environmentId: EnvironmentId.make("environment-other") },
-        localAuthority: { actorId: "user-1" },
+      }),
+    ).toBe(false);
+    expect(
+      capabilityCanControlSession({
+        claims: controller,
+        sessionId: controller.fabricSessionId,
+        publication: "local_only",
+        location,
       }),
     ).toBe(false);
     expect("runnerId" in controller).toBe(false);

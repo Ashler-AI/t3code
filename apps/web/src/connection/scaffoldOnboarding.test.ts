@@ -1,19 +1,25 @@
-import { EnvironmentRegistry, ConnectionBlockedError } from "@t3tools/client-runtime/connection";
-import { ScaffoldLifecycleGateway } from "@t3tools/client-runtime/scaffold";
+import { ConnectionBlockedError, EnvironmentRegistry } from "@t3tools/client-runtime/connection";
+import {
+  makeScaffoldLifecycleAction,
+  ScaffoldLifecycleGateway,
+} from "@t3tools/client-runtime/scaffold";
 import {
   EnvironmentId,
+  ProjectId,
   ScaffoldEnvironmentBinding,
   ScaffoldLifecycleError,
   ScaffoldPreparedConnection,
   ScaffoldSessionObservation,
   ScaffoldSessionLinks,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "@effect/vitest";
-import * as Deferred from "effect/Deferred";
+import { afterEach, describe, expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 
+import {
+  createMemoryScaffoldLifecycleActionStore,
+  drainScaffoldLifecycleActions,
+} from "./scaffoldLifecycleOutbox";
 import { registerScaffoldEnvironment } from "./scaffoldOnboarding";
 
 const input = {
@@ -71,90 +77,167 @@ function runWithLifecycleFailure(error: ScaffoldLifecycleError) {
 }
 
 describe("Scaffold onboarding", () => {
-  it.effect("does not report the binding until the registered environment is connected", () =>
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.effect("returns the binding as soon as its target is durably registered", () =>
     Effect.gen(function* () {
-      const connectionReady = yield* Deferred.make<void>();
-      const registrationObserved = yield* Deferred.make<void>();
+      let registerCalls = 0;
       const gateway = ScaffoldLifecycleGateway.of({
         create: () => Effect.succeed(preparedConnection()),
         prepare: () => Effect.die("not used"),
       });
       const registry = EnvironmentRegistry.of({
-        register: () => Deferred.succeed(registrationObserved, undefined),
-        state: () =>
-          Effect.succeed({
-            desired: true,
-            network: "online",
-            phase: "connecting",
-            stage: "synchronizing",
-            attempt: 0,
-            generation: 1,
-            lastFailure: null,
-            retryAt: null,
+        register: () =>
+          Effect.sync(() => {
+            registerCalls += 1;
           }),
-        stateChanges: () =>
-          Stream.fromEffect(
-            Deferred.await(connectionReady).pipe(
-              Effect.as({
-                desired: true,
-                network: "online" as const,
-                phase: "connected" as const,
-                stage: null,
-                attempt: 0,
-                generation: 1,
-                lastFailure: null,
-                retryAt: null,
-              }),
-            ),
-          ),
+        state: () => Effect.die("onboarding must not wait for supervisor state"),
+        stateChanges: () => Effect.die("onboarding must not follow supervisor state"),
       } as unknown as EnvironmentRegistry["Service"]);
 
-      const onboarding = yield* registerScaffoldEnvironment(input).pipe(
+      const result = yield* registerScaffoldEnvironment(input).pipe(
         Effect.provideService(ScaffoldLifecycleGateway, gateway),
         Effect.provideService(EnvironmentRegistry, registry),
-        Effect.forkChild,
       );
-      yield* Deferred.await(registrationObserved);
-      expect(onboarding.pollUnsafe()).toBeUndefined();
-
-      yield* Deferred.succeed(connectionReady, undefined);
-      const result = yield* Fiber.join(onboarding);
       expect(result.binding.environmentId).toBe("remote-environment");
+      expect(registerCalls).toBe(1);
     }),
   );
 
-  it.effect("surfaces a terminal registry failure instead of projecting the session ready", () =>
+  it.effect("leaves transport backoff and retry exclusively to the registered supervisor", () =>
     Effect.gen(function* () {
-      const connectionFailure = new ConnectionBlockedError({
-        reason: "authentication",
-        detail: "Scaffold attach authorization expired.",
+      let createCalls = 0;
+      let registerCalls = 0;
+      const gateway = ScaffoldLifecycleGateway.of({
+        create: () =>
+          Effect.sync(() => {
+            createCalls += 1;
+            return preparedConnection();
+          }),
+        prepare: () => Effect.die("not used"),
       });
+      const registry = EnvironmentRegistry.of({
+        register: () =>
+          Effect.sync(() => {
+            registerCalls += 1;
+          }),
+        state: () => Effect.die("onboarding must not inspect supervisor backoff"),
+        stateChanges: () => Effect.die("onboarding must not own supervisor retry"),
+      } as unknown as EnvironmentRegistry["Service"]);
+
+      const result = yield* registerScaffoldEnvironment(input).pipe(
+        Effect.provideService(ScaffoldLifecycleGateway, gateway),
+        Effect.provideService(EnvironmentRegistry, registry),
+      );
+
+      expect(result.target.environmentId).toBe("remote-environment");
+      expect(createCalls).toBe(1);
+      expect(registerCalls).toBe(1);
+    }),
+  );
+
+  it("completes one durable create at registration even when readiness exceeds the old timeout", async () => {
+    vi.useFakeTimers();
+    let createCalls = 0;
+    let registerCalls = 0;
+    const action = makeScaffoldLifecycleAction({
+      actionId: input.operationId,
+      kind: "create",
+      deployment: input.deployment,
+      draftId: "draft-1",
+      sourceEnvironmentId: EnvironmentId.make("source-environment"),
+      sourceProjectId: ProjectId.make("source-project"),
+      environmentId: EnvironmentId.make("scaffold-pending:draft-1"),
+      connectionId: "connection-1",
+      sessionId: input.sessionId,
+      expectedLifecycleEpoch: 0,
+      createdAt: "2026-07-27T00:00:00.000Z",
+    });
+    const store = createMemoryScaffoldLifecycleActionStore([action]);
+    const gateway = ScaffoldLifecycleGateway.of({
+      create: () =>
+        Effect.sync(() => {
+          createCalls += 1;
+          return preparedConnection();
+        }),
+      prepare: () => Effect.die("not used"),
+    });
+    const registry = EnvironmentRegistry.of({
+      register: () =>
+        Effect.sync(() => {
+          registerCalls += 1;
+        }),
+      state: () =>
+        Effect.succeed({
+          desired: true,
+          network: "online",
+          phase: "backoff",
+          stage: null,
+          attempt: 1,
+          generation: 1,
+          lastFailure: null,
+          retryAt: Date.now() + 91_000,
+        }),
+      stateChanges: () =>
+        Stream.fromEffect(
+          Effect.sleep("91 seconds").pipe(
+            Effect.as({
+              desired: true,
+              network: "online" as const,
+              phase: "connected" as const,
+              stage: null,
+              attempt: 0,
+              generation: 1,
+              lastFailure: null,
+              retryAt: null,
+            }),
+          ),
+        ),
+    } as unknown as EnvironmentRegistry["Service"]);
+    const execute = () =>
+      // This boundary deliberately adapts the Effect onboarding operation to
+      // the Promise-based lifecycle outbox contract exercised by this test.
+      // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests
+      Effect.runPromise(
+        registerScaffoldEnvironment(input).pipe(
+          Effect.provideService(ScaffoldLifecycleGateway, gateway),
+          Effect.provideService(EnvironmentRegistry, registry),
+          Effect.match({
+            onFailure: () =>
+              ({ _tag: "wait", retryAfterMs: 1_000, errorCode: "transport" }) as const,
+            onSuccess: () => ({ _tag: "acknowledged" }) as const,
+          }),
+        ),
+      );
+
+    const firstDrain = drainScaffoldLifecycleActions({ store, execute });
+    await vi.advanceTimersByTimeAsync(91_000);
+    await firstDrain;
+    await drainScaffoldLifecycleActions({ store, execute });
+
+    expect(createCalls).toBe(1);
+    expect(registerCalls).toBe(1);
+    await expect(store.list()).resolves.toEqual([]);
+  });
+
+  it.effect("does not turn a supervisor block into a second create failure", () =>
+    Effect.gen(function* () {
       const gateway = ScaffoldLifecycleGateway.of({
         create: () => Effect.succeed(preparedConnection()),
         prepare: () => Effect.die("not used"),
       });
       const registry = EnvironmentRegistry.of({
         register: () => Effect.void,
-        state: () =>
-          Effect.succeed({
-            desired: true,
-            network: "online",
-            phase: "blocked",
-            stage: null,
-            attempt: 1,
-            generation: 1,
-            lastFailure: connectionFailure,
-            retryAt: null,
-          }),
+        state: () => Effect.die("blocked transport is projected by the supervisor"),
       } as unknown as EnvironmentRegistry["Service"]);
 
-      const failure = yield* Effect.flip(
-        registerScaffoldEnvironment(input).pipe(
-          Effect.provideService(ScaffoldLifecycleGateway, gateway),
-          Effect.provideService(EnvironmentRegistry, registry),
-        ),
+      const result = yield* registerScaffoldEnvironment(input).pipe(
+        Effect.provideService(ScaffoldLifecycleGateway, gateway),
+        Effect.provideService(EnvironmentRegistry, registry),
       );
-      expect(failure).toBe(connectionFailure);
+      expect(result.binding.sessionId).toBe("session-1");
     }),
   );
 

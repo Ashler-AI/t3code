@@ -25,6 +25,7 @@ import {
   isBranchMismatchDismissedForSession,
   reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
+  resolveFailedScaffoldDraftRetryMode,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   startNewThreadForProject,
@@ -130,6 +131,30 @@ describe("buildLoadingThreadFromShell", () => {
       activities: [],
       checkpoints: [],
     });
+  });
+});
+
+describe("resolveFailedScaffoldDraftRetryMode", () => {
+  it("reconnects an existing registered Scaffold environment instead of replaying creation", () => {
+    expect(
+      resolveFailedScaffoldDraftRetryMode({
+        phase: "failed",
+        environmentId: EnvironmentId.make("environment-scaffold"),
+      }),
+    ).toBe("reconnect");
+  });
+
+  it("replays creation only while the failed draft is still unbound", () => {
+    expect(resolveFailedScaffoldDraftRetryMode({ phase: "failed", environmentId: null })).toBe(
+      "recreate",
+    );
+    expect(
+      resolveFailedScaffoldDraftRetryMode({
+        phase: "failed",
+        terminal: true,
+        environmentId: EnvironmentId.make("environment-stopped"),
+      }),
+    ).toBe("none");
   });
 });
 

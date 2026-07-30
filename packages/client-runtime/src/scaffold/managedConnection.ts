@@ -40,6 +40,7 @@ export function scaffoldTargetFromBinding(
     deployment: binding.deployment,
     sessionId: binding.sessionId,
     lifecycleEpoch: binding.lifecycleEpoch,
+    links: binding.links,
   });
 }
 

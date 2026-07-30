@@ -45,7 +45,7 @@ describe("persistent sidebar New session control", () => {
       /value: "action:new-session",[\s\S]{0,400}disabled: projects\.length === 0/,
     );
     expect(source).toMatch(
-      /value: "action:new-session:local",[\s\S]{0,400}disabled: projects\.length === 0/,
+      /value: "action:new-session:local",[\s\S]{0,400}disabled: scaffoldSourceProject === null/,
     );
   });
 
@@ -53,11 +53,9 @@ describe("persistent sidebar New session control", () => {
     const source = componentSources["CommandPalette.tsx"];
 
     expect(source).toMatch(
-      /const newLocalSessionProjectItems = useMemo\([\s\S]*?handleNewThread\([\s\S]*?forceNew: true,[\s\S]*?\);/,
+      /kind: "action",[\s\S]*?value: "action:new-session:local",[\s\S]*?run: async \(\) => \{[\s\S]*?handleNewThread\([\s\S]*?scopeProjectRef\(scaffoldSourceProject\.environmentId, scaffoldSourceProject\.id\)[\s\S]*?forceNew: true/,
     );
-    expect(source).toMatch(
-      /value: "action:new-session:local",[\s\S]*?items: newLocalSessionProjectItems/,
-    );
+    expect(source).not.toContain("const newLocalSessionProjectItems");
     expect(source).toMatch(
       /const projectThreadItems = useMemo\([\s\S]*?handleNewThread\(scopeProjectRef\(project\.environmentId, project\.id\)\);/,
     );

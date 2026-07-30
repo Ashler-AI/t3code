@@ -45,6 +45,7 @@ describe("RPC authorization scopes", () => {
       WS_METHODS.ompAccountsCancelLogin,
       WS_METHODS.ompAccountsRemove,
       WS_METHODS.scaffoldPause,
+      WS_METHODS.scaffoldRename,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
     }

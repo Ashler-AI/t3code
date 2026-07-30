@@ -2,6 +2,7 @@ import {
   EnvironmentId,
   NonNegativeInt,
   ScaffoldDeployment,
+  ScaffoldSessionLinks,
   SessionFabricClientId,
   SessionFabricSessionId,
 } from "@t3tools/contracts";
@@ -63,6 +64,7 @@ export class ScaffoldConnectionTarget extends Schema.TaggedClass<ScaffoldConnect
     deployment: ScaffoldDeployment,
     sessionId: Schema.String,
     lifecycleEpoch: NonNegativeInt,
+    links: Schema.optionalKey(ScaffoldSessionLinks),
   },
 ) {}
 

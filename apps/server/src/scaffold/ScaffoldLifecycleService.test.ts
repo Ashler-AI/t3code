@@ -3,6 +3,7 @@ import {
   ScaffoldCreateAndPrepareInput,
   ScaffoldObserveInput,
   ScaffoldPauseInput,
+  ScaffoldRenameInput,
   ScaffoldResumeAndPrepareInput,
   ScaffoldSessionObservation,
   SessionFabricSessionId,
@@ -17,8 +18,17 @@ import { makeScaffoldLifecycleService } from "./ScaffoldLifecycleService.ts";
 const ENVIRONMENT_ID = EnvironmentId.make("env_scaffold_1");
 const GLOBAL_SESSION_ID = SessionFabricSessionId.make("session_global_scaffold_1");
 const THREAD_ID = ThreadId.make("thread_scaffold_1");
-const observation = (status: "starting" | "ready" | "paused" | "stopped" | "failed", epoch = 1) =>
-  new ScaffoldSessionObservation({ sessionId: "ses_1", status, lifecycleEpoch: epoch });
+const observation = (
+  status: "starting" | "ready" | "paused" | "stopped" | "failed",
+  epoch = 1,
+  name?: string,
+) =>
+  new ScaffoldSessionObservation({
+    sessionId: "ses_1",
+    status,
+    lifecycleEpoch: epoch,
+    ...(name ? { name } : {}),
+  });
 
 const executionIdentity = (binding: {
   readonly environmentId: typeof ENVIRONMENT_ID;
@@ -41,6 +51,7 @@ function fakeClient(
     getSession: async () => observation("ready"),
     resumeSession: async () => observation("ready"),
     pauseSession: async () => observation("paused", 2),
+    renameSession: async (input) => observation("ready", 1, input.name),
     issueT3Transport: async () => ({
       environmentId: ENVIRONMENT_ID,
       pairingId: "pairing_1",
@@ -67,6 +78,63 @@ function fakeClient(
 }
 
 describe("ScaffoldLifecycleService", () => {
+  it("renames only the create-time fallback and coalesces concurrent requests", async () => {
+    let releaseRename!: () => void;
+    const getSession = vi.fn(async () => observation("ready", 1, "ashler-platform"));
+    const renameSession = vi.fn(
+      (input: { readonly name: string }) =>
+        new Promise<ScaffoldSessionObservation>((resolve) => {
+          releaseRename = () => resolve(observation("ready", 1, input.name));
+        }),
+    );
+    const service = makeScaffoldLifecycleService({
+      client: () => fakeClient({ getSession, renameSession }),
+    });
+    const input = new ScaffoldRenameInput({
+      deployment: "staging",
+      operationId: "scaffold-title-sync:ses_1:thread_1",
+      environmentId: ENVIRONMENT_ID,
+      sessionId: "ses_1",
+      expectedCurrentName: "ashler-platform",
+      name: "Fix Scaffold resume failures",
+    });
+
+    const first = service.rename(input);
+    const second = service.rename(input);
+    await Promise.resolve();
+    expect(getSession).toHaveBeenCalledOnce();
+    expect(renameSession).toHaveBeenCalledOnce();
+    releaseRename();
+    await expect(first).resolves.toMatchObject({ name: "Fix Scaffold resume failures" });
+    await expect(second).resolves.toMatchObject({ name: "Fix Scaffold resume failures" });
+  });
+
+  it("preserves a manual Scaffold session name", async () => {
+    const current = observation("ready", 1, "My manual sandbox name");
+    const renameSession = vi.fn(async () => observation("ready", 1, "generated"));
+    const service = makeScaffoldLifecycleService({
+      client: () =>
+        fakeClient({
+          getSession: async () => current,
+          renameSession,
+        }),
+    });
+
+    await expect(
+      service.rename(
+        new ScaffoldRenameInput({
+          deployment: "staging",
+          operationId: "scaffold-title-sync:ses_1:thread_1",
+          environmentId: ENVIRONMENT_ID,
+          sessionId: "ses_1",
+          expectedCurrentName: "ashler-platform",
+          name: "Fix Scaffold resume failures",
+        }),
+      ),
+    ).resolves.toBe(current);
+    expect(renameSession).not.toHaveBeenCalled();
+  });
+
   it("observes a session with one read and no lifecycle or transport mutation", async () => {
     const current = observation("stopped", 4);
     const getSession = vi.fn(async () => current);
@@ -382,6 +450,79 @@ describe("ScaffoldLifecycleService", () => {
     ).resolves.toMatchObject({ binding: { lifecycleEpoch: 2, status: "ready" } });
   });
 
+  it("retries a stale saved resume once at the authoritative paused epoch", async () => {
+    const conflict = new ScaffoldLifecycleError({
+      reason: "conflict",
+      message: "changed",
+      status: 409,
+      code: "sandbox_lifecycle_changed",
+    });
+    const resumeSession = vi
+      .fn<ScaffoldControlPlaneClient["resumeSession"]>()
+      .mockRejectedValueOnce(conflict)
+      .mockResolvedValueOnce(observation("ready", 5));
+    const getSession = vi.fn(async () => observation("paused", 4));
+    const service = makeScaffoldLifecycleService({
+      client: () => fakeClient({ resumeSession, getSession }),
+    });
+
+    await expect(
+      service.prepare(
+        new ScaffoldResumeAndPrepareInput({
+          deployment: "staging",
+          operationId: "op_stale_resume",
+          environmentId: ENVIRONMENT_ID,
+          sessionId: "ses_1",
+          expectedLifecycleEpoch: 2,
+        }),
+      ),
+    ).resolves.toMatchObject({ binding: { lifecycleEpoch: 5, status: "ready" } });
+    expect(resumeSession).toHaveBeenCalledTimes(2);
+    expect(resumeSession).toHaveBeenNthCalledWith(1, {
+      sessionId: "ses_1",
+      operationId: "op_stale_resume",
+      lifecycleEpoch: 2,
+    });
+    expect(resumeSession).toHaveBeenNthCalledWith(2, {
+      sessionId: "ses_1",
+      operationId: "op_stale_resume",
+      lifecycleEpoch: 4,
+    });
+  });
+
+  it("does not retry an unrelated resume conflict at the same paused epoch", async () => {
+    const conflict = new ScaffoldLifecycleError({
+      reason: "conflict",
+      message: "changed",
+      status: 409,
+      code: "sandbox_lifecycle_changed",
+    });
+    const resumeSession = vi.fn(async () => Promise.reject(conflict));
+    const service = makeScaffoldLifecycleService({
+      client: () =>
+        fakeClient({
+          resumeSession,
+          getSession: async () => observation("paused", 2),
+        }),
+    });
+
+    await expect(
+      service.prepare(
+        new ScaffoldResumeAndPrepareInput({
+          deployment: "staging",
+          operationId: "op_unrelated_resume_conflict",
+          environmentId: ENVIRONMENT_ID,
+          sessionId: "ses_1",
+          expectedLifecycleEpoch: 2,
+        }),
+      ),
+    ).rejects.toMatchObject({
+      status: 409,
+      observation: { status: "paused", lifecycleEpoch: 2 },
+    });
+    expect(resumeSession).toHaveBeenCalledOnce();
+  });
+
   it.each(["stopped", "failed"] as const)(
     "reports the current %s observation when a resume conflicts with an external stop",
     async (status) => {
@@ -605,5 +746,82 @@ describe("ScaffoldLifecycleService", () => {
         }),
       ),
     ).resolves.toMatchObject({ environmentId: ENVIRONMENT_ID, status: "paused" });
+  });
+
+  it("retries settlement pause once at the authoritative ready epoch", async () => {
+    const conflict = new ScaffoldLifecycleError({
+      reason: "conflict",
+      message: "changed",
+      status: 409,
+      code: "sandbox_lifecycle_changed",
+    });
+    const pauseSession = vi
+      .fn<ScaffoldControlPlaneClient["pauseSession"]>()
+      .mockRejectedValueOnce(conflict)
+      .mockResolvedValueOnce(observation("paused", 6));
+    const getSession = vi.fn(async () => observation("ready", 5));
+    const service = makeScaffoldLifecycleService({
+      client: () => fakeClient({ pauseSession, getSession }),
+    });
+
+    await expect(
+      service.pause(
+        new ScaffoldPauseInput({
+          deployment: "staging",
+          operationId: "op_stale_pause",
+          environmentId: ENVIRONMENT_ID,
+          sessionId: "ses_1",
+          expectedLifecycleEpoch: 3,
+        }),
+      ),
+    ).resolves.toMatchObject({
+      environmentId: ENVIRONMENT_ID,
+      status: "paused",
+      lifecycleEpoch: 6,
+    });
+    expect(pauseSession).toHaveBeenCalledTimes(2);
+    expect(pauseSession).toHaveBeenNthCalledWith(1, {
+      sessionId: "ses_1",
+      operationId: "op_stale_pause",
+      lifecycleEpoch: 3,
+    });
+    expect(pauseSession).toHaveBeenNthCalledWith(2, {
+      sessionId: "ses_1",
+      operationId: "op_stale_pause",
+      lifecycleEpoch: 5,
+    });
+  });
+
+  it("preserves the refreshed observation when a pause 409 did not converge", async () => {
+    const conflict = new ScaffoldLifecycleError({
+      reason: "conflict",
+      message: "changed",
+      status: 409,
+      code: "sandbox_lifecycle_changed",
+    });
+    const service = makeScaffoldLifecycleService({
+      client: () =>
+        fakeClient({
+          pauseSession: async () => Promise.reject(conflict),
+          getSession: async () => observation("ready", 4),
+        }),
+    });
+
+    await expect(
+      service.pause(
+        new ScaffoldPauseInput({
+          deployment: "staging",
+          operationId: "op_pause_superseded",
+          environmentId: ENVIRONMENT_ID,
+          sessionId: "ses_1",
+          expectedLifecycleEpoch: 2,
+        }),
+      ),
+    ).rejects.toMatchObject({
+      reason: "conflict",
+      status: 409,
+      code: "sandbox_lifecycle_changed",
+      observation: { sessionId: "ses_1", status: "ready", lifecycleEpoch: 4 },
+    });
   });
 });

@@ -20,6 +20,7 @@ import {
   ConnectionTransientError,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
+  ScaffoldConnectionTarget,
   type ConnectionAttemptError,
   type ConnectionTarget,
   type NetworkStatus,
@@ -42,6 +43,14 @@ const RELAY_TARGET = new RelayConnectionTarget({
   label: TARGET.label,
 });
 
+const SCAFFOLD_TARGET = new ScaffoldConnectionTarget({
+  environmentId: EnvironmentId.make("scaffold-environment-1"),
+  label: "Scaffold sandbox",
+  deployment: "staging",
+  sessionId: "ses_scaffold_1",
+  lifecycleEpoch: 0,
+});
+
 const TARGET_ENTRY: ConnectionCatalogEntry = {
   target: TARGET,
   profile: Option.none(),
@@ -49,6 +58,11 @@ const TARGET_ENTRY: ConnectionCatalogEntry = {
 
 const RELAY_ENTRY: ConnectionCatalogEntry = {
   target: RELAY_TARGET,
+  profile: Option.none(),
+};
+
+const SCAFFOLD_ENTRY: ConnectionCatalogEntry = {
+  target: SCAFFOLD_TARGET,
   profile: Option.none(),
 };
 
@@ -436,7 +450,7 @@ describe("EnvironmentSupervisor", () => {
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
-  it.effect("interrupts and releases a connection attempt when setup times out", () =>
+  it.effect("interrupts and releases an ordinary connection attempt after fifteen seconds", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         prepare: () => Effect.never,
@@ -462,6 +476,30 @@ describe("EnvironmentSupervisor", () => {
           message: "Test environment did not respond during connection setup.",
         },
       });
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("allows managed Scaffold preparation to finish after fifteen seconds", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: () => Effect.sleep("20 seconds").pipe(Effect.as(PREPARED_CONNECTION)),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(SCAFFOLD_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* awaitState(
+        supervisor.state,
+        (state) => state.phase === "connecting" && state.stage === "preparing",
+      );
+      yield* TestClock.adjust("15 seconds");
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("connecting");
+
+      yield* TestClock.adjust("5 seconds");
+      yield* eventuallyState(supervisor.state, (state) => state.phase === "connected");
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 

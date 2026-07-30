@@ -792,15 +792,23 @@ const makeWsRpcLayer = (
             CommandId.make(`${command.commandId}:bootstrap:${phase}`);
           const bootstrapEventId = (phase: string) =>
             EventId.make(`${command.commandId}:bootstrap:${phase}`);
-          const existingThread = Option.getOrUndefined(
-            yield* projectionSnapshotQuery
-              .getThreadShellById(command.threadId)
-              .pipe(
-                Effect.mapError((cause) =>
-                  toDispatchCommandError(cause, "Failed to reconcile bootstrap thread state."),
-                ),
+          const existingThreadEffect: Effect.Effect<
+            Option.Option<{
+              readonly projectId: ProjectId;
+              readonly branch: string | null;
+              readonly worktreePath: string | null;
+            }>,
+            OrchestrationDispatchCommandError
+          > = orchestrationEngine.getAuthoritativeThreadById?.(command.threadId) ??
+          projectionSnapshotQuery
+            .getThreadShellById(command.threadId)
+            .pipe(
+              Effect.mapError((cause) =>
+                toDispatchCommandError(cause, "Failed to reconcile bootstrap thread state."),
               ),
-          );
+            );
+          const existingThreadOption = yield* existingThreadEffect;
+          const existingThread = Option.getOrUndefined(existingThreadOption);
           if (
             existingThread &&
             bootstrap?.createThread &&
@@ -1716,6 +1724,12 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.scaffoldPause,
             scaffoldRequest(() => scaffoldLifecycle.pause(input)),
+            { "rpc.aggregate": "scaffold" },
+          ),
+        [WS_METHODS.scaffoldRename]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.scaffoldRename,
+            scaffoldRequest(() => scaffoldLifecycle.rename(input)),
             { "rpc.aggregate": "scaffold" },
           ),
         [WS_METHODS.sourceControlLookupRepository]: (input) =>

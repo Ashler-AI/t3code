@@ -194,6 +194,7 @@ export class ScaffoldSessionObservation extends Schema.Class<ScaffoldSessionObse
   sessionId: TrimmedNonEmptyString,
   status: ScaffoldSessionStatus,
   lifecycleEpoch: NonNegativeInt,
+  name: Schema.optionalKey(TrimmedNonEmptyString),
   updatedAt: Schema.optionalKey(TrimmedNonEmptyString),
 }) {}
 
@@ -269,6 +270,15 @@ export class ScaffoldPauseInput extends Schema.Class<ScaffoldPauseInput>("Scaffo
   environmentId: EnvironmentId,
   sessionId: TrimmedNonEmptyString,
   expectedLifecycleEpoch: NonNegativeInt,
+}) {}
+
+export class ScaffoldRenameInput extends Schema.Class<ScaffoldRenameInput>("ScaffoldRenameInput")({
+  deployment: ScaffoldDeployment,
+  operationId: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  sessionId: TrimmedNonEmptyString,
+  expectedCurrentName: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
 }) {}
 
 /**

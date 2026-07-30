@@ -8,6 +8,18 @@ const publicConfigDefine = {
   __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
     repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
   ),
+  __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__: JSON.stringify(
+    repoEnv.T3CODE_SESSION_FABRIC_RELAY_URL?.trim() ?? "",
+  ),
+  __T3CODE_BUILD_SCAFFOLD_STAGING_URL__: JSON.stringify(
+    repoEnv.T3CODE_SCAFFOLD_STAGING_URL?.trim() ?? "",
+  ),
+  __T3CODE_BUILD_SCAFFOLD_PRODUCTION_URL__: JSON.stringify(
+    repoEnv.T3CODE_SCAFFOLD_PRODUCTION_URL?.trim() ?? "",
+  ),
+  __T3CODE_BUILD_SCAFFOLD_DEFAULT_DEPLOYMENT__: JSON.stringify(
+    repoEnv.T3CODE_SCAFFOLD_DEFAULT_DEPLOYMENT?.trim() ?? "",
+  ),
 };
 
 export default defineConfig({

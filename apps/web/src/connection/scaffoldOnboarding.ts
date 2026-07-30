@@ -1,9 +1,7 @@
 import {
   ConnectionBlockedError,
-  ConnectionTransientError,
   EnvironmentRegistry,
   ScaffoldConnectionRegistration,
-  type SupervisorConnectionState,
 } from "@t3tools/client-runtime/connection";
 import {
   ScaffoldLifecycleGateway,
@@ -15,53 +13,14 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import {
   ScaffoldCreateAndPrepareInput,
-  type EnvironmentId,
   type ScaffoldCreateParameters,
   type ScaffoldDeployment,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
-import * as Stream from "effect/Stream";
 
 import { connectionAtomRuntime } from "./runtime";
 
 const scheduler = createAtomCommandScheduler();
-const SCAFFOLD_CONNECTION_READY_TIMEOUT = "90 seconds";
-
-export const awaitScaffoldEnvironmentConnected = Effect.fn(
-  "web.scaffold.awaitEnvironmentConnected",
-)(function* (registry: EnvironmentRegistry["Service"], environmentId: EnvironmentId) {
-  const isTerminal = (state: SupervisorConnectionState) =>
-    state.phase === "connected" ||
-    ((state.phase === "blocked" || state.phase === "backoff" || state.phase === "offline") &&
-      state.lastFailure !== null);
-  const current = yield* registry.state(environmentId);
-  const terminal = isTerminal(current)
-    ? current
-    : yield* registry.stateChanges(environmentId).pipe(
-        Stream.filter(isTerminal),
-        Stream.runHead,
-        Effect.map(Option.getOrThrow),
-        Effect.timeoutOrElse({
-          duration: SCAFFOLD_CONNECTION_READY_TIMEOUT,
-          orElse: () =>
-            Effect.fail(
-              new ConnectionTransientError({
-                reason: "timeout",
-                detail: "Scaffold connected, but the agent environment did not become ready.",
-              }),
-            ),
-        }),
-      );
-  if (terminal.phase === "connected") return;
-  return yield* (
-    terminal.lastFailure ??
-      new ConnectionTransientError({
-        reason: "transport",
-        detail: "Scaffold connected, but the agent environment is unavailable.",
-      })
-  );
-});
 
 export const registerScaffoldEnvironment = Effect.fn("web.scaffold.registerEnvironment")(
   function* (input: {
@@ -92,7 +51,10 @@ export const registerScaffoldEnvironment = Effect.fn("web.scaffold.registerEnvir
       input.label?.trim() || "Scaffold sandbox",
     );
     yield* registry.register(new ScaffoldConnectionRegistration({ target }));
-    yield* awaitScaffoldEnvironmentConnected(registry, target.environmentId);
+    // Registration is the durable completion boundary for creation. The
+    // environment supervisor owns transport preparation, retry, and blocking
+    // after this point; waiting here would give the create outbox a second,
+    // competing retry loop for an already-created sandbox.
     return { target, binding: prepared.binding };
   },
 );

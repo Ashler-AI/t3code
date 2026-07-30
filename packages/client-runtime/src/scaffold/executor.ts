@@ -1,7 +1,11 @@
 import { ScaffoldControlPlaneError, type ScaffoldControlPlaneClient } from "./client.ts";
 import type { ScaffoldLifecycleAction } from "./model.ts";
 import type { ScaffoldOutboxExecutionResult } from "./outbox.ts";
-import { reconcileScaffoldLifecycle, type ReconcileScaffoldLifecycleInput } from "./reconcile.ts";
+import {
+  reconcileScaffoldLifecycle,
+  scaffoldOutboxResultFromReconciliation,
+  type ReconcileScaffoldLifecycleInput,
+} from "./reconcile.ts";
 
 export interface ExecuteScaffoldLifecycleActionInput {
   readonly client: ScaffoldControlPlaneClient;
@@ -16,41 +20,6 @@ function isAmbiguousFailure(error: ScaffoldControlPlaneError): boolean {
     error.status === 429 ||
     error.status >= 500
   );
-}
-
-function resultFromReconciliation(
-  reconciliation: ReturnType<typeof reconcileScaffoldLifecycle>,
-  fallbackErrorCode: string,
-): ScaffoldOutboxExecutionResult {
-  switch (reconciliation._tag) {
-    case "converged":
-    case "superseded":
-      return { _tag: "acknowledged" };
-    case "wait":
-      return {
-        _tag: "wait",
-        retryAfterMs: reconciliation.retryAfterMs,
-        errorCode: `session_${reconciliation.observation.status}`,
-        observation: {
-          sessionId: reconciliation.observation.sessionId,
-          lifecycleEpoch: reconciliation.observation.lifecycleEpoch,
-        },
-      };
-    case "stale":
-      return {
-        _tag: "retry",
-        retryAfterMs: reconciliation.retryAfterMs,
-        errorCode: "stale_lifecycle_epoch",
-      };
-    case "retry":
-      return {
-        _tag: "retry",
-        retryAfterMs: reconciliation.retryAfterMs,
-        errorCode: fallbackErrorCode,
-      };
-    case "blocked":
-      return { _tag: "blocked", errorCode: reconciliation.reason };
-  }
 }
 
 /**
@@ -135,5 +104,8 @@ export async function executeScaffoldLifecycleAction(
       : {}),
   });
 
-  return resultFromReconciliation(reconciliation, effectiveError?.code ?? "scaffold_not_converged");
+  return scaffoldOutboxResultFromReconciliation(
+    reconciliation,
+    effectiveError?.code ?? "scaffold_not_converged",
+  );
 }

@@ -3,8 +3,27 @@ import {
   SessionFabricConnectionRegistration,
   SessionFabricConnectionTarget,
 } from "@t3tools/client-runtime/connection";
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 
 const SESSION_FABRIC_ENVIRONMENT_PREFIX = "session-fabric:";
+const LOOPBACK_HTTP_RELAY_PREFIX =
+  /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]+)?(?:\/+|$)/u;
+export const SESSION_FABRIC_ROUTE_CHANGED_EVENT = "t3code:session-fabric-route-changed";
+
+export function subscribeSessionFabricRouteChanges(input: {
+  readonly eventTarget: EventTarget;
+  readonly onChange: () => void;
+}): () => void {
+  input.eventTarget.addEventListener(SESSION_FABRIC_ROUTE_CHANGED_EVENT, input.onChange);
+  return () =>
+    input.eventTarget.removeEventListener(SESSION_FABRIC_ROUTE_CHANGED_EVENT, input.onChange);
+}
+
+export function notifySessionFabricRouteChanged(
+  eventTarget: Pick<EventTarget, "dispatchEvent">,
+): void {
+  eventTarget.dispatchEvent(new Event(SESSION_FABRIC_ROUTE_CHANGED_EVENT));
+}
 
 export function sessionFabricRoutePath(input: {
   readonly sessionId: string;
@@ -52,10 +71,24 @@ export function configuredSessionFabricRelayUrl(value: string | undefined): stri
   const configured = value?.trim();
   if (!configured) return null;
 
+  const secureOrigin = normalizeSecureRelayUrl(configured);
+  if (secureOrigin !== null) return secureOrigin;
+
   try {
     const url = new URL(configured);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-    return url.toString();
+    if (
+      !LOOPBACK_HTTP_RELAY_PREFIX.test(configured) ||
+      url.protocol !== "http:" ||
+      !new Set(["localhost", "127.0.0.1", "[::1]"]).has(url.hostname) ||
+      url.username.length > 0 ||
+      url.password.length > 0 ||
+      url.search.length > 0 ||
+      url.hash.length > 0 ||
+      !/^\/+$/u.test(url.pathname)
+    ) {
+      return null;
+    }
+    return url.origin;
   } catch {
     return null;
   }
@@ -96,4 +129,13 @@ export function isConfiguredSessionFabricRoute(input: {
     input.relayBaseUrl !== null &&
     sessionFabricSessionIdFromPathname(input.pathname, input.runtimeBasePath ?? "") !== null
   );
+}
+
+export function shouldAwaitSessionFabricRouteRegistration(input: {
+  readonly pathname: string;
+  readonly runtimeBasePath?: string;
+  readonly relayBaseUrl: string | null;
+  readonly routeEnvironmentRegistered: boolean;
+}): boolean {
+  return !input.routeEnvironmentRegistered && isConfiguredSessionFabricRoute(input);
 }

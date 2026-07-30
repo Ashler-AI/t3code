@@ -7,7 +7,6 @@ import {
   authorizeSessionFabricCapability,
   capabilityCanListDirectory,
   capabilityCanReadSession,
-  isLoopbackSessionFabricRequestUrl,
   makeSessionFabricCapabilityVerifierConfig,
   websocketCapability,
 } from "@t3tools/shared/sessionFabricCapability";
@@ -21,6 +20,11 @@ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 
 import SessionDirectory from "../../relay/src/sessionFabric/SessionDirectory.ts";
 import SessionStreamCoordinator from "../../relay/src/sessionFabric/SessionStreamCoordinator.ts";
+import {
+  resolveSessionFabricCorsOrigin,
+  sessionFabricCorsHeaders,
+  sessionFabricCorsPreflight,
+} from "./cors.ts";
 import { resolveSessionFabricRoute } from "./route.ts";
 
 const parseAllowedOrigins = (value: string | undefined): ReadonlySet<string> =>
@@ -70,32 +74,6 @@ export const finalizeSessionFabricSessionResponse = <Response>(input: {
   readonly withCors: (response: Response) => Response;
 }): Response =>
   input.upgrade?.toLowerCase() === "websocket" ? input.response : input.withCors(input.response);
-
-export const resolveSessionFabricCorsOrigin = (input: {
-  readonly requestUrl: string;
-  readonly origin: string | undefined;
-  readonly authDisabled: boolean;
-  readonly allowedOrigins: ReadonlySet<string>;
-}): string | null => {
-  const origin = input.origin?.replace(/\/+$/gu, "");
-  if (origin === undefined) return null;
-  if (input.authDisabled) {
-    if (
-      !isLoopbackSessionFabricRequestUrl(
-        normalizeSessionFabricAuthorizationRequestUrl(input.requestUrl),
-      )
-    ) {
-      return null;
-    }
-    try {
-      const url = new URL(origin);
-      return url.hostname === "localhost" || url.hostname === "127.0.0.1" ? origin : null;
-    } catch {
-      return null;
-    }
-  }
-  return input.allowedOrigins.has(origin) ? origin : null;
-};
 
 export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi>()(
   "SessionFabricApi",
@@ -163,30 +141,14 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
       const origin = corsOrigin(request);
       return origin === null
         ? response
-        : HttpServerResponse.setHeaders(response, {
-            "access-control-allow-origin": origin,
-            "access-control-expose-headers": "content-type",
-            vary: "origin",
-          });
+        : HttpServerResponse.setHeaders(response, sessionFabricCorsHeaders(origin, "request"));
     };
 
     return {
       fetch: Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
         if (request.method === "OPTIONS") {
-          const origin = corsOrigin(request);
-          return origin === null
-            ? HttpServerResponse.empty({ status: 403 })
-            : HttpServerResponse.empty({
-                status: 204,
-                headers: {
-                  "access-control-allow-origin": origin,
-                  "access-control-allow-methods": "GET,POST,OPTIONS",
-                  "access-control-allow-headers": "authorization,content-type",
-                  "access-control-max-age": "86400",
-                  vary: "origin",
-                },
-              });
+          return HttpServerResponse.empty(sessionFabricCorsPreflight(corsOrigin(request)));
         }
 
         const resolvedAuthorization = resolveSessionFabricRequestAuthorization({
