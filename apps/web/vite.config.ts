@@ -42,6 +42,10 @@ const configuredRelayTracingUrl = repoEnv.VITE_RELAY_OTLP_TRACES_URL?.trim() || 
 const configuredRelayTracingDataset = repoEnv.VITE_RELAY_OTLP_TRACES_DATASET?.trim() || "";
 const configuredRelayTracingToken = repoEnv.VITE_RELAY_OTLP_TRACES_TOKEN?.trim() || "";
 const configuredHostedAppChannel = process.env.VITE_HOSTED_APP_CHANNEL?.trim() || "";
+const hostedAppChannelMarker =
+  configuredHostedAppChannel === "latest" || configuredHostedAppChannel === "nightly"
+    ? configuredHostedAppChannel
+    : "local";
 const configuredAppVersion = process.env.APP_VERSION?.trim() || pkg.version;
 const localDevAutoAuthConfig = resolveLocalDevAutoAuthConfig(process.env);
 const configuredHostedAppUrl = (() => {
@@ -140,7 +144,9 @@ export default defineConfig(() => {
       {
         name: "ashler-web-product-identity",
         transformIndexHtml: (html) =>
-          html.replaceAll("__ASHLER_PRODUCT_NAME__", productManifest.productName),
+          html
+            .replaceAll("__ASHLER_PRODUCT_NAME__", productManifest.productName)
+            .replaceAll("__T3_HOSTED_APP_CHANNEL__", hostedAppChannelMarker),
       },
       ...(localDevAutoAuthConfig
         ? [
