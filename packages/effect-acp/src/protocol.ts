@@ -1,9 +1,13 @@
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
+import type { NonEmptyReadonlyArray } from "effect/Array";
+import * as PlatformError from "effect/PlatformError";
+import * as Pull from "effect/Pull";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Sink from "effect/Sink";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Stdio from "effect/Stdio";
@@ -17,6 +21,7 @@ import * as AcpSchema from "./_generated/schema.gen.ts";
 import { CLIENT_METHODS } from "./_generated/meta.gen.ts";
 import * as AcpError from "./errors.ts";
 const isAcpError = Schema.is(AcpError.AcpError);
+const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
 export interface AcpProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
@@ -64,12 +69,31 @@ export interface AcpPatchedProtocol {
   readonly incoming: Stream.Stream<AcpIncomingNotification>;
   readonly request: (method: string, payload: unknown) => Effect.Effect<unknown, AcpError.AcpError>;
   readonly notify: (method: string, payload: unknown) => Effect.Effect<void, AcpError.AcpError>;
+  /** Registers a waiter that completes when the next matching request enters the outgoing queue. */
+  readonly registerRequestEnqueue: (method: string) => Effect.Effect<AcpRequestEnqueueRegistration>;
+  /** Waits until every previously enqueued outgoing message has been written to stdout. */
+  readonly flush: Effect.Effect<void, AcpError.AcpError>;
+}
+
+export interface AcpRequestEnqueueRegistration {
+  readonly awaitEnqueued: Effect.Effect<void, AcpError.AcpError>;
+  readonly release: Effect.Effect<void>;
 }
 
 interface AcpPendingRequest {
   readonly deferred: Deferred.Deferred<unknown, AcpError.AcpError>;
   readonly method: string;
 }
+
+type AcpOutgoingMessage =
+  | {
+      readonly _tag: "Data";
+      readonly data: string | Uint8Array;
+    }
+  | {
+      readonly _tag: "Flush";
+      readonly acknowledge: Deferred.Deferred<void, AcpError.AcpError>;
+    };
 
 const decodeSessionUpdate = Schema.decodeUnknownEffect(AcpSchema.SessionNotification);
 const decodeElicitationComplete = Schema.decodeUnknownEffect(
@@ -85,10 +109,68 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const clientQueue = yield* Queue.unbounded<RpcMessage.FromServerEncoded>();
   const notificationQueue = yield* Queue.unbounded<AcpIncomingNotification>();
   const disconnects = yield* Queue.unbounded<number>();
-  const outgoing = yield* Queue.unbounded<string | Uint8Array, Cause.Done<void>>();
+  const outgoing = yield* Queue.unbounded<AcpOutgoingMessage, Cause.Done<void>>();
   const nextRequestId = yield* Ref.make(1);
   const terminationHandled = yield* Ref.make(false);
   const extPending = yield* Ref.make(new Map<string, AcpPendingRequest>());
+  const outgoingFailure = yield* Ref.make<AcpError.AcpError | undefined>(undefined);
+  const pendingFlushes = yield* Ref.make(new Set<Deferred.Deferred<void, AcpError.AcpError>>());
+  const requestEnqueueWaiters = yield* Ref.make(
+    new Map<string, ReadonlyArray<Deferred.Deferred<void, AcpError.AcpError>>>(),
+  );
+
+  const removeRequestEnqueueWaiter = (
+    method: string,
+    deferred: Deferred.Deferred<void, AcpError.AcpError>,
+  ) =>
+    Ref.update(requestEnqueueWaiters, (current) => {
+      const waiters = current.get(method);
+      if (!waiters?.includes(deferred)) {
+        return current;
+      }
+      const remaining = waiters.filter((waiter) => waiter !== deferred);
+      const next = new Map(current);
+      if (remaining.length === 0) {
+        next.delete(method);
+      } else {
+        next.set(method, remaining);
+      }
+      return next;
+    });
+
+  const resolveNextRequestEnqueueWaiter = (
+    method: string,
+    resolve: (deferred: Deferred.Deferred<void, AcpError.AcpError>) => Effect.Effect<boolean>,
+  ) =>
+    Ref.modify(requestEnqueueWaiters, (current) => {
+      const waiters = current.get(method);
+      const deferred = waiters?.[0];
+      if (!deferred) {
+        return [Effect.void, current] as const;
+      }
+      const next = new Map(current);
+      if (waiters.length === 1) {
+        next.delete(method);
+      } else {
+        next.set(method, waiters.slice(1));
+      }
+      return [resolve(deferred).pipe(Effect.asVoid), next] as const;
+    }).pipe(Effect.flatten);
+
+  const signalRequestEnqueued = (method: string) =>
+    resolveNextRequestEnqueueWaiter(method, (deferred) => Deferred.succeed(deferred, undefined));
+
+  const failNextRequestEnqueueWaiter = (method: string, error: AcpError.AcpError) =>
+    resolveNextRequestEnqueueWaiter(method, (deferred) => Deferred.fail(deferred, error));
+
+  const failAllRequestEnqueueWaiters = (error: AcpError.AcpError) =>
+    Ref.getAndSet(requestEnqueueWaiters, new Map()).pipe(
+      Effect.flatMap((pending) =>
+        Effect.forEach([...pending.values()].flat(), (deferred) => Deferred.fail(deferred, error), {
+          discard: true,
+        }),
+      ),
+    );
 
   const logProtocol = (event: AcpProtocolLogEvent) => {
     if (event.direction === "incoming" && !options.logIncoming) {
@@ -106,33 +188,83 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const offerOutgoing = Effect.fn("offerOutgoing")(function* (
     message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
   ) {
+    const method = message._tag === "Request" ? message.tag : undefined;
+    return yield* Effect.gen(function* () {
+      yield* logProtocol({
+        direction: "outgoing",
+        stage: "decoded",
+        payload: message,
+      });
+
+      const encodedRequestId =
+        message._tag === "Request"
+          ? message.id
+          : "requestId" in message
+            ? message.requestId
+            : undefined;
+      const requestId = encodedRequestId === "" ? undefined : encodedRequestId;
+      const encoded = yield* Effect.try({
+        try: () => parser.encode(message),
+        catch: (cause) =>
+          AcpError.AcpProtocolParseError.fromEncodingError(method, requestId, cause),
+      });
+
+      if (encoded) {
+        yield* logProtocol({
+          direction: "outgoing",
+          stage: "raw",
+          payload: typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded),
+        });
+
+        const enqueued = yield* Queue.offer(outgoing, { _tag: "Data", data: encoded });
+        if (!enqueued) {
+          return yield* new AcpError.AcpTransportError({
+            detail: "ACP outgoing transport is no longer accepting messages.",
+            cause: undefined,
+          });
+        }
+        if (method !== undefined) {
+          yield* signalRequestEnqueued(method);
+        }
+      }
+    }).pipe(
+      Effect.tapError((error) =>
+        method === undefined ? Effect.void : failNextRequestEnqueueWaiter(method, error),
+      ),
+    );
+  });
+
+  const offerOutgoingNotification = Effect.fn("offerOutgoingNotification")(function* (
+    method: string,
+    payload: unknown,
+  ) {
+    const notification = {
+      jsonrpc: "2.0" as const,
+      method,
+      params: payload,
+    };
     yield* logProtocol({
       direction: "outgoing",
       stage: "decoded",
-      payload: message,
+      payload: notification,
     });
 
-    const method = message._tag === "Request" ? message.tag : undefined;
-    const encodedRequestId =
-      message._tag === "Request"
-        ? message.id
-        : "requestId" in message
-          ? message.requestId
-          : undefined;
-    const requestId = encodedRequestId === "" ? undefined : encodedRequestId;
     const encoded = yield* Effect.try({
-      try: () => parser.encode(message),
-      catch: (cause) => AcpError.AcpProtocolParseError.fromEncodingError(method, requestId, cause),
+      try: () => `${encodeUnknownJsonString(notification)}\n`,
+      catch: (cause) => AcpError.AcpProtocolParseError.fromEncodingError(method, undefined, cause),
+    });
+    yield* logProtocol({
+      direction: "outgoing",
+      stage: "raw",
+      payload: encoded,
     });
 
-    if (encoded) {
-      yield* logProtocol({
-        direction: "outgoing",
-        stage: "raw",
-        payload: typeof encoded === "string" ? encoded : new TextDecoder().decode(encoded),
+    const enqueued = yield* Queue.offer(outgoing, { _tag: "Data", data: encoded });
+    if (!enqueued) {
+      return yield* new AcpError.AcpTransportError({
+        detail: "ACP outgoing transport is no longer accepting messages.",
+        cause: undefined,
       });
-
-      yield* Queue.offer(outgoing, encoded).pipe(Effect.asVoid);
     }
   });
 
@@ -177,6 +309,15 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       ),
     );
 
+  const failAllPendingFlushes = (error: AcpError.AcpError) =>
+    Ref.getAndSet(pendingFlushes, new Set()).pipe(
+      Effect.flatMap((flushes) =>
+        Effect.forEach(flushes, (deferred) => Deferred.fail(deferred, error), {
+          discard: true,
+        }),
+      ),
+    );
+
   const dispatchNotification = (notification: AcpIncomingNotification) =>
     Queue.offer(notificationQueue, notification).pipe(
       Effect.andThen(
@@ -210,7 +351,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
           if (!error) {
             return;
           }
+          yield* Ref.set(outgoingFailure, error);
           yield* failAllExtPending(error);
+          yield* failAllPendingFlushes(error);
+          yield* failAllRequestEnqueueWaiters(error);
           yield* emitClientProtocolError(error);
           if (options.onTermination) {
             yield* options.onTermination(error);
@@ -476,7 +620,50 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     Effect.forkScoped,
   );
 
-  yield* Stream.fromQueue(outgoing).pipe(Stream.run(options.stdio.stdout()), Effect.forkScoped);
+  const outgoingWriter = Sink.fromTransform<
+    AcpOutgoingMessage,
+    void,
+    PlatformError.PlatformError,
+    never
+  >((upstream, scope) => {
+    const pullData: Pull.Pull<
+      NonEmptyReadonlyArray<string | Uint8Array>,
+      never,
+      void
+    > = Effect.suspend(() =>
+      Effect.flatMap(upstream, ([message]) => {
+        if (message._tag === "Flush") {
+          // The stdout sink requests its next element only after it has consumed the
+          // previous one. A one-element stream chunk therefore makes this a real
+          // write barrier without ending the long-lived child-process stdin sink.
+          return Deferred.succeed(message.acknowledge, undefined).pipe(
+            Effect.asVoid,
+            Effect.andThen(pullData),
+          );
+        }
+        return Effect.succeed([message.data] as NonEmptyReadonlyArray<string | Uint8Array>);
+      }),
+    );
+    return options.stdio.stdout().transform(pullData, scope);
+  });
+
+  yield* Stream.fromQueue(outgoing).pipe(
+    Stream.rechunk(1),
+    Stream.run(outgoingWriter),
+    Effect.catchCause((cause) =>
+      handleTermination(() =>
+        Effect.succeed(
+          new AcpError.AcpTransportError({
+            detail: "Failed to write an ACP protocol message.",
+            cause: new Error("ACP protocol stdout writer failed.", {
+              cause: Cause.squash(cause),
+            }),
+          }),
+        ),
+      ),
+    ),
+    Effect.forkScoped,
+  );
 
   const clientProtocol = RpcClient.Protocol.of({
     run: (_clientId, f) =>
@@ -520,13 +707,34 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     method: string,
     payload: unknown,
   ) {
-    yield* offerOutgoing({
-      _tag: "Request",
-      id: "",
-      tag: method,
-      payload,
-      headers: [],
-    });
+    yield* offerOutgoingNotification(method, payload);
+  });
+
+  const flush = Effect.gen(function* () {
+    const acknowledge = yield* Deferred.make<void, AcpError.AcpError>();
+    yield* Ref.update(pendingFlushes, (current) => new Set(current).add(acknowledge));
+    return yield* Effect.gen(function* () {
+      const failure = yield* Ref.get(outgoingFailure);
+      if (failure) {
+        return yield* failure;
+      }
+      const enqueued = yield* Queue.offer(outgoing, { _tag: "Flush", acknowledge });
+      if (!enqueued) {
+        return yield* new AcpError.AcpTransportError({
+          detail: "ACP outgoing transport closed before it could be flushed.",
+          cause: undefined,
+        });
+      }
+      return yield* Deferred.await(acknowledge);
+    }).pipe(
+      Effect.ensuring(
+        Ref.update(pendingFlushes, (current) => {
+          const next = new Set(current);
+          next.delete(acknowledge);
+          return next;
+        }),
+      ),
+    );
   });
 
   const sendRequest = Effect.fn("sendRequest")(function* (method: string, payload: unknown) {
@@ -550,6 +758,24 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     );
   });
 
+  const registerRequestEnqueue = Effect.fn("registerRequestEnqueue")(function* (method: string) {
+    const deferred = yield* Deferred.make<void, AcpError.AcpError>();
+    yield* Ref.update(requestEnqueueWaiters, (current) => {
+      const next = new Map(current);
+      next.set(method, [...(current.get(method) ?? []), deferred]);
+      return next;
+    });
+    const failure = yield* Ref.get(outgoingFailure);
+    if (failure) {
+      yield* removeRequestEnqueueWaiter(method, deferred);
+      yield* Deferred.fail(deferred, failure);
+    }
+    return {
+      awaitEnqueued: Deferred.await(deferred),
+      release: removeRequestEnqueueWaiter(method, deferred),
+    } satisfies AcpRequestEnqueueRegistration;
+  });
+
   return {
     clientProtocol,
     serverProtocol,
@@ -558,6 +784,8 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     },
     request: sendRequest,
     notify: sendNotification,
+    registerRequestEnqueue,
+    flush,
   } satisfies AcpPatchedProtocol;
 });
 

@@ -18,6 +18,7 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 import * as EffectAcpClient from "effect-acp/client";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
+import { AGENT_METHODS } from "effect-acp/schema";
 import type * as EffectAcpProtocol from "effect-acp/protocol";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
@@ -54,6 +55,7 @@ export type AcpSessionRuntimeEvent = AcpParsedSessionEvent | AcpSessionEventStre
 
 const defaultSessionLoadTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
+const defaultCancelPromptResponseTimeout = Duration.seconds(6);
 
 export interface AcpSpawnInput {
   readonly command: string;
@@ -68,6 +70,7 @@ export interface AcpSessionRuntimeOptions {
   readonly resumeSessionId?: string;
   readonly sessionLoadTimeout?: Duration.Input;
   readonly sessionLoadReplayIdleGap?: Duration.Input;
+  readonly cancelPromptResponseTimeout?: Duration.Input;
   readonly clientCapabilities?: EffectAcpSchema.InitializeRequest["clientCapabilities"];
   readonly clientInfo: {
     readonly name: string;
@@ -204,6 +207,10 @@ export class AcpSessionRuntime extends Context.Service<
      */
     readonly prompt: (
       payload: Omit<EffectAcpSchema.PromptRequest, "sessionId">,
+      options?: {
+        /** Runs after the prompt request is queued and flushed to the ACP agent. */
+        readonly onRegistered?: Effect.Effect<void>;
+      },
     ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
     /**
      * Sends a real ACP `session/cancel` notification for the active session.
@@ -291,6 +298,10 @@ export const make = (
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const runtimeScope = yield* Scope.Scope;
     const eventQueue = yield* Queue.unbounded<AcpSessionRuntimeEvent>();
+    const runtimeClosed = yield* Deferred.make<void>();
+    yield* Effect.addFinalizer(() =>
+      Deferred.succeed(runtimeClosed, undefined).pipe(Effect.asVoid),
+    );
     const modeStateRef = yield* Ref.make<AcpSessionModeState | undefined>(undefined);
     const toolCallsRef = yield* Ref.make(new Map<string, AcpToolCallState>());
     const assistantItemRuntimeId = yield* crypto.randomUUIDv4.pipe(
@@ -316,6 +327,8 @@ export const make = (
     const sessionLoadGateRef = yield* Ref.make<Option.Option<SessionLoadGate>>(Option.none());
     const replayNotificationsRef = yield* Ref.make<ReadonlyArray<AcpReplayNotification>>([]);
     const notificationSequenceRef = yield* Ref.make(0);
+    const cancelPromptResponseTimeout =
+      options.cancelPromptResponseTimeout ?? defaultCancelPromptResponseTimeout;
 
     const logRequest = (event: AcpSessionRequestLogEvent) =>
       options.requestLogger ? options.requestLogger(event) : Effect.void;
@@ -755,7 +768,10 @@ export const make = (
           _tag: "EventStreamBarrier",
           acknowledge,
         });
-        yield* Deferred.await(acknowledge);
+        // A failed cancellation can close the ACP runtime while the prompt
+        // error path is draining notifications. Do not strand that caller on
+        // a barrier whose consumer has already been stopped.
+        yield* Effect.raceFirst(Deferred.await(acknowledge), Deferred.await(runtimeClosed));
       }),
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
@@ -763,7 +779,7 @@ export const make = (
       awaitAvailableCommands: Deferred.await(availableCommandsReady).pipe(
         Effect.andThen(Ref.get(availableCommandsRef)),
       ),
-      prompt: (payload) =>
+      prompt: (payload, options) =>
         promptSerializationSemaphore.withPermit(
           Effect.gen(function* () {
             const started = yield* getStartedState;
@@ -778,13 +794,26 @@ export const make = (
             const cancelledResponse = {
               stopReason: "cancelled",
             } satisfies EffectAcpSchema.PromptResponse;
+            const promptEnqueue = yield* acp.raw.registerRequestEnqueue(
+              AGENT_METHODS.session_prompt,
+            );
             const promptRpcFiber = yield* runLoggedRequest(
               "session/prompt",
               requestPayload,
               acp.agent.prompt(requestPayload),
-            ).pipe(Effect.forkIn(runtimeScope));
+            ).pipe(Effect.forkIn(runtimeScope, { startImmediately: true }));
             yield* Ref.set(activePromptFiberRef, Option.some(promptRpcFiber));
-            return yield* Fiber.join(promptRpcFiber).pipe(
+            return yield* Effect.gen(function* () {
+              // Request logging may suspend before the RPC client reaches its
+              // transport. Wait for the transport's exact enqueue signal so
+              // observers cannot expose a cancellable turn prematurely.
+              yield* promptEnqueue.awaitEnqueued;
+              yield* acp.raw.flush;
+              if (options?.onRegistered) {
+                yield* options.onRegistered;
+              }
+              return yield* Fiber.join(promptRpcFiber);
+            }).pipe(
               Effect.catchCause((cause) =>
                 Cause.hasInterruptsOnly(cause)
                   ? Effect.succeed(cancelledResponse)
@@ -792,6 +821,7 @@ export const make = (
               ),
               Effect.ensuring(
                 Effect.gen(function* () {
+                  yield* promptEnqueue.release;
                   yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
                   yield* Ref.set(activePromptFiberRef, Option.none());
                 }),
@@ -808,13 +838,42 @@ export const make = (
       cancel: getStartedState.pipe(
         Effect.flatMap((started) =>
           Effect.gen(function* () {
+            // Capture the prompt before notifying the provider. A provider may
+            // reject and finalize the prompt synchronously while processing
+            // `session/cancel`; reading the ref afterwards would lose that
+            // rejection and incorrectly report cancellation as successful.
             const activePromptFiber = yield* Ref.get(activePromptFiberRef);
-            if (Option.isSome(activePromptFiber)) {
-              yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
+            yield* acp.agent.cancel({ sessionId: started.sessionId });
+            yield* acp.raw.flush;
+
+            if (Option.isNone(activePromptFiber)) {
+              return;
             }
-            yield* acp.agent
-              .cancel({ sessionId: started.sessionId })
-              .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
+
+            // `session/cancel` is a notification, so the provider acknowledges
+            // completed cleanup by resolving the original prompt as cancelled.
+            // Keep the local request alive for that response; only interrupt it
+            // as a bounded fallback for agents that never settle the prompt.
+            yield* Fiber.join(activePromptFiber.value).pipe(
+              Effect.asVoid,
+              Effect.timeoutOrElse({
+                duration: cancelPromptResponseTimeout,
+                orElse: () =>
+                  Fiber.interrupt(activePromptFiber.value).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new EffectAcpErrors.AcpTransportError({
+                          operation: "call-rpc",
+                          method: "session/prompt",
+                          detail:
+                            "session/cancel timed out waiting for the active session/prompt response",
+                          cause: undefined,
+                        }),
+                      ),
+                    ),
+                  ),
+              }),
+            );
           }),
         ),
       ),
@@ -919,10 +978,6 @@ export const handleSessionUpdate = ({
         yield* Ref.set(configOptionsRef, event.configOptions);
       }
       if (event._tag === "ToolCallUpdated") {
-        yield* closeActiveAssistantSegment({
-          queue,
-          assistantSegmentRef,
-        });
         const { previous, merged } = yield* Ref.modify(toolCallsRef, (current) => {
           const previous = current.get(event.toolCall.toolCallId);
           const nextToolCall = mergeToolCallState(previous, event.toolCall);
@@ -936,6 +991,16 @@ export const handleSessionUpdate = ({
         });
         if (!shouldEmitToolCallUpdate(previous, merged)) {
           continue;
+        }
+        // A new tool invocation separates assistant text before the call from text
+        // produced after it. Updates for a tool that is already running may arrive
+        // asynchronously between token chunks, so they must not split one assistant
+        // message into many tiny timeline items.
+        if (previous === undefined || !toolCallUpdateIsVisible(previous)) {
+          yield* closeActiveAssistantSegment({
+            queue,
+            assistantSegmentRef,
+          });
         }
         yield* Queue.offer(queue, {
           _tag: "ToolCallUpdated",
@@ -1003,10 +1068,14 @@ function shouldEmitToolCallUpdate(
   if (next.status === "completed" || next.status === "failed") {
     return true;
   }
-  if (!next.detail) {
+  if (!toolCallUpdateIsVisible(next)) {
     return false;
   }
   return previous === undefined || previous.title !== next.title || previous.detail !== next.detail;
+}
+
+function toolCallUpdateIsVisible(update: AcpToolCallState): boolean {
+  return update.status === "completed" || update.status === "failed" || Boolean(update.detail);
 }
 
 const assistantItemId = (sessionId: string, runtimeId: string, segmentIndex: number) =>

@@ -2,6 +2,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -29,6 +30,9 @@ const useOmpAdvisorPolicyOptions = process.env.T3_ACP_OMP_ADVISOR_POLICY_OPTIONS
 const emitAvailableCommands = process.env.T3_ACP_EMIT_AVAILABLE_COMMANDS === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
+const ignoreCancel = process.env.T3_ACP_IGNORE_CANCEL === "1";
+const failPromptOnCancel = process.env.T3_ACP_FAIL_PROMPT_ON_CANCEL === "1";
+const requireActivePromptForCancel = process.env.T3_ACP_REQUIRE_ACTIVE_PROMPT_FOR_CANCEL === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
@@ -64,6 +68,8 @@ let currentFast = false;
 let promptCount = 0;
 let overlappingFirstPromptId: string | undefined;
 const cancelledSessions = new Set<string>();
+const failedCancellationSessions = new Set<string>();
+const hangingPromptCancellation = new Map<string, Deferred.Deferred<"cancelled" | "failed">>();
 
 function promptIdFromRequestMeta(
   request: Pick<AcpSchema.PromptRequest, "_meta">,
@@ -527,8 +533,25 @@ const program = Effect.gen(function* () {
 
   yield* agent.handleCancel(({ sessionId }) =>
     Effect.gen(function* () {
+      if (ignoreCancel) {
+        return;
+      }
       const cancelledSessionId = String(sessionId ?? "mock-session-1");
-      cancelledSessions.add(cancelledSessionId);
+      const cancellation = hangingPromptCancellation.get(cancelledSessionId);
+      // Real OMP does not latch cancellation for a prompt that has not begun.
+      // This strict mode makes ordering regressions visible in adapter tests.
+      if (requireActivePromptForCancel && !cancellation) {
+        return;
+      }
+      const outcome = failPromptOnCancel ? "failed" : "cancelled";
+      if (outcome === "failed") {
+        failedCancellationSessions.add(cancelledSessionId);
+      } else {
+        cancelledSessions.add(cancelledSessionId);
+      }
+      if (cancellation) {
+        yield* Deferred.succeed(cancellation, outcome);
+      }
       if (emitLateUpdateAfterCancel) {
         yield* Effect.sleep("50 millis");
         yield* Effect.sync(() => {
@@ -611,7 +634,29 @@ const program = Effect.gen(function* () {
       }
 
       if (hangPromptForever || (hangFirstPromptForever && promptCount === 1)) {
-        return yield* Effect.never;
+        if (failedCancellationSessions.delete(requestedSessionId)) {
+          return yield* AcpError.AcpRequestError.internalError("Mock cancel cleanup failure");
+        }
+        if (cancelledSessions.delete(requestedSessionId)) {
+          return { stopReason: "cancelled" as const };
+        }
+        const cancellation = yield* Deferred.make<"cancelled" | "failed">();
+        hangingPromptCancellation.set(requestedSessionId, cancellation);
+        const outcome = yield* Deferred.await(cancellation).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (hangingPromptCancellation.get(requestedSessionId) === cancellation) {
+                hangingPromptCancellation.delete(requestedSessionId);
+              }
+            }),
+          ),
+        );
+        cancelledSessions.delete(requestedSessionId);
+        failedCancellationSessions.delete(requestedSessionId);
+        if (outcome === "failed") {
+          return yield* AcpError.AcpRequestError.internalError("Mock cancel cleanup failure");
+        }
+        return { stopReason: "cancelled" as const };
       }
 
       if (emitXAiPromptCompleteThenHang) {

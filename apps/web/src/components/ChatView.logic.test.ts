@@ -28,6 +28,7 @@ import {
   resolveFailedScaffoldDraftRetryMode,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  shouldShowComposerStop,
   startNewThreadForProject,
   shouldShowBranchMismatchBanner,
   shouldWriteThreadErrorToCurrentServerThread,
@@ -534,6 +535,50 @@ describe("shouldWriteThreadErrorToCurrentServerThread", () => {
         targetThreadId: threadId,
       }),
     ).toBe(false);
+  });
+});
+
+describe("shouldShowComposerStop", () => {
+  const runningSession = {
+    ...readySession,
+    status: "running" as const,
+    activeTurnId: completedTurn.turnId,
+  };
+
+  it.each(["interrupted", "completed", "error"] as const)(
+    "hides Stop when the active turn is %s before its running session settles",
+    (state) => {
+      expect(
+        shouldShowComposerStop(
+          makeThread({
+            session: runningSession,
+            latestTurn: { ...completedTurn, state },
+          }),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  it("keeps Stop visible while the active turn is running", () => {
+    expect(
+      shouldShowComposerStop(
+        makeThread({
+          session: runningSession,
+          latestTurn: { ...completedTurn, state: "running", completedAt: null },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps Stop visible when latestTurn still describes the previous turn", () => {
+    expect(
+      shouldShowComposerStop(
+        makeThread({
+          session: { ...runningSession, activeTurnId: TurnId.make("turn-2") },
+          latestTurn: completedTurn,
+        }),
+      ),
+    ).toBe(true);
   });
 });
 

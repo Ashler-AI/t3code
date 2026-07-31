@@ -33,6 +33,7 @@ import {
 } from "../providerMaintenance.ts";
 import {
   buildOmpSkillsFromAvailableCommands,
+  buildOmpSlashCommandsFromAvailableCommands,
   configuredManagedScaffoldOmpModels,
   makeOmpAcpRuntime,
   OMP_MODEL_CONFIG_ID,
@@ -172,6 +173,7 @@ export function buildOmpDiscoveredModelsFromConfigOptions(
 
 type OmpDiscoveredCatalog = {
   readonly models: ReadonlyArray<ServerProviderModel>;
+  readonly slashCommands: ServerProvider["slashCommands"];
   readonly skills: ServerProvider["skills"];
 };
 
@@ -211,6 +213,7 @@ const discoverOmpCatalogViaAcp: OmpCatalogDiscovery = (
         started.sessionSetupResult.configOptions,
         environment,
       ),
+      slashCommands: buildOmpSlashCommandsFromAvailableCommands(availableCommands),
       skills: buildOmpSkillsFromAvailableCommands(availableCommands),
     };
   }).pipe(Effect.mapError((cause) => new OmpCatalogDiscoveryError({ cause })));
@@ -372,6 +375,7 @@ export const checkOmpProviderStatus = Effect.fn("checkOmpProviderStatus")(functi
   }
   const discoveredModels = discoveryExit.value.value.models;
   const models = discoveredModels.length > 0 ? discoveredModels : fallbackModels;
+  const slashCommands = discoveryExit.value.value.slashCommands;
   const skills = discoveryExit.value.value.skills;
 
   return buildServerProvider({
@@ -379,6 +383,7 @@ export const checkOmpProviderStatus = Effect.fn("checkOmpProviderStatus")(functi
     enabled: ompSettings.enabled,
     checkedAt,
     models,
+    slashCommands,
     skills,
     probe: {
       installed: true,
