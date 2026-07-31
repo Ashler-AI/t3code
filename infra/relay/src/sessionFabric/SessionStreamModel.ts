@@ -97,6 +97,12 @@ export function settlePauseCanResettle(status: string): boolean {
   return status === "cancelled" || status === "failed";
 }
 
+export function settlePauseOutcomeAdvancesLifecycle(
+  outcome: "paused" | "already_inactive" | "superseded",
+): boolean {
+  return outcome === "paused" || outcome === "already_inactive";
+}
+
 export function settlePauseLifecycleAuthority(input: {
   readonly currentLifecycleEpoch: number;
   readonly expectedLifecycleEpoch: number;
