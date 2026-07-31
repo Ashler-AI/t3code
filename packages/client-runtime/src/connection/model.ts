@@ -116,6 +116,8 @@ export class ConnectionTransientError extends Schema.TaggedErrorClass<Connection
     reason: ConnectionTransientReason,
     detail: Schema.String,
     traceId: Schema.optionalKey(Schema.String),
+    httpStatus: Schema.optionalKey(Schema.Number),
+    requestUrl: Schema.optionalKey(Schema.String),
   },
 ) {
   override get message(): string {

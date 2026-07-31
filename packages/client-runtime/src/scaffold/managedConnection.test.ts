@@ -10,12 +10,14 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
+import { mapRemoteEnvironmentError } from "../connection/errors.ts";
 import {
   ConnectionBlockedError,
   ConnectionTransientError,
   RelayConnectionTarget,
   ScaffoldConnectionTarget,
 } from "../connection/model.ts";
+import { RemoteEnvironmentAuthUndeclaredStatusError } from "../rpc/http.ts";
 import {
   prepareManagedScaffoldConnection,
   scaffoldTargetFromBinding,
@@ -57,11 +59,11 @@ describe("prepareManagedScaffoldConnection", () => {
             authorizeCount += 1;
             const bootstrap = yield* input.obtainBootstrap;
             if (authorizeCount === 1) {
-              return yield* new ConnectionTransientError({
-                reason: "remote-unavailable",
-                detail:
-                  "Remote environment endpoint https://sandbox.example.com/.well-known/t3/environment returned undeclared status 409.",
-              });
+              const rpcError = new RemoteEnvironmentAuthUndeclaredStatusError(
+                "https://sandbox.example.com/.well-known/t3/environment",
+                409,
+              );
+              return yield* mapRemoteEnvironmentError(rpcError);
             }
             return {
               environmentId: ENVIRONMENT_ID,
@@ -112,6 +114,20 @@ describe("prepareManagedScaffoldConnection", () => {
     }),
   );
 
+  it("preserves structured HTTP failure metadata across the connection error boundary", () => {
+    const requestUrl = "https://sandbox.example.com/.well-known/t3/environment";
+    const error = mapRemoteEnvironmentError(
+      new RemoteEnvironmentAuthUndeclaredStatusError(requestUrl, 409),
+    );
+
+    expect(error).toMatchObject({
+      _tag: "ConnectionTransientError",
+      reason: "remote-unavailable",
+      httpStatus: 409,
+      requestUrl,
+    });
+  });
+
   it.effect("does not re-prepare for a non-descriptor authorization failure", () =>
     Effect.gen(function* () {
       let prepareCount = 0;
@@ -119,6 +135,8 @@ describe("prepareManagedScaffoldConnection", () => {
         reason: "remote-unavailable",
         detail:
           "Remote environment endpoint https://sandbox.example.com/oauth/token returned undeclared status 409.",
+        httpStatus: 409,
+        requestUrl: "https://sandbox.example.com/oauth/token",
       });
       const result = yield* Effect.result(
         prepareManagedScaffoldConnection({
@@ -171,6 +189,8 @@ describe("prepareManagedScaffoldConnection", () => {
         reason: "remote-unavailable",
         detail:
           "Remote environment endpoint https://sandbox.example.com/.well-known/t3/environment returned undeclared status 409.",
+        httpStatus: 409,
+        requestUrl: "https://sandbox.example.com/.well-known/t3/environment",
       });
       const result = yield* Effect.result(
         prepareManagedScaffoldConnection({

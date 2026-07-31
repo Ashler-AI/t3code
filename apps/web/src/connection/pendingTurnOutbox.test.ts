@@ -17,11 +17,13 @@ import {
   discardPendingTurn,
   drainPendingTurnOutbox,
   enqueuePendingTurn,
+  firstPendingTurnDrainFailure,
   isPendingTurnDispatchFailureRetryable,
   listPendingTurnsForThread,
   reconcilePendingTurnForExistingThread,
   recordPendingTurnFailure,
   retargetPendingTurnsForDraft,
+  subscribePendingTurnTerminal,
   type PendingTurnOutboxEntry,
   type PendingTurnOutboxStorage,
 } from "./pendingTurnOutbox";
@@ -574,9 +576,11 @@ describe("pending turn outbox", () => {
     ).toBe(true);
   });
 
-  it("makes declared command failures terminal and never resends them", async () => {
+  it("removes declared command failures after announcing them as terminal", async () => {
     const storage = createMemoryPendingTurnOutboxStorage();
     await enqueuePendingTurn(storage, pendingInput());
+    const terminalListener = vi.fn();
+    const unsubscribe = subscribePendingTurnTerminal(terminalListener);
     const dispatch = vi.fn(async () => {
       throw {
         _tag: "OrchestrationDispatchCommandError",
@@ -588,14 +592,122 @@ describe("pending turn outbox", () => {
     const second = await drainPendingTurnOutbox({ storage, dispatch });
 
     expect(first[0]).toMatchObject({ outcome: "terminal", error: "Invalid model selection" });
-    expect(second[0]).toMatchObject({ outcome: "terminal", error: "Invalid model selection" });
+    expect(firstPendingTurnDrainFailure(first)).toMatchObject({
+      outcome: "terminal",
+      error: "Invalid model selection",
+    });
+    expect(terminalListener).toHaveBeenCalledTimes(1);
+    expect(terminalListener).toHaveBeenCalledWith(
+      expect.objectContaining({
+        idempotencyKey: commandId,
+        messageId,
+        status: "terminal",
+        lastError: "Invalid model selection",
+      }),
+    );
+    expect(second).toEqual([]);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(await storage.list()).toMatchObject([
-      { status: "terminal", attemptCount: 1, lastError: "Invalid model selection" },
-    ]);
+    expect(await storage.list()).toEqual([]);
+    expect(await listPendingTurnsForThread(storage, environmentId, threadId)).toEqual([]);
 
     await discardPendingTurn(storage, commandId);
     expect(await storage.list()).toEqual([]);
+    unsubscribe();
+  });
+
+  it("does not let one terminal rejection block a later accepted turn", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(storage, pendingInput());
+    const laterCommandId = CommandId.make("command-2");
+    const laterMessageId = MessageId.make("message-2");
+    await enqueuePendingTurn(storage, {
+      ...pendingInput(),
+      idempotencyKey: laterCommandId,
+      messageId: laterMessageId,
+      createdAt: "2026-07-24T12:01:00.000Z",
+      input: {
+        ...pendingInput().input,
+        commandId: laterCommandId,
+        message: { ...pendingInput().input.message, messageId: laterMessageId },
+      },
+    });
+    const dispatch = vi.fn(async (entry: PendingTurnOutboxEntry) => {
+      if (entry.idempotencyKey === commandId) {
+        throw {
+          _tag: "EnvironmentOperationForbiddenError",
+          message: "This shared session is available as read-only.",
+        };
+      }
+    });
+
+    const results = await drainPendingTurnOutbox({ storage, dispatch });
+
+    expect(results.map((result) => result.outcome)).toEqual(["terminal", "sent"]);
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(await storage.list()).toEqual([]);
+  });
+
+  it("cleans up a legacy terminal entry before sending a later pending turn", async () => {
+    const seedStorage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(seedStorage, pendingInput());
+    await recordPendingTurnFailure(seedStorage, commandId, {
+      _tag: "EnvironmentOperationForbiddenError",
+      message: "This shared session is available as read-only.",
+    });
+    const [legacyTerminal] = await seedStorage.list();
+    expect(legacyTerminal?.status).toBe("terminal");
+
+    const laterCommandId = CommandId.make("command-legacy-later");
+    const laterMessageId = MessageId.make("message-legacy-later");
+    const storage = createMemoryPendingTurnOutboxStorage([legacyTerminal!]);
+    await enqueuePendingTurn(storage, {
+      ...pendingInput(),
+      idempotencyKey: laterCommandId,
+      messageId: laterMessageId,
+      createdAt: "2026-07-24T12:01:00.000Z",
+      input: {
+        ...pendingInput().input,
+        commandId: laterCommandId,
+        message: { ...pendingInput().input.message, messageId: laterMessageId },
+      },
+    });
+    const terminalListener = vi.fn();
+    const unsubscribe = subscribePendingTurnTerminal(terminalListener);
+    const dispatch = vi.fn(async () => undefined);
+
+    const results = await drainPendingTurnOutbox({ storage, dispatch });
+
+    expect(results.map((result) => result.outcome)).toEqual(["terminal", "sent"]);
+    expect(terminalListener).toHaveBeenCalledTimes(1);
+    expect(terminalListener).toHaveBeenCalledWith(
+      expect.objectContaining({
+        idempotencyKey: commandId,
+        status: "terminal",
+      }),
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ idempotencyKey: laterCommandId }),
+    );
+    expect(await storage.list()).toEqual([]);
+    unsubscribe();
+  });
+
+  it("does not announce retryable dispatch failures as terminal", async () => {
+    const storage = createMemoryPendingTurnOutboxStorage();
+    await enqueuePendingTurn(storage, pendingInput());
+    const terminalListener = vi.fn();
+    const unsubscribe = subscribePendingTurnTerminal(terminalListener);
+
+    await drainPendingTurnOutbox({
+      storage,
+      dispatch: async () => {
+        throw new Error("offline");
+      },
+    });
+
+    expect(terminalListener).not.toHaveBeenCalled();
+    unsubscribe();
   });
 
   it("does not send a later turn ahead of a failed earlier turn", async () => {

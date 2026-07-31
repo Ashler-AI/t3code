@@ -647,6 +647,44 @@ export function sortSettledThreadsForSidebarV2<
   );
 }
 
+export function resolvePaginatedCurrentThread<T>(input: {
+  readonly threads: readonly T[];
+  readonly visibleCount: number;
+  readonly currentThreadKey: string | null;
+  readonly getThreadKey: (thread: T) => string;
+}): {
+  readonly visibleThreads: readonly T[];
+  readonly pinnedCurrentThread: T | null;
+  readonly hiddenThreadCount: number;
+} {
+  const visibleCount = Math.max(0, input.visibleCount);
+  const visibleThreads = input.threads.slice(0, visibleCount);
+  if (input.currentThreadKey === null) {
+    return {
+      visibleThreads,
+      pinnedCurrentThread: null,
+      hiddenThreadCount: Math.max(0, input.threads.length - visibleThreads.length),
+    };
+  }
+
+  const currentThreadIndex = input.threads.findIndex(
+    (thread) => input.getThreadKey(thread) === input.currentThreadKey,
+  );
+  const pinnedCurrentThread =
+    currentThreadIndex >= visibleThreads.length
+      ? (input.threads[currentThreadIndex] ?? null)
+      : null;
+
+  return {
+    visibleThreads,
+    pinnedCurrentThread,
+    hiddenThreadCount: Math.max(
+      0,
+      input.threads.length - visibleThreads.length - (pinnedCurrentThread === null ? 0 : 1),
+    ),
+  };
+}
+
 /** The timestamp a working thread's elapsed label counts from: the running
     turn's start (request time until adoption), falling back to the session's
     last transition when the turn projection lags behind. Malformed

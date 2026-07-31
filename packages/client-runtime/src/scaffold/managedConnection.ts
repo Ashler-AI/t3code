@@ -81,9 +81,7 @@ function isStaleScaffoldAttachGrant(
     return false;
   }
   const descriptorUrl = environmentEndpointUrl(prepared.httpBaseUrl, "/.well-known/t3/environment");
-  return (
-    error.detail === `Remote environment endpoint ${descriptorUrl} returned undeclared status 409.`
-  );
+  return error.httpStatus === 409 && error.requestUrl === descriptorUrl;
 }
 
 function persistentScaffoldAttachFailure(): ConnectionBlockedError {

@@ -594,20 +594,39 @@ function ScaffoldSessionCoordinator() {
   const pauseScaffold = useAtomCommand(serverEnvironment.pauseScaffold, { reportFailure: false });
   const renameScaffold = useAtomCommand(serverEnvironment.renameScaffold, { reportFailure: false });
   const attemptedLegacyDraftIds = useRef(new Set<string>());
-  const syncScaffoldSessionTitle = useMemo(
-    () =>
-      createScaffoldSessionTitleSyncRunner(async (candidate) => {
-        if (primaryEnvironmentId === null) {
+  const primaryEnvironmentIdRef = useRef(primaryEnvironmentId);
+  const renameScaffoldRef = useRef(renameScaffold);
+  primaryEnvironmentIdRef.current = primaryEnvironmentId;
+  renameScaffoldRef.current = renameScaffold;
+  const syncScaffoldSessionTitleRef = useRef<ReturnType<
+    typeof createScaffoldSessionTitleSyncRunner
+  > | null>(null);
+  if (
+    syncScaffoldSessionTitleRef.current === null ||
+    typeof syncScaffoldSessionTitleRef.current.activate !== "function"
+  ) {
+    syncScaffoldSessionTitleRef.current = createScaffoldSessionTitleSyncRunner(
+      async (candidate) => {
+        const currentPrimaryEnvironmentId = primaryEnvironmentIdRef.current;
+        if (currentPrimaryEnvironmentId === null) {
           throw new Error("The primary environment is not ready for Scaffold session naming.");
         }
-        const result = await renameScaffold({
-          environmentId: primaryEnvironmentId,
+        const result = await renameScaffoldRef.current({
+          environmentId: currentPrimaryEnvironmentId,
           input: new ScaffoldRenameInput(candidate),
         });
         if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-      }),
-    [primaryEnvironmentId, renameScaffold],
-  );
+      },
+    );
+  }
+  const syncScaffoldSessionTitle = syncScaffoldSessionTitleRef.current;
+
+  useEffect(() => {
+    syncScaffoldSessionTitle.activate();
+    return () => {
+      syncScaffoldSessionTitle.dispose();
+    };
+  }, [syncScaffoldSessionTitle]);
 
   useEffect(() => {
     void reconcileLegacyFailedScaffoldSessions({
@@ -866,8 +885,10 @@ function ScaffoldSessionCoordinator() {
       threads: threadShells,
     });
     for (const candidate of candidates) {
-      void syncScaffoldSessionTitle.run(candidate).catch((error: unknown) => {
-        console.error("Could not synchronize the Scaffold session title.", error);
+      void syncScaffoldSessionTitle.run(candidate).catch(() => {
+        // Session naming is best-effort. The runner owns its bounded retry
+        // budget, and an unavailable older Scaffold server must not produce a
+        // console or render storm for every hydrated historical session.
       });
     }
   }, [environments, primaryEnvironmentId, projects, syncScaffoldSessionTitle, threadShells]);

@@ -59,6 +59,26 @@ export interface PendingTurnDrainResult {
   readonly error: string | null;
 }
 
+type PendingTurnTerminalListener = (entry: PendingTurnOutboxEntry) => void;
+const pendingTurnTerminalListeners = new Set<PendingTurnTerminalListener>();
+
+export function subscribePendingTurnTerminal(listener: PendingTurnTerminalListener): () => void {
+  pendingTurnTerminalListeners.add(listener);
+  return () => pendingTurnTerminalListeners.delete(listener);
+}
+
+function announcePendingTurnTerminal(entry: PendingTurnOutboxEntry): void {
+  for (const listener of pendingTurnTerminalListeners) listener(entry);
+}
+
+export function firstPendingTurnDrainFailure(
+  results: ReadonlyArray<PendingTurnDrainResult>,
+): PendingTurnDrainResult | null {
+  return (
+    results.find((result) => result.outcome === "failed" || result.outcome === "terminal") ?? null
+  );
+}
+
 function errorMessage(error: unknown): string {
   if (
     typeof error === "object" &&
@@ -351,7 +371,10 @@ export async function listPendingTurnsForThread(
   threadId: ThreadId,
 ): Promise<ReadonlyArray<PendingTurnOutboxEntry>> {
   return (await storage.list()).filter(
-    (entry) => entry.environmentId === environmentId && entry.threadId === threadId,
+    (entry) =>
+      entry.environmentId === environmentId &&
+      entry.threadId === threadId &&
+      entry.status !== "terminal",
   );
 }
 
@@ -469,6 +492,9 @@ export async function drainPendingTurnOutbox(input: {
       const results: PendingTurnDrainResult[] = [];
       for (const entry of entries) {
         if (entry.status === "terminal") {
+          announcePendingTurnTerminal(entry);
+          await input.storage.remove(entry.idempotencyKey);
+          allEntries.splice(allEntries.indexOf(entry), 1);
           results.push({ entry, outcome: "terminal", error: entry.lastError });
           continue;
         }
@@ -509,14 +535,20 @@ export async function drainPendingTurnOutbox(input: {
         } catch (error) {
           const message = errorMessage(error);
           const retryable = isPendingTurnDispatchFailureRetryable(error);
-          await input.storage.put({
+          const failed: PendingTurnOutboxEntry = {
             ...sending,
             status: retryable ? "failed" : "terminal",
             updatedAt: new Date().toISOString(),
             lastError: message,
-          });
+          };
+          await input.storage.put(failed);
+          if (!retryable) {
+            announcePendingTurnTerminal(failed);
+            await input.storage.remove(failed.idempotencyKey);
+            allEntries.splice(allEntries.indexOf(entry), 1);
+          }
           results.push({
-            entry: sending,
+            entry: failed,
             outcome: retryable ? "failed" : "terminal",
             error: message,
           });

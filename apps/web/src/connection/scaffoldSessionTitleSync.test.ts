@@ -187,6 +187,45 @@ describe("Scaffold session title synchronization", () => {
     expect(rename).toHaveBeenCalledTimes(2);
   });
 
+  it("preserves retry state when a render replaces the rename callback", async () => {
+    let now = 1_000;
+    const firstRename = vi
+      .fn<(candidate: unknown) => Promise<void>>()
+      .mockRejectedValue(new Error("offline"));
+    const secondRename = vi.fn<(candidate: unknown) => Promise<void>>().mockResolvedValue();
+    const current = { rename: firstRename };
+    const runner = createScaffoldSessionTitleSyncRunner((candidate) => current.rename(candidate), {
+      now: () => now,
+      retryDelayMs: 30_000,
+    });
+    const [candidate] = selectScaffoldSessionTitleSyncCandidates({
+      targets: [target],
+      projects: [project],
+      threads: [
+        thread({
+          id: "thread-titled",
+          title: "Fix Scaffold resume failures",
+          createdAt: "2026-07-30T00:00:02Z",
+        }),
+      ],
+    });
+    if (!candidate) throw new Error("expected title candidate");
+
+    await expect(runner.run(candidate)).rejects.toThrow("offline");
+
+    // React command hooks may return a new function when their registry
+    // context changes. The coordinator keeps this runner and updates the
+    // callback behind its ref instead of recreating all retry state.
+    current.rename = secondRename;
+    await expect(runner.run(candidate)).resolves.toBeUndefined();
+    expect(firstRename).toHaveBeenCalledOnce();
+    expect(secondRename).not.toHaveBeenCalled();
+
+    now += 30_000;
+    await expect(runner.run(candidate)).resolves.toBeUndefined();
+    expect(secondRename).toHaveBeenCalledOnce();
+  });
+
   it("requires both the primary RPC owner and the Scaffold target to be connected", () => {
     const primaryEnvironmentId = EnvironmentId.make("environment-primary");
     const primaryTarget = new PrimaryConnectionTarget({
@@ -258,14 +297,13 @@ describe("Scaffold session title synchronization", () => {
     ).toEqual([{ target, usable: false }]);
   });
 
-  it("keeps retrying transient failures with bounded backoff until naming succeeds", async () => {
+  it("bounds transient retries and starts a fresh attempt budget after reconnect", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
     const rename = vi
       .fn<(candidate: unknown) => Promise<void>>()
       .mockRejectedValueOnce(new Error("RPC unavailable"))
       .mockRejectedValueOnce(new Error("lifecycle unavailable"))
-      .mockRejectedValueOnce(new Error("still unavailable"))
       .mockResolvedValueOnce();
     const runner = createScaffoldSessionTitleSyncRunner(rename, {
       retryDelayMs: 10,
@@ -298,16 +336,17 @@ describe("Scaffold session title synchronization", () => {
       await vi.advanceTimersByTimeAsync(19);
       expect(rename).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(1);
-      expect(rename).toHaveBeenCalledTimes(3);
-
-      await vi.advanceTimersByTimeAsync(19);
-      expect(rename).toHaveBeenCalledTimes(3);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(rename).toHaveBeenCalledTimes(4);
+      expect(rename).toHaveBeenCalledTimes(2);
 
       await vi.advanceTimersByTimeAsync(1_000);
       await expect(runner.run(candidate)).resolves.toBeUndefined();
-      expect(rename).toHaveBeenCalledTimes(4);
+      expect(rename).toHaveBeenCalledTimes(2);
+
+      runner.reconcileAvailability([{ target, usable: false }]);
+      runner.reconcileAvailability([{ target, usable: true }]);
+      await vi.waitFor(() => expect(rename).toHaveBeenCalledTimes(3));
+      await expect(runner.run(candidate)).resolves.toBeUndefined();
+      expect(rename).toHaveBeenCalledTimes(3);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -374,6 +413,41 @@ describe("Scaffold session title synchronization", () => {
       runner.reconcileAvailability([{ target, usable: true }]);
       await vi.waitFor(() => expect(rename).toHaveBeenCalledTimes(2));
       await vi.advanceTimersByTimeAsync(10_000);
+      expect(rename).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pending retries when its coordinator is disposed", async () => {
+    vi.useFakeTimers();
+    const rename = vi.fn<(candidate: unknown) => Promise<void>>().mockRejectedValue(new Error());
+    const runner = createScaffoldSessionTitleSyncRunner(rename, { retryDelayMs: 10 });
+    const [candidate] = selectScaffoldSessionTitleSyncCandidates({
+      targets: [target],
+      projects: [project],
+      threads: [
+        thread({
+          id: "thread-titled",
+          title: "Fix Scaffold resume failures",
+          createdAt: "2026-07-30T00:00:02Z",
+        }),
+      ],
+    });
+    if (!candidate) throw new Error("expected title candidate");
+
+    try {
+      runner.reconcileAvailability([{ target, usable: true }]);
+      await expect(runner.run(candidate)).rejects.toThrow();
+      runner.dispose();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(runner.run(candidate)).resolves.toBeUndefined();
+      expect(rename).toHaveBeenCalledOnce();
+
+      runner.activate();
+      runner.reconcileAvailability([{ target, usable: true }]);
+      await expect(runner.run(candidate)).rejects.toThrow();
       expect(rename).toHaveBeenCalledTimes(2);
     } finally {
       vi.clearAllTimers();

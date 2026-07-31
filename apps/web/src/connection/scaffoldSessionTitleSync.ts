@@ -151,6 +151,8 @@ export interface ScaffoldSessionTitleSyncRunner {
   readonly reconcileAvailability: (
     availability: ReadonlyArray<ScaffoldSessionTitleSyncTargetAvailability>,
   ) => void;
+  readonly activate: () => void;
+  readonly dispose: () => void;
 }
 
 function isTerminalTitleSyncFailure(error: unknown): boolean {
@@ -161,9 +163,10 @@ function isTerminalTitleSyncFailure(error: unknown): boolean {
 
 /**
  * Coalesces concurrent renders in one UI runtime and backs off failed calls.
- * Transient failures retry automatically with bounded exponential backoff;
- * reconnecting resets the delay. Successful responses include the server's
- * manual-name no-op, while terminal lifecycle outcomes permanently stop work.
+ * Transient failures retry automatically with a bounded attempt budget;
+ * reconnecting starts a fresh budget. Successful responses include the
+ * server's manual-name no-op, while terminal lifecycle outcomes permanently
+ * stop work.
  */
 export function createScaffoldSessionTitleSyncRunner(
   rename: (candidate: ScaffoldSessionTitleSyncCandidate) => Promise<void>,
@@ -189,6 +192,7 @@ export function createScaffoldSessionTitleSyncRunner(
   const available = new Map<string, boolean>();
   const candidates = new Map<string, ScaffoldSessionTitleSyncCandidate>();
   const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let disposed = false;
 
   const clearRetryTimer = (key: string) => {
     const timer = retryTimers.get(key);
@@ -202,10 +206,12 @@ export function createScaffoldSessionTitleSyncRunner(
   };
 
   const scheduleRetry = (key: string, delayMs: number) => {
+    if (disposed) return;
     clearRetryTimer(key);
     const timer = setTimeout(() => {
       retryTimers.delete(key);
       retryNotBefore.delete(key);
+      if (disposed) return;
       const candidate = candidates.get(key);
       if (!candidate || completed.has(key) || stopped.has(key) || available.get(key) === false) {
         return;
@@ -221,6 +227,7 @@ export function createScaffoldSessionTitleSyncRunner(
   const reconcileAvailability = (
     availability: ReadonlyArray<ScaffoldSessionTitleSyncTargetAvailability>,
   ) => {
+    if (disposed) return;
     const nextKeys = new Set<string>();
     for (const entry of availability) {
       const key = sessionKey(entry.target);
@@ -250,6 +257,7 @@ export function createScaffoldSessionTitleSyncRunner(
   };
 
   function run(candidate: ScaffoldSessionTitleSyncCandidate): Promise<void> {
+    if (disposed) return Promise.resolve();
     const key = sessionKey(candidate);
     candidates.set(key, candidate);
     if (completed.has(key) || stopped.has(key)) return Promise.resolve();
@@ -258,7 +266,8 @@ export function createScaffoldSessionTitleSyncRunner(
     if (current) return current;
     if ((retryNotBefore.get(key) ?? 0) > now()) return Promise.resolve();
     const attempt = attempts.get(key) ?? 0;
-    const nextAttempt = Math.min(attempt + 1, maxAttemptsPerConnection);
+    if (attempt >= maxAttemptsPerConnection) return Promise.resolve();
+    const nextAttempt = attempt + 1;
     attempts.set(key, nextAttempt);
 
     const flight = rename(candidate)
@@ -276,9 +285,14 @@ export function createScaffoldSessionTitleSyncRunner(
           clearRetryTimer(key);
           throw error;
         }
-        const delayMs = retryDelayForAttempt(nextAttempt);
-        retryNotBefore.set(key, now() + delayMs);
-        scheduleRetry(key, delayMs);
+        if (!disposed && nextAttempt < maxAttemptsPerConnection) {
+          const delayMs = retryDelayForAttempt(nextAttempt);
+          retryNotBefore.set(key, now() + delayMs);
+          scheduleRetry(key, delayMs);
+        } else {
+          retryNotBefore.delete(key);
+          clearRetryTimer(key);
+        }
         throw error;
       })
       .finally(() => {
@@ -288,7 +302,20 @@ export function createScaffoldSessionTitleSyncRunner(
     return flight;
   }
 
-  return { run, reconcileAvailability };
+  const dispose = () => {
+    disposed = true;
+    for (const key of retryTimers.keys()) clearRetryTimer(key);
+    attempts.clear();
+    retryNotBefore.clear();
+    candidates.clear();
+    available.clear();
+  };
+
+  const activate = () => {
+    disposed = false;
+  };
+
+  return { run, reconcileAvailability, activate, dispose };
 }
 
 export type { EnvironmentProject as ScaffoldTitleSyncProject };

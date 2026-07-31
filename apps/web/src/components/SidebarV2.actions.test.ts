@@ -60,4 +60,13 @@ describe("Sidebar v2 thread lifecycle actions", () => {
       /const handleThreadContextMenu[\s\S]*?const supportsSettlement =\s*readEnvironmentSupportsSettlement\(thread\.environmentId\);/u,
     );
   });
+
+  it("uses the source-aware settlement capability for every selected thread", () => {
+    expect(sidebarV2Source).toMatch(
+      /const canSettleSelection = selectedThreads\.every\(\(thread\) =>\s*readEnvironmentSupportsSettlement\(thread\.environmentId\),?\s*\);/u,
+    );
+    expect(sidebarV2Source).toMatch(
+      /\.\.\.\(canSettleSelection \? \[\{ id: "settle", label: `Settle \(\$\{count\}\)` \}\] : \[\]\)/u,
+    );
+  });
 });

@@ -122,6 +122,7 @@ import {
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
   resolveAdjacentThreadId,
+  resolvePaginatedCurrentThread,
   resolveProvisionalDraftPresentation,
   resolveSettledTimestamp,
   resolveSidebarV2Status,
@@ -1741,24 +1742,20 @@ export default function SidebarV2() {
     lastSettledResetKeyRef.current = settledResetKey;
     setSettledVisibleCount(SETTLED_TAIL_INITIAL_COUNT);
   }
-  const visibleSettledThreads = useMemo(() => {
-    if (settledThreads.length <= settledVisibleCount) return settledThreads;
-    const visible = settledThreads.slice(0, settledVisibleCount);
-    // The open thread must never hide under "Show more": navigating into a
-    // deep settled thread (search, deep link) pulls its row into the visible
-    // tail so the highlight and the un-settle affordance stay reachable.
-    if (routeThreadKey !== null) {
-      const routeThread = settledThreads
-        .slice(settledVisibleCount)
-        .find(
-          (thread) =>
-            scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-        );
-      if (routeThread !== undefined) visible.push(routeThread);
-    }
-    return visible;
-  }, [routeThreadKey, settledThreads, settledVisibleCount]);
-  const hiddenSettledCount = settledThreads.length - visibleSettledThreads.length;
+  const {
+    visibleThreads: visibleSettledThreads,
+    pinnedCurrentThread: pinnedSettledThread,
+    hiddenThreadCount: hiddenSettledCount,
+  } = useMemo(
+    () =>
+      resolvePaginatedCurrentThread({
+        threads: settledThreads,
+        visibleCount: settledVisibleCount,
+        currentThreadKey: routeThreadKey,
+        getThreadKey: (thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+      }),
+    [routeThreadKey, settledThreads, settledVisibleCount],
+  );
   const showMoreSettled = useCallback(
     () => setSettledVisibleCount((count) => count + SETTLED_TAIL_PAGE_COUNT),
     [],
@@ -1795,8 +1792,13 @@ export default function SidebarV2() {
   }, [routeThreadKey, snoozedShelfExpanded, snoozedThreads]);
 
   const orderedThreads = useMemo(
-    () => [...activeThreads, ...visibleSnoozedThreads, ...renderedSettledThreads],
-    [activeThreads, visibleSnoozedThreads, renderedSettledThreads],
+    () => [
+      ...(pinnedSettledThread === null ? [] : [pinnedSettledThread]),
+      ...activeThreads,
+      ...visibleSnoozedThreads,
+      ...renderedSettledThreads,
+    ],
+    [activeThreads, pinnedSettledThread, visibleSnoozedThreads, renderedSettledThreads],
   );
   const orderedThreadKeys = useMemo(
     () =>
@@ -2136,6 +2138,9 @@ export default function SidebarV2() {
         const thread = threadByKeyRef.current.get(threadKey);
         return thread ? [thread] : [];
       });
+      const canSettleSelection = selectedThreads.every((thread) =>
+        readEnvironmentSupportsSettlement(thread.environmentId),
+      );
       const canSnoozeSelection = selectedThreads.every(
         (thread) =>
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true &&
@@ -2157,7 +2162,7 @@ export default function SidebarV2() {
       const clicked = await settlePromise(() =>
         api.contextMenu.show(
           [
-            { id: "settle", label: `Settle (${count})` },
+            ...(canSettleSelection ? [{ id: "settle", label: `Settle (${count})` }] : []),
             ...(canSnoozeSelection
               ? [
                   {
@@ -2852,6 +2857,23 @@ export default function SidebarV2() {
                     </li>
                   );
                 });
+                if (pinnedSettledThread !== null) {
+                  items.push(
+                    <li
+                      key="current-thread-header"
+                      data-thread-selection-safe
+                      className="list-none"
+                    >
+                      <div className="mb-1 mt-1 flex w-full items-center gap-2 px-2.5 text-left">
+                        <span className="text-xs font-medium text-sidebar-muted-foreground/65">
+                          Current
+                        </span>
+                        <span className="h-px flex-1 bg-sidebar-border/60" />
+                      </div>
+                    </li>,
+                    renderThreadRow(pinnedSettledThread, "settled"),
+                  );
+                }
                 items.push(
                   ...publicLocalFabricSessions.map((session) => {
                     const scaffoldLinks = sessionFabricScaffoldLinks(session);
