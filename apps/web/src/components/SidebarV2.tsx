@@ -1964,11 +1964,13 @@ export default function SidebarV2() {
   // must not dispatch a second settle that fails and toasts a false error.
   const settlingThreadKeysRef = useRef(new Set<string>());
   const unsettlingThreadKeysRef = useRef(new Set<string>());
-  // Parking the thread you're looking at (settle or snooze) moves you
-  // forward: the next remaining card (never a settled or snoozed row, never
-  // one leaving in the same batch), or a fresh draft in this project when it
-  // was the last active one. Callers snapshot the plan BEFORE the command
-  // mutates the partition; background parks never navigate (null plan).
+  // Snoozing the thread you're looking at moves you forward: the next
+  // remaining card (never a settled or snoozed row, never one leaving in the
+  // same batch), or a fresh draft in this project when it was the last active
+  // one. Settling is different: settled threads remain readable in the live
+  // sidebar and the current route must stay put while the row moves shelves.
+  // Callers snapshot the plan BEFORE snooze mutates the partition; background
+  // snoozes never navigate (null plan).
   const planForwardNavigation = useCallback(
     (threadKey: string, coParkingKeys?: ReadonlySet<string>): (() => void) | null => {
       if (routeThreadKeyRef.current !== threadKey) return null;
@@ -1995,13 +1997,11 @@ export default function SidebarV2() {
   );
 
   const attemptSettle = useCallback(
-    (threadRef: ScopedThreadRef, opts: { coSettlingKeys?: ReadonlySet<string> } = {}) => {
+    (threadRef: ScopedThreadRef) => {
       const threadKey = scopedThreadKey(threadRef);
       void runSidebarThreadActionOnce(settlingThreadKeysRef.current, threadKey, async () => {
-        const navigateAfterSettle = planForwardNavigation(threadKey, opts.coSettlingKeys);
         const result = await settleThread(threadRef);
         if (result._tag === "Failure") {
-          // Never navigate away from a thread that did not settle.
           if (!isAtomCommandInterrupted(result)) {
             const error = squashAtomCommandFailure(result);
             toastManager.add(
@@ -2014,14 +2014,9 @@ export default function SidebarV2() {
           }
           return;
         }
-        // Only move forward if the user is still on the settled thread —
-        // a navigation made during the await wins over ours.
-        if (routeThreadKeyRef.current === threadKey) {
-          navigateAfterSettle?.();
-        }
       });
     },
-    [planForwardNavigation, settleThread],
+    [settleThread],
   );
   const attemptUnsettle = useCallback(
     (threadRef: ScopedThreadRef) => {
@@ -2223,15 +2218,13 @@ export default function SidebarV2() {
         return;
       }
       if (clicked.value === "settle") {
-        // Post-settle navigation must skip threads settling in this same
-        // batch — they are all leaving the card block together. Rows that
-        // are already explicitly settled are skipped: nothing to do on a
-        // valid mixed selection.
-        const coSettlingKeys = new Set(threadKeys);
+        // Rows that are already explicitly settled are skipped: nothing to do
+        // on a valid mixed selection. Settling never changes the current
+        // route, including when the current row is part of this batch.
         for (const threadKey of threadKeys) {
           const thread = threadByKeyRef.current.get(threadKey);
           if (!thread || thread.settledOverride === "settled") continue;
-          attemptSettle(scopeThreadRef(thread.environmentId, thread.id), { coSettlingKeys });
+          attemptSettle(scopeThreadRef(thread.environmentId, thread.id));
         }
         clearSelection();
         return;
