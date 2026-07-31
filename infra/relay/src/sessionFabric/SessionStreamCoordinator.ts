@@ -72,6 +72,7 @@ import {
   settlePauseCompensationCommandId,
   settlePauseLifecycleAuthority,
   settlementEventIdFromCompensationCommand,
+  settlePauseOutcomeAdvancesLifecycle,
   shouldReplayCommand,
   snapshotProvesScaffoldWakeTarget,
 } from "./SessionStreamModel.ts";
@@ -1295,6 +1296,25 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
           }),
         );
         if (result.ok) {
+          if (!settlePauseOutcomeAdvancesLifecycle(result.response.outcome)) {
+            yield* sql
+              .exec(
+                "UPDATE session_settle_pauses SET status = 'failed', next_attempt_at = NULL, detail = 'Superseded Scaffold lifecycle epoch', updated_at = ? WHERE settlement_event_id = ?",
+                updatedAt,
+                row.settlement_event_id,
+              )
+              .pipe(Effect.asVoid);
+            yield* sql
+              .exec(
+                "DELETE FROM session_command_wakes WHERE status = 'joining_pause' AND environment_id = ? AND thread_id = ? AND scaffold_session_id = ?",
+                row.environment_id,
+                row.thread_id,
+                row.scaffold_session_id,
+              )
+              .pipe(Effect.asVoid);
+            yield* dispatchPendingCommands();
+            return;
+          }
           const lifecycleAuthority = settlePauseLifecycleAuthority({
             currentLifecycleEpoch: (yield* readMeta()).runner_generation,
             expectedLifecycleEpoch: row.expected_lifecycle_epoch,

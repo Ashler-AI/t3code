@@ -24,6 +24,7 @@ import {
   settlePauseCompensationCommandId,
   settlePauseLifecycleAuthority,
   settlePauseNeedsCompensatingWake,
+  settlePauseOutcomeAdvancesLifecycle,
   settlementEventIdFromCompensationCommand,
   snapshotProvesScaffoldWakeTarget,
   shouldReplayCommand,
@@ -283,6 +284,10 @@ describe("SessionStreamModel", () => {
   });
 
   it("advances durable authority through a settled pause before the next wake", () => {
+    expect(settlePauseOutcomeAdvancesLifecycle("paused")).toBe(true);
+    expect(settlePauseOutcomeAdvancesLifecycle("already_inactive")).toBe(true);
+    expect(settlePauseOutcomeAdvancesLifecycle("superseded")).toBe(false);
+
     const pausedEpoch = settlePauseLifecycleAuthority({
       currentLifecycleEpoch: 7,
       expectedLifecycleEpoch: 7,
