@@ -55,6 +55,16 @@ describe("Sidebar v2 thread lifecycle actions", () => {
     );
   });
 
+  it("keeps the current route open when a thread is settled", () => {
+    const attemptSettleSource = sidebarV2Source.slice(
+      sidebarV2Source.indexOf("const attemptSettle = useCallback"),
+      sidebarV2Source.indexOf("const attemptUnsettle = useCallback"),
+    );
+
+    expect(attemptSettleSource).not.toContain("planForwardNavigation");
+    expect(attemptSettleSource).not.toContain("router.navigate");
+  });
+
   it("uses the source-aware settlement capability when opening a thread context menu", () => {
     expect(sidebarV2Source).toMatch(
       /const handleThreadContextMenu[\s\S]*?const supportsSettlement =\s*readEnvironmentSupportsSettlement\(thread\.environmentId\);/u,
