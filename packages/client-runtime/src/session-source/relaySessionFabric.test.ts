@@ -2,6 +2,7 @@ import {
   CommandId,
   EnvironmentId,
   EventId,
+  MessageId,
   ProjectId,
   ProviderInstanceId,
   SessionFabricClientFrame,
@@ -250,6 +251,29 @@ const makeMetaUpdatedEvent = (sequence: number, title: string): OrchestrationEve
 
 const staleEvent = makeMetaUpdatedEvent(6, "Stale title");
 const liveEvent = makeMetaUpdatedEvent(8, "Shared title");
+
+const makeAssistantDeltaEvent = (sequence: number, text: string): OrchestrationEvent => ({
+  sequence,
+  eventId: EventId.make(`event-${sequence}`),
+  aggregateKind: "thread",
+  aggregateId: THREAD_ID,
+  occurredAt: NOW,
+  commandId: CommandId.make(`command-${sequence}`),
+  causationEventId: null,
+  correlationId: CommandId.make(`command-${sequence}`),
+  metadata: {},
+  type: "thread.message-sent",
+  payload: {
+    threadId: THREAD_ID,
+    messageId: MessageId.make("assistant-stream-1"),
+    role: "assistant",
+    text,
+    turnId: TURN_ID,
+    streaming: true,
+    createdAt: RUNNING_AT,
+    updatedAt: NOW,
+  },
+});
 const encodeServerFrame = Schema.encodeSync(Schema.fromJsonString(SessionFabricServerFrame));
 const decodeClientFrame = Schema.decodeUnknownSync(Schema.fromJsonString(SessionFabricClientFrame));
 
@@ -324,8 +348,15 @@ class TestRelay {
     Extract<SessionFabricClientFrameType, { type: "client.hello" }>["hello"]
   > = [];
   clientHelloCount = 0;
+  submittedCommandCount = 0;
+  acceptedCommandCount = 0;
+  committedCommandEventCount = 0;
   private readonly initialSnapshot: SessionFabricSnapshot;
   private readonly emitReplayEvent: boolean;
+  private readonly terminalReceipts = new Map<
+    CommandId,
+    Extract<SessionFabricServerFrameType, { type: "command.receipt" }>["receipt"]
+  >();
 
   constructor(initialSnapshot: SessionFabricSnapshot = snapshot, emitReplayEvent = true) {
     this.initialSnapshot = initialSnapshot;
@@ -363,17 +394,28 @@ class TestRelay {
       return;
     }
     if (frame.type !== "command.submit") return;
+    this.submittedCommandCount += 1;
+    const existing = this.terminalReceipts.get(frame.command.commandId);
+    if (existing !== undefined) {
+      socket.serverFrame({ type: "command.receipt", receipt: existing });
+      return;
+    }
+
+    this.acceptedCommandCount += 1;
+    const receipt = {
+      sessionId: SESSION_ID,
+      commandId: frame.command.commandId,
+      status: "accepted" as const,
+      resultSequence: 8,
+      detail: null,
+      updatedAt: NOW,
+    };
+    this.terminalReceipts.set(frame.command.commandId, receipt);
     socket.serverFrame({
       type: "command.receipt",
-      receipt: {
-        sessionId: SESSION_ID,
-        commandId: frame.command.commandId,
-        status: "accepted",
-        resultSequence: 8,
-        detail: null,
-        updatedAt: NOW,
-      },
+      receipt,
     });
+    this.committedCommandEventCount += 1;
     this.broadcast({
       type: "session.event",
       sequence: 2,
@@ -743,6 +785,137 @@ describe("Relay session fabric UI source", () => {
           );
         }
       }),
+  );
+
+  it.effect("hydrates two independent clients from the same authoritative snapshot", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      let firstFetchCount = 0;
+      let secondFetchCount = 0;
+      const first = makeSource(relay, "client-authoritative-first", (() => {
+        firstFetchCount += 1;
+        return Promise.resolve(Response.json(snapshot));
+      }) as typeof fetch);
+      const second = makeSource(relay, "client-authoritative-second", (() => {
+        secondFetchCount += 1;
+        return Promise.resolve(Response.json(snapshot));
+      }) as typeof fetch);
+
+      const [firstSnapshot, secondSnapshot] = yield* Effect.all([
+        first.authoritativeThreadSnapshot({} as never, THREAD_ID),
+        second.authoritativeThreadSnapshot({} as never, THREAD_ID),
+      ]);
+
+      expect(firstSnapshot).toEqual(Option.some(snapshot.thread));
+      expect(secondSnapshot).toEqual(Option.some(snapshot.thread));
+      expect([firstFetchCount, secondFetchCount]).toEqual([1, 1]);
+    }),
+  );
+
+  it.effect("streams ordered assistant token events to two independent clients", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      const first = makeSource(relay, "client-stream-first");
+      const second = makeSource(relay, "client-stream-second");
+      const subscribe = (source: ReturnType<typeof makeSource>) =>
+        source
+          .subscribeThread(() =>
+            Effect.succeed({
+              threadId: THREAD_ID,
+              afterSequence: 0,
+              requestCompletionMarker: true,
+            }),
+          )
+          .pipe(
+            Stream.take(4),
+            Stream.runCollect,
+            Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          );
+
+      const firstFrames = yield* Effect.forkChild(subscribe(first));
+      const secondFrames = yield* Effect.forkChild(subscribe(second));
+      yield* awaitSocketCount(relay, 2);
+      relay.sockets[0]!.open();
+      relay.sockets[1]!.open();
+      yield* awaitHelloCount(relay, 2);
+
+      for (const [fabricSequence, event] of [
+        [2, makeAssistantDeltaEvent(8, "Hello")],
+        [3, makeAssistantDeltaEvent(9, ", world")],
+      ] as const) {
+        relay.broadcast({
+          type: "session.event",
+          sequence: fabricSequence,
+          published: {
+            sessionId: SESSION_ID,
+            runnerId: "runner-1" as never,
+            runnerGeneration: 0,
+            event,
+          },
+        });
+      }
+
+      const [firstItems, secondItems] = yield* Effect.all([
+        Fiber.join(firstFrames),
+        Fiber.join(secondFrames),
+      ]);
+      for (const items of [Array.from(firstItems), Array.from(secondItems)]) {
+        expect(items.map((item) => item.kind)).toEqual([
+          "snapshot",
+          "synchronized",
+          "event",
+          "event",
+        ]);
+        expect(
+          items.flatMap((item) =>
+            item.kind === "event" && item.event.type === "thread.message-sent"
+              ? [item.event.payload.text]
+              : [],
+          ),
+        ).toEqual(["Hello", ", world"]);
+        expect(
+          items.flatMap((item) => (item.kind === "event" ? [item.event.sequence] : [])),
+        ).toEqual([8, 9]);
+      }
+    }),
+  );
+
+  it.effect("returns the original receipt when two clients submit the same command", () =>
+    Effect.gen(function* () {
+      const relay = new TestRelay();
+      const first = makeSource(relay, "client-command-first");
+      const second = makeSource(relay, "client-command-second");
+      const command = {
+        type: "thread.meta.update" as const,
+        commandId: CommandId.make("command-shared-idempotent"),
+        threadId: THREAD_ID,
+        title: "Shared idempotent title",
+      };
+
+      const firstDispatch = yield* Effect.forkChild(
+        first
+          .dispatch(command)
+          .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
+      );
+      yield* awaitSocketCount(relay, 1);
+      relay.sockets[0]!.open();
+      const firstReceipt = yield* Fiber.join(firstDispatch);
+
+      const secondDispatch = yield* Effect.forkChild(
+        second
+          .dispatch(command)
+          .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
+      );
+      yield* awaitSocketCount(relay, 2);
+      relay.sockets[1]!.open();
+      const secondReceipt = yield* Fiber.join(secondDispatch);
+
+      expect(firstReceipt).toEqual({ sequence: 8 });
+      expect(secondReceipt).toEqual(firstReceipt);
+      expect(relay.submittedCommandCount).toBe(2);
+      expect(relay.acceptedCommandCount).toBe(1);
+      expect(relay.committedCommandEventCount).toBe(1);
+    }),
   );
 
   it.live("projects live session completion into the shell stream", () =>

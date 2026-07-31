@@ -159,10 +159,16 @@ export function mapRemoteEnvironmentError(
         traceId: error.traceId,
       });
     case "RemoteEnvironmentAuthInvalidJsonError":
+      return new ConnectionTransientError({
+        reason: "remote-unavailable",
+        detail: error.message,
+      });
     case "RemoteEnvironmentAuthUndeclaredStatusError":
       return new ConnectionTransientError({
         reason: "remote-unavailable",
         detail: error.message,
+        httpStatus: error.status,
+        requestUrl: error.requestUrl,
       });
   }
 }

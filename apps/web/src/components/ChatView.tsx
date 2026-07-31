@@ -305,10 +305,13 @@ import { useComposerHandleContext } from "../composerHandleContext";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
 import {
   browserPendingTurnOutbox,
+  discardPendingTurn,
   drainPendingTurnOutbox,
   enqueuePendingTurn,
+  firstPendingTurnDrainFailure,
   listPendingTurnsForThread,
   reconcilePendingTurnForExistingThread,
+  subscribePendingTurnTerminal,
 } from "../connection/pendingTurnOutbox";
 import {
   browserScaffoldLifecycleActionStore,
@@ -1328,6 +1331,17 @@ function ChatViewContent(props: ChatViewProps) {
   const [optimisticUserMessages, setOptimisticUserMessages] = useState<ChatMessage[]>([]);
   const optimisticUserMessagesRef = useRef(optimisticUserMessages);
   optimisticUserMessagesRef.current = optimisticUserMessages;
+  useEffect(
+    () =>
+      subscribePendingTurnTerminal((entry) => {
+        setOptimisticUserMessages((existing) => {
+          const removed = existing.filter((message) => message.id === entry.messageId);
+          for (const message of removed) revokeUserMessagePreviewUrls(message);
+          return existing.filter((message) => message.id !== entry.messageId);
+        });
+      }),
+    [],
+  );
   const [localDraftErrorsByDraftId, setLocalDraftErrorsByDraftId] = useState<
     Record<string, LocalThreadErrorEntry>
   >({});
@@ -2884,7 +2898,10 @@ function ChatViewContent(props: ChatViewProps) {
         scaffoldPendingTurnMode === "drain"
           ? await listPendingTurnsForThread(browserPendingTurnOutbox, environmentId, threadId)
           : (await browserPendingTurnOutbox.list()).filter(
-              (entry) => entry.draftId === scaffoldDraftId && entry.threadId === threadId,
+              (entry) =>
+                entry.draftId === scaffoldDraftId &&
+                entry.threadId === threadId &&
+                entry.status !== "terminal",
             );
       if (cancelled) return;
       if (pending.length === 0) {
@@ -2951,8 +2968,16 @@ function ChatViewContent(props: ChatViewProps) {
         },
       });
       if (cancelled) return;
-      const failure = results.find((result) => result.outcome === "failed");
+      const failure = firstPendingTurnDrainFailure(results);
       if (failure) {
+        if (failure.outcome === "terminal") {
+          await discardPendingTurn(browserPendingTurnOutbox, failure.entry.idempotencyKey);
+          setOptimisticUserMessages((existing) => {
+            const removed = existing.filter((message) => message.id === failure.entry.messageId);
+            for (const message of removed) revokeUserMessagePreviewUrls(message);
+            return existing.filter((message) => message.id !== failure.entry.messageId);
+          });
+        }
         resetLocalDispatch();
         setThreadError(threadId, failure.error);
       }
@@ -5344,11 +5369,16 @@ function ChatViewContent(props: ChatViewProps) {
           turnStartSucceeded = results.some(
             (result) => result.outcome === "sent" || result.outcome === "acknowledged",
           );
-          const drainFailure = results.find((result) => result.outcome === "failed");
-          if (drainFailure)
+          const drainFailure = firstPendingTurnDrainFailure(results);
+          if (drainFailure) {
             pendingTurnPersistenceError = new Error(
               drainFailure.error ?? "Failed to send message.",
             );
+            if (drainFailure.outcome === "terminal") {
+              await discardPendingTurn(browserPendingTurnOutbox, drainFailure.entry.idempotencyKey);
+              messagePersistedToOutbox = false;
+            }
+          }
         }
       }
     }

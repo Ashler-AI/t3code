@@ -104,6 +104,21 @@ describe("Scaffold draft controls", () => {
     expect(chatViewSource).toContain("draftId: effectiveScaffoldSession?.draftId ?? draftId");
   });
 
+  it("removes terminally rejected messages from the outbox and optimistic transcript", () => {
+    expect(chatViewSource).toMatch(
+      /subscribePendingTurnTerminal\(\(entry\) => \{[\s\S]*?setOptimisticUserMessages\([\s\S]*?message\.id !== entry\.messageId/u,
+    );
+    expect(chatViewSource).toMatch(
+      /const drainFailure = firstPendingTurnDrainFailure\(results\);[\s\S]*?drainFailure\.outcome === "terminal"[\s\S]*?discardPendingTurn\([\s\S]*?messagePersistedToOutbox = false;/u,
+    );
+    expect(chatViewSource).toMatch(
+      /const failure = firstPendingTurnDrainFailure\(results\);[\s\S]*?failure\.outcome === "terminal"[\s\S]*?discardPendingTurn\([\s\S]*?setOptimisticUserMessages\([\s\S]*?message\.id !== failure\.entry\.messageId/u,
+    );
+    expect(chatViewSource).toMatch(
+      /entry\.draftId === scaffoldDraftId[\s\S]*?entry\.status !== "terminal"/u,
+    );
+  });
+
   it("never prepares a local worktree for a Scaffold-backed first turn", () => {
     expect(
       shouldPrepareWorktreeForFirstMessage({

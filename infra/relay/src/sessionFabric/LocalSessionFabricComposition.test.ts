@@ -520,7 +520,7 @@ describe("local session fabric composition", () => {
         expect(accepted).toEqual({ sequence: 3 });
 
         const duplicateFiber = yield* Effect.forkChild(
-          actorA
+          actorB
             .dispatch(commandA)
             .pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor)),
         );

@@ -67,7 +67,6 @@ import {
   SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
   SESSION_FABRIC_PERMISSION_CLOSE_CODE,
   settledEventCanQueueScaffoldPause,
-  settlePauseCanResettle,
   settlePauseNeedsCompensatingWake,
   settlePauseCompensationCommandId,
   settlePauseLifecycleAuthority,
@@ -99,6 +98,7 @@ interface MetaRow {
   readonly session_id: string | null;
   readonly runner_id: string | null;
   readonly runner_generation: number;
+  readonly scaffold_lifecycle_authority_epoch: number | null;
   readonly runner_state: string;
   readonly snapshot_json: string | null;
   readonly snapshot_sequence: number;
@@ -370,6 +370,26 @@ export function legacyWakeIdentityFromStoredSnapshot(input: {
   }
 }
 
+export const LEGACY_WAKE_IDENTITY_COLUMN_SQL = {
+  environment_id: "ALTER TABLE session_command_wakes ADD COLUMN environment_id TEXT",
+  thread_id: "ALTER TABLE session_command_wakes ADD COLUMN thread_id TEXT",
+} as const;
+
+export const LEGACY_WAKE_IDENTITY_SELECT_SQL =
+  "SELECT command_id, scaffold_session_id FROM session_command_wakes WHERE environment_id IS NULL OR thread_id IS NULL";
+
+export const LEGACY_WAKE_IDENTITY_UPDATE_SQL =
+  "UPDATE session_command_wakes SET environment_id = ?, thread_id = ? WHERE command_id = ? AND (environment_id IS NULL OR thread_id IS NULL)";
+
+export const DELETE_REPLACEABLE_SETTLE_PAUSE_SQL =
+  "DELETE FROM session_settle_pauses WHERE fabric_session_id = ? AND expected_lifecycle_epoch = ? AND status IN ('cancelled', 'failed')";
+
+export const ADVANCE_SETTLE_PAUSE_LIFECYCLE_AUTHORITY_SQL =
+  "UPDATE session_meta SET runner_generation = ?, scaffold_lifecycle_authority_epoch = ?, runner_state = 'offline', snapshot_json = ? WHERE id = 1 AND runner_generation = ?";
+
+export const ADVANCE_SNAPSHOT_LIFECYCLE_AUTHORITY_SQL =
+  "UPDATE session_meta SET snapshot_json = ?, snapshot_sequence = ?, scaffold_lifecycle_authority_epoch = CASE WHEN ? IS NULL THEN scaffold_lifecycle_authority_epoch ELSE ? END WHERE id = 1";
+
 export function scaffoldWakeIdentityMatches(input: {
   readonly wakeEnvironmentId: string | null;
   readonly wakeThreadId: string | null;
@@ -530,7 +550,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
 
       yield* sql
         .exec(
-          "CREATE TABLE IF NOT EXISTS session_meta (id INTEGER PRIMARY KEY CHECK (id = 1), session_id TEXT, runner_id TEXT, runner_generation INTEGER NOT NULL DEFAULT 0, runner_state TEXT NOT NULL DEFAULT 'offline', snapshot_json TEXT, snapshot_sequence INTEGER NOT NULL DEFAULT 0, environment_kind TEXT, environment_id TEXT, thread_id TEXT, actor_id TEXT)",
+          "CREATE TABLE IF NOT EXISTS session_meta (id INTEGER PRIMARY KEY CHECK (id = 1), session_id TEXT, runner_id TEXT, runner_generation INTEGER NOT NULL DEFAULT 0, scaffold_lifecycle_authority_epoch INTEGER, runner_state TEXT NOT NULL DEFAULT 'offline', snapshot_json TEXT, snapshot_sequence INTEGER NOT NULL DEFAULT 0, environment_kind TEXT, environment_id TEXT, thread_id TEXT, actor_id TEXT)",
         )
         .pipe(Effect.asVoid);
       const metaColumns = yield* sql.exec<{ readonly name: string }>(
@@ -539,6 +559,13 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
       const existingMetaColumns = yield* metaColumns.toArray();
       if (!existingMetaColumns.some((column) => column.name === "runner_id")) {
         yield* sql.exec("ALTER TABLE session_meta ADD COLUMN runner_id TEXT").pipe(Effect.asVoid);
+      }
+      if (
+        !existingMetaColumns.some((column) => column.name === "scaffold_lifecycle_authority_epoch")
+      ) {
+        yield* sql
+          .exec("ALTER TABLE session_meta ADD COLUMN scaffold_lifecycle_authority_epoch INTEGER")
+          .pipe(Effect.asVoid);
       }
       for (const column of [
         "environment_kind",
@@ -571,9 +598,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
       const existingWakeColumns = yield* wakeColumns.toArray();
       for (const column of ["environment_id", "thread_id"] as const) {
         if (!existingWakeColumns.some((candidate) => candidate.name === column)) {
-          yield* sql
-            .exec(`ALTER TABLE session_command_wakes ADD COLUMN ${column} TEXT`)
-            .pipe(Effect.asVoid);
+          yield* sql.exec(LEGACY_WAKE_IDENTITY_COLUMN_SQL[column]).pipe(Effect.asVoid);
         }
       }
       yield* sql
@@ -607,15 +632,18 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
           "INSERT OR IGNORE INTO session_meta (id, runner_generation, runner_state, snapshot_sequence) VALUES (1, 0, 'offline', 0)",
         )
         .pipe(Effect.asVoid);
+      yield* sql
+        .exec(
+          "UPDATE session_meta SET scaffold_lifecycle_authority_epoch = runner_generation WHERE scaffold_lifecycle_authority_epoch IS NULL",
+        )
+        .pipe(Effect.asVoid);
       const storedSnapshot = yield* sql.exec<{ readonly snapshot_json: string | null }>(
         "SELECT snapshot_json FROM session_meta WHERE id = 1",
       );
       const legacyWakes = yield* sql.exec<{
         readonly command_id: string;
         readonly scaffold_session_id: string;
-      }>(
-        "SELECT command_id, scaffold_session_id FROM session_command_wakes WHERE environment_id IS NULL OR thread_id IS NULL",
-      );
+      }>(LEGACY_WAKE_IDENTITY_SELECT_SQL);
       const snapshotJson = (yield* storedSnapshot.one()).snapshot_json;
       for (const wake of yield* legacyWakes.toArray()) {
         const identity = legacyWakeIdentityFromStoredSnapshot({
@@ -625,7 +653,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
         if (identity === null) continue;
         yield* sql
           .exec(
-            "UPDATE session_command_wakes SET environment_id = ?, thread_id = ? WHERE command_id = ? AND (environment_id IS NULL OR thread_id IS NULL)",
+            LEGACY_WAKE_IDENTITY_UPDATE_SQL,
             identity.environmentId,
             identity.threadId,
             wake.command_id,
@@ -635,7 +663,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
 
       const readMeta = Effect.fn("session_fabric.read_meta")(function* () {
         const cursor = yield* sql.exec<MetaRow>(
-          "SELECT session_id, runner_id, runner_generation, runner_state, snapshot_json, snapshot_sequence, environment_kind, environment_id, thread_id, actor_id FROM session_meta WHERE id = 1",
+          "SELECT session_id, runner_id, runner_generation, scaffold_lifecycle_authority_epoch, runner_state, snapshot_json, snapshot_sequence, environment_kind, environment_id, thread_id, actor_id FROM session_meta WHERE id = 1",
         );
         return yield* cursor.one();
       });
@@ -1315,8 +1343,10 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
             yield* dispatchPendingCommands();
             return;
           }
+          const pauseMeta = yield* readMeta();
           const lifecycleAuthority = settlePauseLifecycleAuthority({
-            currentLifecycleEpoch: (yield* readMeta()).runner_generation,
+            currentLifecycleEpoch:
+              pauseMeta.scaffold_lifecycle_authority_epoch ?? pauseMeta.runner_generation,
             expectedLifecycleEpoch: row.expected_lifecycle_epoch,
             targetLifecycleEpoch: result.response.targetLifecycleEpoch,
           });
@@ -1354,7 +1384,8 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
           });
           state.raw.storage.transactionSync(() => {
             sql.raw.exec(
-              "UPDATE session_meta SET runner_generation = ?, runner_state = 'offline', snapshot_json = ? WHERE id = 1 AND runner_generation = ?",
+              ADVANCE_SETTLE_PAUSE_LIFECYCLE_AUTHORITY_SQL,
+              lifecycleAuthority,
               lifecycleAuthority,
               offlineSnapshot,
               row.expected_lifecycle_epoch,
@@ -1796,20 +1827,6 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
             runnerGeneration: meta.runner_generation,
           });
         const pauseDueAt = yield* Clock.currentTimeMillis;
-        const existingEpochPauseCursor =
-          queuesSettlePause && snapshot !== null
-            ? yield* sql.exec<{
-                readonly settlement_event_id: string;
-                readonly status: string;
-              }>(
-                "SELECT settlement_event_id, status FROM session_settle_pauses WHERE fabric_session_id = ? AND expected_lifecycle_epoch = ? LIMIT 1",
-                published.sessionId,
-                snapshot.session.location.scaffoldLifecycleEpoch ?? -1,
-              )
-            : null;
-        const existingEpochPause =
-          existingEpochPauseCursor === null ? [] : yield* existingEpochPauseCursor.toArray();
-        const replaceablePause = existingEpochPause.at(0);
         const sequence = state.raw.storage.transactionSync(() => {
           sql.raw.exec(
             "INSERT INTO session_events (event_id, occurred_at, payload_json) VALUES (?, ?, ?)",
@@ -1833,12 +1850,14 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
             snapshot.session.location.scaffoldLifecycleEpoch !== null &&
             snapshot.session.location.scaffoldLifecycleEpoch !== undefined
           ) {
-            if (replaceablePause !== undefined && settlePauseCanResettle(replaceablePause.status)) {
-              sql.raw.exec(
-                "DELETE FROM session_settle_pauses WHERE settlement_event_id = ? AND status IN ('cancelled', 'failed')",
-                replaceablePause.settlement_event_id,
-              );
-            }
+            // The epoch uniqueness fence prevents concurrent pauses, but a terminal failed or
+            // cancelled request must not permanently consume the epoch. Delete only those
+            // terminal rows in the same transaction as the replacement insert.
+            sql.raw.exec(
+              DELETE_REPLACEABLE_SETTLE_PAUSE_SQL,
+              published.sessionId,
+              snapshot.session.location.scaffoldLifecycleEpoch,
+            );
             sql.raw.exec(
               "INSERT OR IGNORE INTO session_settle_pauses (settlement_event_id, fabric_session_id, environment_id, thread_id, scaffold_session_id, expected_lifecycle_epoch, target_lifecycle_epoch, status, attempt_count, next_attempt_at, detail, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, 'pending', 0, ?, NULL, ?)",
               published.event.eventId,
@@ -1972,9 +1991,11 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
           const encodedSnapshot = encodeSnapshot(normalizedSnapshot);
           yield* sql
             .exec(
-              "UPDATE session_meta SET snapshot_json = ?, snapshot_sequence = ? WHERE id = 1",
+              ADVANCE_SNAPSHOT_LIFECYCLE_AUTHORITY_SQL,
               encodedSnapshot,
               published.snapshot.session.cursor.snapshotSequence,
+              normalizedSnapshot.session.location.scaffoldLifecycleEpoch,
+              normalizedSnapshot.session.location.scaffoldLifecycleEpoch,
             )
             .pipe(Effect.asVoid);
           const wakeCursor = yield* sql.exec<WakeRow>(
@@ -2143,21 +2164,24 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObject<S
           scaffoldWakeController !== null &&
           snapshot !== null &&
           snapshot.session.location.scaffoldSessionId !== null &&
-          meta.runner_generation === scaffoldWakeController.scaffoldLifecycleEpoch + 1
+          (meta.scaffold_lifecycle_authority_epoch ?? meta.runner_generation) ===
+            scaffoldWakeController.scaffoldLifecycleEpoch + 1
             ? yield* readSettlePauseWakeProof({
                 fabricSessionId: command.sessionId,
                 environmentId: snapshot.session.location.environmentId,
                 threadId: snapshot.session.location.threadId,
                 scaffoldSessionId: snapshot.session.location.scaffoldSessionId,
                 expectedLifecycleEpoch: scaffoldWakeController.scaffoldLifecycleEpoch,
-                targetLifecycleEpoch: meta.runner_generation,
+                targetLifecycleEpoch:
+                  meta.scaffold_lifecycle_authority_epoch ?? meta.runner_generation,
               })
             : undefined;
         const scaffoldWakeExpectedEpoch =
           scaffoldWakeController === null
             ? null
             : scaffoldWakeExpectedLifecycleEpoch({
-                durableLifecycleEpoch: meta.runner_generation,
+                durableLifecycleEpoch:
+                  meta.scaffold_lifecycle_authority_epoch ?? meta.runner_generation,
                 controllerLifecycleEpoch: scaffoldWakeController.scaffoldLifecycleEpoch,
                 snapshotLifecycleEpoch: snapshot?.session.location.scaffoldLifecycleEpoch,
                 settlePauseProof:

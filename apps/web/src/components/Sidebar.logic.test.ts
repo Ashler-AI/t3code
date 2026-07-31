@@ -16,6 +16,7 @@ import {
   orderItemsByPreferredIds,
   resolveProjectStatusIndicator,
   resolveProvisionalDraftPresentation,
+  resolvePaginatedCurrentThread,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveSidebarV2Status,
@@ -129,6 +130,40 @@ describe("selectProvisionalDraftRows", () => {
     expect(resolveProvisionalDraftPresentation(pendingRow)).toEqual({
       statusLabel: "Local session is starting",
       detail: "Preparing worktree...",
+    });
+  });
+});
+
+describe("resolvePaginatedCurrentThread", () => {
+  const threads = ["settled-1", "settled-2", "settled-3", "settled-4"];
+
+  it("keeps the paginated rows stable when the current thread is outside the page", () => {
+    const presentation = resolvePaginatedCurrentThread({
+      threads,
+      visibleCount: 2,
+      currentThreadKey: "settled-4",
+      getThreadKey: (thread) => thread,
+    });
+
+    expect(presentation).toEqual({
+      visibleThreads: ["settled-1", "settled-2"],
+      pinnedCurrentThread: "settled-4",
+      hiddenThreadCount: 1,
+    });
+  });
+
+  it("does not duplicate a current thread that is already in the page", () => {
+    const presentation = resolvePaginatedCurrentThread({
+      threads,
+      visibleCount: 2,
+      currentThreadKey: "settled-2",
+      getThreadKey: (thread) => thread,
+    });
+
+    expect(presentation).toEqual({
+      visibleThreads: ["settled-1", "settled-2"],
+      pinnedCurrentThread: null,
+      hiddenThreadCount: 2,
     });
   });
 });
