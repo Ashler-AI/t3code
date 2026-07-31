@@ -21,6 +21,9 @@ describe("session fabric proof deployment", () => {
       expect(stack).toContain("state: Cloudflare.state()");
       expect(stack).not.toContain("state: Alchemy.localState()");
       expect(worker).toContain('name: "ashler-session-fabric-proof"');
+      expect(worker).toContain("SESSION_FABRIC_DEPLOYMENT_MARKER:");
+      expect(worker).toContain("process.env.SESSION_FABRIC_DEPLOYMENT_MARKER");
+      expect(worker).not.toContain("SESSION_FABRIC_ALLOWED_ORIGINS: process.env");
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 

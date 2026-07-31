@@ -89,6 +89,13 @@ export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi
       port: 8788,
       strictPort: true,
     },
+    env: {
+      // This intentionally remains plain text so deployment verification can
+      // bind an active Cloudflare version to one CI run without inspecting any
+      // secret runtime configuration.
+      SESSION_FABRIC_DEPLOYMENT_MARKER:
+        process.env.SESSION_FABRIC_DEPLOYMENT_MARKER?.trim() || "local",
+    },
     observability: { enabled: true },
   },
   Effect.gen(function* () {
