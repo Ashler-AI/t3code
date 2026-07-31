@@ -3,10 +3,13 @@ import * as AcpError from "./errors.ts";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Ref from "effect/Ref";
+import * as Sink from "effect/Sink";
+import * as Stdio from "effect/Stdio";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { it, assert } from "@effect/vitest";
@@ -49,6 +52,9 @@ const decodeExtResponse = Schema.decodeEffect(Schema.fromJsonString(ExtResponse)
 const decodeRequestPermissionResponse = Schema.decodeEffect(
   Schema.fromJsonString(RequestPermissionResponse),
 );
+const decodeUnknownJsonRecord = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+);
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 const encoder = new TextEncoder();
 const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
@@ -89,6 +95,18 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
 
         yield* transport.notify("session/cancel", { sessionId: "session-1" });
         const outbound = yield* Queue.take(output);
+        const wireNotification = decodeUnknownJsonRecord(
+          typeof outbound === "string" ? outbound : new TextDecoder().decode(outbound),
+        );
+        assert.deepEqual(wireNotification, {
+          jsonrpc: "2.0",
+          method: "session/cancel",
+          params: {
+            sessionId: "session-1",
+          },
+        });
+        assert.isFalse(Object.hasOwn(wireNotification, "id"));
+        assert.isFalse(Object.hasOwn(wireNotification, "headers"));
         assert.deepEqual(yield* decodeSessionCancelNotification(outbound), {
           jsonrpc: "2.0",
           method: "session/cancel",
@@ -133,6 +151,184 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
         assert.equal(update?._tag, "SessionUpdate");
         assert.equal(completion?._tag, "ElicitationComplete");
       }),
+  );
+
+  it.effect("flush waits until previously enqueued notifications are written", () =>
+    Effect.gen(function* () {
+      const firstWriteStarted = yield* Deferred.make<void>();
+      const releaseFirstWrite = yield* Deferred.make<void>();
+      const secondWriteStarted = yield* Deferred.make<void>();
+      const releaseSecondWrite = yield* Deferred.make<void>();
+      const writeCount = yield* Ref.make(0);
+      const output = yield* Ref.make<Array<string>>([]);
+      const stdio = Stdio.make({
+        args: Effect.succeed([]),
+        stdin: Stream.never,
+        stdout: () =>
+          Sink.forEach((data: string | Uint8Array) =>
+            Ref.getAndUpdate(writeCount, (current) => current + 1).pipe(
+              Effect.flatMap((index) =>
+                index === 0
+                  ? Deferred.succeed(firstWriteStarted, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseFirstWrite)),
+                    )
+                  : Deferred.succeed(secondWriteStarted, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseSecondWrite)),
+                    ),
+              ),
+              Effect.andThen(
+                Ref.update(output, (current) => [
+                  ...current,
+                  typeof data === "string" ? data : new TextDecoder().decode(data),
+                ]),
+              ),
+            ),
+          ),
+        stderr: () => Sink.drain,
+      });
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+
+      yield* transport.notify("session/cancel", { sessionId: "session-1" });
+      yield* Deferred.await(firstWriteStarted);
+      yield* transport.notify("session/cancel", { sessionId: "session-2" });
+      const flushFiber = yield* transport.flush.pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* Deferred.succeed(releaseFirstWrite, undefined);
+      yield* Deferred.await(secondWriteStarted);
+      yield* Effect.yieldNow;
+      assert.isUndefined(flushFiber.pollUnsafe());
+
+      yield* Deferred.succeed(releaseSecondWrite, undefined);
+      yield* Fiber.join(flushFiber).pipe(Effect.timeout("2 seconds"));
+      const outbound = yield* Ref.get(output);
+      const decoded = yield* Effect.forEach(outbound, (message) =>
+        decodeSessionCancelNotification(message),
+      );
+      assert.deepEqual(
+        decoded.map((message) => message.params.sessionId),
+        ["session-1", "session-2"],
+      );
+    }),
+  );
+
+  it.effect("acknowledges a matching request only after it enters the outgoing queue", () =>
+    Effect.gen(function* () {
+      const { stdio, output } = yield* makeInMemoryStdio();
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+      const registration = yield* transport.registerRequestEnqueue("session/prompt");
+      const enqueueFiber = yield* registration.awaitEnqueued.pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+
+      assert.isUndefined(enqueueFiber.pollUnsafe());
+      yield* transport.clientProtocol.send(0, {
+        _tag: "Request",
+        id: "prompt-1",
+        tag: "session/prompt",
+        payload: { sessionId: "session-1", prompt: [] },
+        headers: [],
+      });
+
+      yield* Fiber.join(enqueueFiber);
+      assert.isDefined(enqueueFiber.pollUnsafe());
+      const outbound = yield* Queue.take(output);
+      const decoded = decodeUnknownJsonRecord(
+        typeof outbound === "string" ? outbound : new TextDecoder().decode(outbound),
+      );
+      assert.equal(decoded.method, "session/prompt");
+      yield* registration.release;
+    }),
+  );
+
+  it.effect("flush fails when the outgoing writer fails", () =>
+    Effect.gen(function* () {
+      const writerCause = new Error("write failed");
+      const writerFailure = PlatformError.systemError({
+        _tag: "Unknown",
+        module: "effect-acp-test",
+        method: "stdout",
+        cause: writerCause,
+      });
+      const stdio = Stdio.make({
+        args: Effect.succeed([]),
+        stdin: Stream.never,
+        stdout: () => Sink.forEach(() => Effect.fail(writerFailure)),
+        stderr: () => Sink.drain,
+      });
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+
+      yield* transport.notify("session/cancel", { sessionId: "session-1" });
+      const error = yield* transport.flush.pipe(Effect.flip, Effect.timeout("2 seconds"));
+
+      assert.instanceOf(error, AcpError.AcpTransportError);
+      assert.equal(error.detail, "Failed to write an ACP protocol message.");
+      assert.instanceOf(error.cause, Error);
+      assert.equal(error.cause.message, "ACP protocol stdout writer failed.");
+      assert.strictEqual(error.cause.cause, writerFailure);
+    }),
+  );
+
+  it.effect("flush preserves FIFO order for all prior messages", () =>
+    Effect.gen(function* () {
+      const output = yield* Ref.make<Array<string>>([]);
+      const stdio = Stdio.make({
+        args: Effect.succeed([]),
+        stdin: Stream.never,
+        stdout: () =>
+          Sink.forEach((data: string | Uint8Array) =>
+            Ref.update(output, (current) => [
+              ...current,
+              typeof data === "string" ? data : new TextDecoder().decode(data),
+            ]),
+          ),
+        stderr: () => Sink.drain,
+      });
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+
+      yield* transport.notify("session/cancel", { sessionId: "session-1" });
+      yield* transport.notify("session/cancel", { sessionId: "session-2" });
+      yield* transport.flush.pipe(Effect.timeout("2 seconds"));
+
+      const outbound = yield* Ref.get(output);
+      const decoded = yield* Effect.forEach(outbound, (message) =>
+        decodeSessionCancelNotification(message),
+      );
+      assert.deepEqual(
+        decoded.map((message) => message.params.sessionId),
+        ["session-1", "session-2"],
+      );
+    }),
+  );
+
+  it.effect("flush completes when no messages are pending", () =>
+    Effect.gen(function* () {
+      const output = yield* Ref.make<Array<string | Uint8Array>>([]);
+      const stdio = Stdio.make({
+        args: Effect.succeed([]),
+        stdin: Stream.never,
+        stdout: () => Sink.forEach((data) => Ref.update(output, (current) => [...current, data])),
+        stderr: () => Sink.drain,
+      });
+      const transport = yield* AcpProtocol.makeAcpPatchedProtocol({
+        stdio,
+        serverRequestMethods: new Set(),
+      });
+
+      yield* transport.flush.pipe(Effect.timeout("2 seconds"));
+      assert.deepEqual(yield* Ref.get(output), []);
+    }),
   );
 
   it.effect("keeps invalid core notification values only in the schema cause", () =>
@@ -199,20 +395,18 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
           direction: "outgoing",
           stage: "decoded",
           payload: {
-            _tag: "Request",
-            id: "",
-            tag: "session/cancel",
-            payload: {
+            jsonrpc: "2.0",
+            method: "session/cancel",
+            params: {
               sessionId: "session-1",
             },
-            headers: [],
           },
         },
         {
           direction: "outgoing",
           stage: "raw",
           payload:
-            '{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"session-1"},"id":"","headers":[]}\n',
+            '{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"session-1"}}\n',
         },
       ]);
     }),
@@ -262,7 +456,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       assert.instanceOf(bigintError, AcpError.AcpProtocolParseError);
       assert.equal(bigintError.operation, "encode-message");
       assert.equal(bigintError.method, "x/test");
-      assert.instanceOf(bigintError.cause, TypeError);
+      assert.instanceOf(bigintError.cause, Schema.SchemaError);
       assert.equal(
         bigintError.message,
         "ACP protocol operation 'encode-message' failed for method 'x/test'.",
@@ -274,7 +468,7 @@ it.layer(NodeServices.layer)("effect-acp protocol", (it) => {
       assert.instanceOf(circularError, AcpError.AcpProtocolParseError);
       assert.equal(circularError.operation, "encode-message");
       assert.equal(circularError.method, "x/test");
-      assert.instanceOf(circularError.cause, TypeError);
+      assert.instanceOf(circularError.cause, Schema.SchemaError);
 
       const requestError = yield* transport.request("x/request", 1n).pipe(
         Effect.match({

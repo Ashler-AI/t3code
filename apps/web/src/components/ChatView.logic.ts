@@ -147,6 +147,20 @@ export function buildThreadTurnInterruptInput(thread: Pick<Thread, "id" | "sessi
   };
 }
 
+export function shouldShowComposerStop(
+  thread: Pick<Thread, "latestTurn" | "session"> | null | undefined,
+): boolean {
+  const session = thread?.session;
+  if (session?.status !== "running") return false;
+
+  const latestTurn = thread?.latestTurn;
+  return (
+    latestTurn == null ||
+    latestTurn.turnId !== session.activeTurnId ||
+    latestTurn.state === "running"
+  );
+}
+
 export function reconcileMountedTerminalThreadIds(input: {
   currentThreadIds: ReadonlyArray<string>;
   openThreadIds: ReadonlyArray<string>;

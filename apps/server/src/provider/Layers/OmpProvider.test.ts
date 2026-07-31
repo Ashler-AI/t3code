@@ -223,6 +223,16 @@ describe("OmpProvider", () => {
       const snapshot = yield* checkOmpProviderStatus(decodeOmpSettings({ binaryPath }));
 
       expect(snapshot.status).toBe("ready");
+      expect(snapshot.slashCommands).toEqual([
+        {
+          name: "handoff",
+          description: "Hand work to another environment.",
+        },
+        {
+          name: "skill:review",
+          description: "Review the current changes.",
+        },
+      ]);
       expect(snapshot.skills).toEqual([
         {
           name: "handoff",

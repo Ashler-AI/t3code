@@ -6,6 +6,7 @@ import {
   applyOmpAdvisorSelection,
   assertManagedScaffoldOmpModelAllowed,
   buildOmpSkillsFromAvailableCommands,
+  buildOmpSlashCommandsFromAvailableCommands,
   buildOmpAcpSpawnInput,
   filterManagedScaffoldOmpModelSlugs,
   currentOmpModelIdFromSessionSetup,
@@ -40,6 +41,19 @@ describe("OMP command skills", () => {
         scope: "omp",
         enabled: true,
       },
+    ]);
+  });
+
+  it("maps ACP commands to the native slash-command palette", () => {
+    expect(
+      buildOmpSlashCommandsFromAvailableCommands([
+        { name: " advisor ", description: " Inspect advisor state. ", input: { hint: "status" } },
+        { name: "ADVISOR", description: "Latest advisor command." },
+        { name: " goal ", description: " Manage the active goal. " },
+      ]),
+    ).toEqual([
+      { name: "ADVISOR", description: "Latest advisor command." },
+      { name: "goal", description: "Manage the active goal." },
     ]);
   });
 

@@ -1,6 +1,7 @@
 import {
   type OmpSettings,
   type ProviderOptionSelection,
+  type ServerProviderSlashCommand,
   type ServerProviderSkill,
 } from "@t3tools/contracts";
 import {
@@ -92,6 +93,24 @@ export function buildOmpSkillsFromAvailableCommands(
     });
   }
   return [...skills.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export function buildOmpSlashCommandsFromAvailableCommands(
+  commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+): ReadonlyArray<ServerProviderSlashCommand> {
+  const slashCommands = new Map<string, ServerProviderSlashCommand>();
+  for (const command of commands) {
+    const name = command.name.trim();
+    if (!name) continue;
+    const description = command.description.trim();
+    const hint = command.input?.hint.trim();
+    slashCommands.set(name.toLowerCase(), {
+      name,
+      ...(description ? { description } : {}),
+      ...(hint ? { input: { hint } } : {}),
+    });
+  }
+  return [...slashCommands.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 
 /** Convert UI-only skill/session chips into instructions OMP can execute safely. */

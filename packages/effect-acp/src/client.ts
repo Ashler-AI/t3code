@@ -33,6 +33,8 @@ type AcpClientRaw = {
   readonly notifications: Stream.Stream<AcpProtocol.AcpIncomingNotification>;
   readonly request: (method: string, payload: unknown) => Effect.Effect<unknown, AcpError.AcpError>;
   readonly notify: (method: string, payload: unknown) => Effect.Effect<void, AcpError.AcpError>;
+  readonly registerRequestEnqueue: AcpProtocol.AcpPatchedProtocol["registerRequestEnqueue"];
+  readonly flush: Effect.Effect<void, AcpError.AcpError>;
 };
 
 export class AcpClient extends Context.Service<
@@ -461,6 +463,8 @@ export const make = Effect.fn("effect-acp/AcpClient.make")(function* (
       notifications: transport.incoming,
       request: transport.request,
       notify: transport.notify,
+      registerRequestEnqueue: transport.registerRequestEnqueue,
+      flush: transport.flush,
     },
     agent: {
       initialize: (payload) =>

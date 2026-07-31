@@ -920,7 +920,10 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
       return Effect.succeed(ctx);
     };
 
-    const stopSessionInternal = (ctx: OmpSessionContext) =>
+    const stopSessionInternal = (
+      ctx: OmpSessionContext,
+      exitKind: "graceful" | "error" = "graceful",
+    ) =>
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
@@ -935,7 +938,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           ...(yield* makeEventStamp(ctx.threadId)),
           provider: PROVIDER,
           threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
+          payload: { exitKind },
         }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -1301,12 +1304,19 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
             threadId: input.threadId,
             payload: { resume: started.initializeResult },
           });
+          // A restored active turn remains canonical execution authority until
+          // its terminal event or an explicit interrupt clears it.
           yield* offerRuntimeEvent({
             type: "session.state.changed",
             ...(yield* makeEventStamp(input.threadId)),
             provider: PROVIDER,
             threadId: input.threadId,
-            payload: { state: "ready", reason: "OMP ACP session ready" },
+            payload: {
+              state: resumedActiveTurnId ? "running" : "ready",
+              reason: resumedActiveTurnId
+                ? "OMP ACP session resumed with an active turn"
+                : "OMP ACP session ready",
+            },
           });
           yield* offerRuntimeEvent({
             type: "thread.started",
@@ -1326,10 +1336,10 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           input.threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(input.threadId);
-            // A sendTurn while a prompt is in flight is a steer: the agent
-            // folds the new prompt into the ongoing work, so the active turn
-            // id is reused instead of opening a new turn.
-            const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
+            // An active turn is canonical even when its prompt RPC belonged to
+            // a prior adapter process. Fold the new input into that turn via
+            // steering instead of replacing its restored id with a new turn.
+            const steeringTurnId = ctx.activeTurnId;
             const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
             // Count this prompt immediately so a superseded in-flight prompt
             // resolving from here on does not settle the turn; decremented on
@@ -1495,20 +1505,6 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
                 };
               }
 
-              if (steeringTurnId === undefined) {
-                yield* offerRuntimeEvent({
-                  type: "turn.started",
-                  ...(yield* makeEventStamp(input.threadId)),
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  turnId,
-                  payload: {
-                    ...(displayModel ? { model: displayModel } : {}),
-                    ...(displayEffort ? { effort: displayEffort } : {}),
-                  },
-                });
-              }
-
               return {
                 kind: "prompt" as const,
                 acp: ctx.acp,
@@ -1517,6 +1513,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
                 displayEffort,
                 promptParts,
                 turnId,
+                emitTurnStarted: steeringTurnId === undefined,
               };
             }).pipe(
               Effect.tapCause(() =>
@@ -1582,19 +1579,6 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
                 updatedAt: yield* nowIso,
                 ...(prepared.displayModel ? { model: prepared.displayModel } : {}),
               };
-              if (liveTurnId === undefined) {
-                yield* offerRuntimeEvent({
-                  type: "turn.started",
-                  ...(yield* makeEventStamp(input.threadId)),
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  turnId: fallbackTurnId,
-                  payload: {
-                    ...(prepared.displayModel ? { model: prepared.displayModel } : {}),
-                    ...(prepared.displayEffort ? { effort: prepared.displayEffort } : {}),
-                  },
-                });
-              }
               return {
                 kind: "prompt" as const,
                 acp: prepared.acp,
@@ -1603,6 +1587,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
                 displayEffort: prepared.displayEffort,
                 promptParts: prepared.promptParts,
                 turnId: fallbackTurnId,
+                emitTurnStarted: liveTurnId === undefined,
               };
             }),
           );
@@ -1617,9 +1602,28 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
 
         return yield* Effect.gen(function* () {
           const result = yield* prepared.acp
-            .prompt({
-              prompt: prepared.promptParts,
-            })
+            .prompt(
+              {
+                prompt: prepared.promptParts,
+              },
+              prepared.emitTurnStarted
+                ? {
+                    onRegistered: Effect.gen(function* () {
+                      yield* offerRuntimeEvent({
+                        type: "turn.started",
+                        ...(yield* makeEventStamp(input.threadId)),
+                        provider: PROVIDER,
+                        threadId: input.threadId,
+                        turnId: prepared.turnId,
+                        payload: {
+                          ...(prepared.displayModel ? { model: prepared.displayModel } : {}),
+                          ...(prepared.displayEffort ? { effort: prepared.displayEffort } : {}),
+                        },
+                      });
+                    }),
+                  }
+                : undefined,
+            )
             .pipe(
               Effect.tap((promptResult) =>
                 Effect.all([
@@ -1870,13 +1874,27 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
               observed.interruptedTurnId ?? turnId ?? activeTurnId ?? ctx.session.activeTurnId;
             yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
             yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
-            yield* Effect.ignore(
-              ctx.acp.cancel.pipe(
-                Effect.mapError((error) =>
-                  mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
-                ),
+            const cancellationFailure = yield* ctx.acp.cancel.pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
               ),
+              Effect.match({
+                onFailure: Option.some,
+                onSuccess: () => Option.none(),
+              }),
             );
+            if (Option.isSome(cancellationFailure)) {
+              const error = cancellationFailure.value;
+              if (interruptedTurnId) {
+                ctx.interruptedTurnIds.add(interruptedTurnId);
+                yield* settlePromptInFlight(threadId, interruptedTurnId, ctx.acpSessionId, {
+                  errorMessage: error.message,
+                  settleAllPrompts: true,
+                });
+              }
+              yield* stopSessionInternal(ctx, "error");
+              return yield* error;
+            }
             if (interruptedTurnId) {
               ctx.interruptedTurnIds.add(interruptedTurnId);
               yield* settlePromptInFlight(threadId, interruptedTurnId, ctx.acpSessionId, {
@@ -1976,7 +1994,9 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
       });
 
     const stopAll: OmpAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
+      Effect.forEach(Array.from(sessions.values()), (ctx) => stopSessionInternal(ctx), {
+        discard: true,
+      });
 
     yield* Effect.addFinalizer(() =>
       Effect.ignore(stopAll()).pipe(

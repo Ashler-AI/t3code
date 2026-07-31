@@ -6,6 +6,7 @@ import * as NodeFS from "node:fs";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -273,6 +274,166 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect(
+    "does not expose a cancellable prompt until the request logger releases the transport enqueue",
+    () =>
+      Effect.gen(function* () {
+        const loggerEntered = yield* Deferred.make<void>();
+        const releaseLogger = yield* Deferred.make<void>();
+        const promptRegistered = yield* Deferred.make<void>();
+
+        yield* Effect.gen(function* () {
+          const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+          yield* runtime.start();
+
+          const promptFiber = yield* runtime
+            .prompt(
+              {
+                prompt: [{ type: "text", text: "cancel after enqueue" }],
+              },
+              {
+                onRegistered: Deferred.succeed(promptRegistered, undefined).pipe(Effect.asVoid),
+              },
+            )
+            .pipe(Effect.forkChild({ startImmediately: true }));
+
+          yield* Deferred.await(loggerEntered);
+          expect(yield* Deferred.isDone(promptRegistered)).toBe(false);
+
+          yield* Deferred.succeed(releaseLogger, undefined);
+          yield* Deferred.await(promptRegistered);
+          yield* runtime.cancel;
+
+          expect(yield* Fiber.join(promptFiber)).toMatchObject({ stopReason: "cancelled" });
+        }).pipe(
+          Effect.provide(
+            AcpSessionRuntime.layer({
+              spawn: {
+                command: mockAgentCommand,
+                args: mockAgentArgs,
+                env: {
+                  T3_ACP_HANG_PROMPT_FOREVER: "1",
+                  T3_ACP_REQUIRE_ACTIVE_PROMPT_FOR_CANCEL: "1",
+                },
+              },
+              cwd: process.cwd(),
+              clientInfo: { name: "t3-test", version: "0.0.0" },
+              authMethodId: "test",
+              requestLogger: (event) =>
+                event.method === "session/prompt" && event.status === "started"
+                  ? Deferred.succeed(loggerEntered, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseLogger)),
+                    )
+                  : Effect.void,
+            }),
+          ),
+          Effect.scoped,
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("propagates a prompt rejection triggered immediately by session/cancel", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const promptFiber = yield* runtime
+        .prompt({
+          prompt: [{ type: "text", text: "fail during cancellation" }],
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* TestClock.adjust("500 millis");
+      const cancelError = yield* Effect.flip(runtime.cancel);
+      expect(cancelError).toMatchObject({
+        _tag: "AcpRequestError",
+        method: "session/prompt",
+      });
+      if (cancelError._tag === "AcpRequestError") {
+        expect(cancelError.message).toContain("Mock cancel cleanup failure");
+      }
+
+      const promptError = yield* Effect.flip(Fiber.join(promptFiber));
+      expect(promptError).toMatchObject({
+        _tag: "AcpRequestError",
+        method: "session/prompt",
+      });
+      if (promptError._tag === "AcpRequestError") {
+        expect(promptError.message).toContain("Mock cancel cleanup failure");
+      }
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_HANG_PROMPT_FOREVER: "1",
+              T3_ACP_FAIL_PROMPT_ON_CANCEL: "1",
+            },
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    ),
+  );
+
+  it.effect("fails cancellation when the provider never acknowledges prompt cleanup", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const promptFiber = yield* runtime
+        .prompt({
+          prompt: [{ type: "text", text: "ignore cancellation" }],
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* TestClock.adjust("500 millis");
+      const cancelFiber = yield* runtime.cancel.pipe(
+        Effect.flip,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* TestClock.adjust("100 millis");
+      const error = yield* Fiber.join(cancelFiber);
+
+      expect(error).toMatchObject({
+        _tag: "AcpTransportError",
+        operation: "call-rpc",
+        method: "session/prompt",
+      });
+      if (error._tag === "AcpTransportError") {
+        expect(error.detail).toContain(
+          "session/cancel timed out waiting for the active session/prompt response",
+        );
+      }
+      expect(yield* Fiber.join(promptFiber)).toMatchObject({ stopReason: "cancelled" });
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_HANG_PROMPT_FOREVER: "1",
+              T3_ACP_IGNORE_CANCEL: "1",
+            },
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+          cancelPromptResponseTimeout: "50 millis",
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    ),
+  );
+
   it.effect("segments assistant text around ACP tool calls", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
@@ -383,6 +544,168 @@ describe("AcpSessionRuntime", () => {
       expect(new Set(starts.map((event) => event.itemId))).toHaveLength(3);
       expect(deltas.map((event) => event.itemId)).toEqual(starts.map((event) => event.itemId));
       expect(deltas.map((event) => event.text)).toEqual(["reply 1", "reply 2", "reply 3"]);
+    }),
+  );
+
+  it.effect("keeps one assistant message across asynchronous updates for an active tool", () =>
+    Effect.gen(function* () {
+      const queue = yield* Queue.unbounded<AcpSessionRuntime.AcpSessionRuntimeEvent>();
+      const modeStateRef = yield* Ref.make<AcpSessionModeState | undefined>(undefined);
+      const configOptionsRef = yield* Ref.make<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>(
+        [],
+      );
+      const toolCallsRef = yield* Ref.make(new Map<string, AcpToolCallState>());
+      const assistantSegmentRef = yield* Ref.make<AcpSessionRuntime.AcpAssistantSegmentState>({
+        nextSegmentIndex: 0,
+      });
+
+      const applyUpdate = (
+        update: EffectAcpSchema.SessionNotification["update"],
+        sourceSequence: number,
+      ) =>
+        AcpSessionRuntime.handleSessionUpdate({
+          queue,
+          modeStateRef,
+          configOptionsRef,
+          toolCallsRef,
+          assistantSegmentRef,
+          assistantItemRuntimeId: "runtime-1",
+          params: {
+            sessionId: "session-1",
+            update,
+          },
+          sourceSequence,
+        });
+
+      yield* applyUpdate(
+        {
+          sessionUpdate: "tool_call",
+          toolCallId: "background-task-1",
+          title: "Terminal",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { executable: "background-task", args: ["start"] },
+        },
+        1,
+      );
+      yield* applyUpdate(
+        {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "assistant-1",
+          content: { type: "text", text: "anthropic/cla" },
+        },
+        2,
+      );
+      yield* applyUpdate(
+        {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "background-task-1",
+          title: "Terminal",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { executable: "background-task", args: ["progress"] },
+        },
+        3,
+      );
+      yield* applyUpdate(
+        {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "assistant-1",
+          content: { type: "text", text: "ude-fable-5" },
+        },
+        4,
+      );
+
+      const events = Array.from(yield* Queue.takeAll(queue));
+      expect(events.map((event) => event._tag)).toEqual([
+        "ToolCallUpdated",
+        "AssistantItemStarted",
+        "ContentDelta",
+        "ToolCallUpdated",
+        "ContentDelta",
+      ]);
+
+      const assistantStarts = events.filter((event) => event._tag === "AssistantItemStarted");
+      const assistantCompletions = events.filter(
+        (event) => event._tag === "AssistantItemCompleted",
+      );
+      const assistantDeltas = events.filter((event) => event._tag === "ContentDelta");
+      expect(assistantStarts).toHaveLength(1);
+      expect(assistantCompletions).toHaveLength(0);
+      expect(assistantDeltas.map((event) => event.text).join("")).toBe("anthropic/claude-fable-5");
+      expect(new Set(assistantDeltas.map((event) => event.itemId))).toEqual(
+        new Set(assistantStarts.map((event) => event.itemId)),
+      );
+    }),
+  );
+
+  it.effect("segments assistant text at the first emitted update for a suppressed tool", () =>
+    Effect.gen(function* () {
+      const queue = yield* Queue.unbounded<AcpSessionRuntime.AcpSessionRuntimeEvent>();
+      const modeStateRef = yield* Ref.make<AcpSessionModeState | undefined>(undefined);
+      const configOptionsRef = yield* Ref.make<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>(
+        [],
+      );
+      const toolCallsRef = yield* Ref.make(new Map<string, AcpToolCallState>());
+      const assistantSegmentRef = yield* Ref.make<AcpSessionRuntime.AcpAssistantSegmentState>({
+        nextSegmentIndex: 0,
+      });
+      const applyUpdate = (
+        update: EffectAcpSchema.SessionNotification["update"],
+        sourceSequence: number,
+      ) =>
+        AcpSessionRuntime.handleSessionUpdate({
+          queue,
+          modeStateRef,
+          configOptionsRef,
+          toolCallsRef,
+          assistantSegmentRef,
+          assistantItemRuntimeId: "runtime-1",
+          params: { sessionId: "session-1", update },
+          sourceSequence,
+        });
+
+      yield* applyUpdate(
+        {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "assistant-1",
+          content: { type: "text", text: "before tool" },
+        },
+        1,
+      );
+      yield* applyUpdate(
+        {
+          sessionUpdate: "tool_call",
+          toolCallId: "tool-1",
+          title: "Tool",
+          kind: "other",
+          status: "pending",
+        },
+        2,
+      );
+      yield* applyUpdate(
+        {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tool-1",
+          title: "Terminal",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { executable: "pwd", args: [] },
+        },
+        3,
+      );
+
+      const events = Array.from(yield* Queue.takeAll(queue));
+      expect(events.map((event) => event._tag)).toEqual([
+        "AssistantItemStarted",
+        "ContentDelta",
+        "AssistantItemCompleted",
+        "ToolCallUpdated",
+      ]);
+      expect(events[2]).toMatchObject({
+        _tag: "AssistantItemCompleted",
+        itemId: events[0]?._tag === "AssistantItemStarted" ? events[0].itemId : undefined,
+      });
     }),
   );
 

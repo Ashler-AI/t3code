@@ -2,6 +2,7 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeTimersPromises from "node:timers/promises";
 import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -69,6 +70,26 @@ async function makeOmpCompatibilityWrapper(mode: "success" | "error" = "success"
   );
   await NodeFSP.chmod(wrapperPath, 0o755);
   return wrapperPath;
+}
+
+async function waitForFileContent(
+  filePath: string,
+  attempts = 40,
+  expectedContent?: string,
+): Promise<string> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const raw = await NodeFSP.readFile(filePath, "utf8");
+      if (
+        raw.trim().length > 0 &&
+        (expectedContent === undefined || raw.includes(expectedContent))
+      ) {
+        return raw;
+      }
+    } catch {}
+    await NodeTimersPromises.setTimeout(25);
+  }
+  throw new Error(`Timed out waiting for file content at ${filePath}`);
 }
 
 const testLayer = ServerConfig.layerTest(process.cwd(), {
@@ -287,6 +308,72 @@ it.layer(testLayer)("OmpAdapter", (it) => {
         ),
       );
       yield* second.stopSession(threadId);
+    }),
+  );
+
+  it.effect("steers the restored active turn instead of opening a concurrent prompt", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("omp-resume-active-turn");
+      const activeTurnId = TurnId.make("turn-in-flight");
+      const requestLogPath = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "omp-acp-resume-steer-log-")).then((dir) =>
+          NodePath.join(dir, "requests.ndjson"),
+        ),
+      );
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockOmpWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_OMP_STEER_STATE: "streaming",
+        }),
+      );
+      const adapter = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }));
+      const events: ProviderRuntimeEvent[] = [];
+      const eventFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => events.push(event)),
+      ).pipe(Effect.forkChild);
+
+      const resumed = yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("omp"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: {
+          schemaVersion: 3,
+          sessionId: "mock-session-1",
+          eventSequence: 20,
+          acpSequence: 0,
+          activeTurnId,
+        },
+      });
+      const steered = yield* adapter.sendTurn({
+        threadId,
+        input: "continue the restored turn",
+        attachments: [],
+      });
+      yield* Effect.yieldNow;
+      yield* Fiber.interrupt(eventFiber);
+
+      assert.equal(resumed.status, "running");
+      assert.equal(resumed.activeTurnId, activeTurnId);
+      assert.equal(steered.turnId, activeTurnId);
+      const liveSession = (yield* adapter.listSessions())[0];
+      assert.equal(liveSession?.status, "running");
+      assert.equal(liveSession?.activeTurnId, activeTurnId);
+      const lifecycle = events.find((event) => event.type === "session.state.changed");
+      assert.equal(lifecycle?.type, "session.state.changed");
+      if (lifecycle?.type === "session.state.changed") {
+        assert.equal(lifecycle.payload.state, "running");
+        assert.equal(lifecycle.payload.reason, "OMP ACP session resumed with an active turn");
+      }
+      assert.isFalse(events.some((event) => event.type === "turn.started"));
+      const requestLog = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
+      assert.include(requestLog, '"method":"_omp/session/steer"');
+      assert.include(
+        requestLog,
+        '"sessionId":"mock-session-1","text":"continue the restored turn"',
+      );
+      assert.notInclude(requestLog, '"method":"session/prompt"');
+      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -886,7 +973,7 @@ it.layer(testLayer)("OmpAdapter", (it) => {
           ...process.env,
           SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
           OMP_AGENT_MODEL: "openai/gpt-5.6",
-          OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6,anthropic/claude-sonnet-5",
+          OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6",
         },
       });
 
@@ -932,7 +1019,7 @@ it.layer(testLayer)("OmpAdapter", (it) => {
           ...process.env,
           SCAFFOLD_RUNTIME_PROFILE: "agent_t3_omp",
           OMP_AGENT_MODEL: "openai/gpt-5.6",
-          OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6,anthropic/claude-sonnet-5",
+          OMP_AGENT_ALLOWED_MODELS: "openai/gpt-5.6",
         },
       });
       yield* adapter.startSession({
@@ -1013,6 +1100,175 @@ it.layer(testLayer)("OmpAdapter", (it) => {
       yield* adapter.stopSession(threadId);
       yield* Fiber.interrupt(eventFiber);
     }),
+  );
+
+  it.effect("sends ACP cancellation before an active OMP interrupt completes", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("omp-native-interrupt");
+      const requestLogPath = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "omp-acp-interrupt-log-")).then((dir) =>
+          NodePath.join(dir, "requests.ndjson"),
+        ),
+      );
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockOmpWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_HANG_PROMPT_FOREVER: "1",
+          T3_ACP_REQUIRE_ACTIVE_PROMPT_FOR_CANCEL: "1",
+        }),
+      );
+      const adapter = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }));
+      const startedTurn = yield* Deferred.make<TurnId>();
+      const completedTurn = yield* Deferred.make<ProviderRuntimeEvent>();
+      const eventFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (event.type === "turn.started" && event.turnId) {
+          return Deferred.succeed(startedTurn, event.turnId).pipe(Effect.ignore);
+        }
+        if (event.type === "turn.completed") {
+          return Deferred.succeed(completedTurn, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("omp"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const promptFiber = yield* adapter
+        .sendTurn({ threadId, input: "hang until interrupted", attachments: [] })
+        .pipe(Effect.forkChild);
+      const activeTurnId = yield* Deferred.await(startedTurn);
+      yield* adapter.interruptTurn(threadId, activeTurnId);
+
+      const requestLog = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
+      const requestLines = requestLog.split("\n").filter((line) => line.trim().length > 0);
+      const promptRequestIndex = requestLines.findIndex((line) =>
+        line.includes('"method":"session/prompt"'),
+      );
+      const cancelRequestIndex = requestLines.findIndex((line) =>
+        line.includes('"method":"session/cancel"'),
+      );
+      assert.isAtLeast(promptRequestIndex, 0);
+      assert.isAbove(cancelRequestIndex, promptRequestIndex);
+      const cancelRequests = requestLines
+        .filter((line) => line.includes('"method":"session/cancel"'))
+        .map((line) => JSON.parse(line) as unknown);
+      assert.deepEqual(cancelRequests, [
+        {
+          jsonrpc: "2.0",
+          method: "session/cancel",
+          params: { sessionId: "mock-session-1" },
+        },
+      ]);
+
+      yield* Fiber.join(promptFiber).pipe(Effect.timeout("2 seconds"));
+      const completed = yield* Deferred.await(completedTurn).pipe(Effect.timeout("2 seconds"));
+      assert.equal(completed.turnId, activeTurnId);
+      assert.deepInclude(completed.payload, {
+        state: "cancelled",
+        stopReason: "cancelled",
+      });
+
+      yield* adapter.stopSession(threadId);
+      yield* Fiber.interrupt(eventFiber);
+    }),
+  );
+
+  it.effect(
+    "fails the turn and discards the OMP session when cancel triggers a prompt rejection",
+    () =>
+      Effect.gen(function* () {
+        const threadId = ThreadId.make("omp-native-interrupt-failure");
+        const requestLogPath = yield* Effect.promise(() =>
+          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "omp-acp-interrupt-failure-log-")).then(
+            (dir) => NodePath.join(dir, "requests.ndjson"),
+          ),
+        );
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockOmpWrapper({
+            T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+            T3_ACP_HANG_PROMPT_FOREVER: "1",
+            T3_ACP_FAIL_PROMPT_ON_CANCEL: "1",
+          }),
+        );
+        const adapter = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }));
+        const startedTurn = yield* Deferred.make<TurnId>();
+        const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+        const eventFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => {
+            runtimeEvents.push(event);
+          }).pipe(
+            Effect.andThen(
+              event.type === "turn.started" && event.turnId
+                ? Deferred.succeed(startedTurn, event.turnId).pipe(Effect.ignore)
+                : Effect.void,
+            ),
+          ),
+        ).pipe(Effect.forkChild);
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("omp"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+
+        const promptFiber = yield* adapter
+          .sendTurn({ threadId, input: "fail while interrupting", attachments: [] })
+          .pipe(Effect.forkChild);
+        const activeTurnId = yield* Deferred.await(startedTurn).pipe(Effect.timeout("2 seconds"));
+        yield* Effect.promise(() =>
+          waitForFileContent(requestLogPath, 80, '"method":"session/prompt"'),
+        );
+
+        const interruptError = yield* Effect.flip(
+          adapter.interruptTurn(threadId, activeTurnId).pipe(Effect.timeout("3 seconds")),
+        );
+        assert.equal(interruptError._tag, "ProviderAdapterRequestError");
+        if (interruptError._tag === "ProviderAdapterRequestError") {
+          assert.equal(interruptError.method, "session/cancel");
+          assert.include(interruptError.detail, "Mock cancel cleanup failure");
+        }
+
+        const promptError = yield* Effect.flip(
+          Fiber.join(promptFiber).pipe(Effect.timeout("3 seconds")),
+        );
+        assert.equal(promptError._tag, "ProviderAdapterRequestError");
+        if (promptError._tag === "ProviderAdapterRequestError") {
+          assert.equal(promptError.method, "session/prompt");
+          assert.include(promptError.detail, "Mock cancel cleanup failure");
+        }
+
+        const terminalEvents = runtimeEvents.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+            event.type === "turn.completed" && event.turnId === activeTurnId,
+        );
+        assert.lengthOf(terminalEvents, 1);
+        assert.deepInclude(terminalEvents[0]?.payload, {
+          state: "failed",
+        });
+        assert.include(
+          terminalEvents[0]?.payload.state === "failed"
+            ? terminalEvents[0].payload.errorMessage
+            : "",
+          "Mock cancel cleanup failure",
+        );
+        assert.isFalse(
+          terminalEvents.some(
+            (event) =>
+              event.payload.state === "cancelled" || event.payload.stopReason === "cancelled",
+          ),
+        );
+        const sessionExited = runtimeEvents.find(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "session.exited" }> =>
+            event.type === "session.exited" && event.threadId === threadId,
+        );
+        assert.deepEqual(sessionExited?.payload, { exitKind: "error" });
+        assert.isFalse(yield* adapter.hasSession(threadId));
+
+        yield* Fiber.interrupt(eventFiber);
+      }),
   );
 
   it.effect("configures the cross-provider advisor from OMP's live model catalog", () =>
