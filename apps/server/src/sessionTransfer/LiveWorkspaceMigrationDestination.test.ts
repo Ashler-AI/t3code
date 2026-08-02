@@ -319,6 +319,48 @@ describe("buildWorkspaceMigrationDestinationPlan", () => {
     expect(replayPlan.binding.resumeCursor).toEqual(plan.binding.resumeCursor);
   });
 
+  it("preserves the source selection in provenance while binding ChatGPT to the managed Scaffold OMP route", () => {
+    const fixture = transferFixture();
+    const source = {
+      ...fixture.source,
+      modelSelection: {
+        instanceId: "omp" as never,
+        model: "openai-codex/gpt-5.6-sol",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
+    };
+    const request = new ScaffoldWorkspaceMigrationImportInput({
+      ...fixture.request,
+      source: {
+        ...fixture.request.source,
+        model: source.modelSelection.model,
+      },
+      payload: {
+        ...fixture.request.payload,
+        source: {
+          ...fixture.request.payload.source,
+          model: source.modelSelection.model,
+        },
+      },
+    });
+
+    const plan = buildWorkspaceMigrationDestinationPlan({
+      request,
+      source,
+      destinationEnvironmentId: EnvironmentId.make("destination-env"),
+      importedOmpSessionId: destinationOmpSessionId,
+    });
+
+    expect(source.modelSelection.model).toBe("openai-codex/gpt-5.6-sol");
+    expect(plan.projectCommand.defaultModelSelection).toEqual({
+      instanceId: "omp",
+      model: "openai/gpt-5.6-sol",
+      options: [{ id: "reasoningEffort", value: "high" }],
+    });
+    expect(plan.threadCommand.modelSelection).toEqual(plan.projectCommand.defaultModelSelection);
+    expect(plan.startInput.modelSelection).toEqual(plan.projectCommand.defaultModelSelection);
+  });
+
   it.each([
     ["reused source", "omp-private-session"],
     ["mismatched destination", "omp-unrelated"],

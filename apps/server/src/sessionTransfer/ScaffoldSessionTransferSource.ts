@@ -377,6 +377,7 @@ export function makeIdempotentScaffoldSessionTransferSource(options: {
     {
       readonly requestFingerprintSha256: string;
       readonly promise: Promise<ScaffoldWorkspaceMigrationReceipt>;
+      receipt?: ScaffoldWorkspaceMigrationReceipt;
     }
   >();
 
@@ -630,12 +631,22 @@ export function makeIdempotentScaffoldSessionTransferSource(options: {
         }
       }
     });
-    operations.set(input.operationId, { requestFingerprintSha256, promise });
-    void promise.catch(() => {
-      if (operations.get(input.operationId)?.promise === promise) {
-        operations.delete(input.operationId);
-      }
-    });
+    const operation: {
+      readonly requestFingerprintSha256: string;
+      readonly promise: Promise<ScaffoldWorkspaceMigrationReceipt>;
+      receipt?: ScaffoldWorkspaceMigrationReceipt;
+    } = { requestFingerprintSha256, promise };
+    operations.set(input.operationId, operation);
+    void promise.then(
+      (receipt) => {
+        if (operations.get(input.operationId)?.promise === promise) operation.receipt = receipt;
+      },
+      () => {
+        if (operations.get(input.operationId)?.promise === promise) {
+          operations.delete(input.operationId);
+        }
+      },
+    );
     return Effect.tryPromise({
       try: () => promise,
       catch: (error) =>
@@ -854,7 +865,19 @@ export function makeIdempotentScaffoldSessionTransferSource(options: {
     start,
     reconcile: (input) =>
       resolvePhysicalInput(input, false).pipe(
-        Effect.flatMap((physicalInput) => settleFromAuthority(physicalInput, "reconcile")),
+        Effect.flatMap((physicalInput) => {
+          const operation = operations.get(physicalInput.operationId);
+          if (operation?.receipt) return Effect.succeed(operation.receipt);
+          if (operation) {
+            return Effect.fail(
+              new WorkspaceMigrationImportError({
+                code: "workspace_migration_source_reconciliation_pending",
+                detail: "The local source transfer is still running and remains fenced.",
+              }),
+            );
+          }
+          return settleFromAuthority(physicalInput, "reconcile");
+        }),
         Effect.flatMap((result) =>
           result
             ? Effect.succeed(result)
@@ -1379,9 +1402,9 @@ export function captureThenMigrateWithSourceRestore<A, B, E1, E2, E3, E4>(option
 }): Effect.Effect<B, E1 | E2 | E3 | E4> {
   return Effect.acquireUseRelease(
     options.stop,
-    () => options.capture,
+    () => options.capture.pipe(Effect.flatMap(options.migrate)),
     () => options.restart,
-  ).pipe(Effect.flatMap(options.migrate));
+  );
 }
 
 /**
@@ -1631,7 +1654,7 @@ export const makeLiveScaffoldSessionTransferSource = Effect.fn(
                       },
                     });
                     return yield* Effect.tryPromise(() =>
-                      cli.migrate(command, (authority) =>
+                      cli.migrate(command, input.deployment, (authority) =>
                         authorityJournal
                           .bind({
                             lifecycleEpoch: authority.lifecycleEpoch,
@@ -1677,14 +1700,18 @@ export const makeLiveScaffoldSessionTransferSource = Effect.fn(
     execute: capture,
     store: makeSqlSourceTransferFenceStore(sql),
     authority: {
-      reconcile: async ({ operationId, requestFingerprintSha256 }) =>
+      reconcile: async ({ operationId, requestFingerprintSha256, deployment }) =>
         decodeSourceTransferAuthorityResolution(
-          await cli.reconcile({ operationId, requestFingerprintSha256 }),
+          await cli.reconcile({
+            operationId,
+            requestFingerprintSha256,
+            deployment,
+          }),
           { operationId, requestFingerprintSha256 },
         ),
-      abort: async ({ operationId, requestFingerprintSha256 }) =>
+      abort: async ({ operationId, requestFingerprintSha256, deployment }) =>
         decodeSourceTransferAuthorityResolution(
-          await cli.abort({ operationId, requestFingerprintSha256 }),
+          await cli.abort({ operationId, requestFingerprintSha256, deployment }),
           { operationId, requestFingerprintSha256 },
         ),
     },

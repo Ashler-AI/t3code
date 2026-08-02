@@ -57,6 +57,24 @@ function workspaceMigrationOmpSessionId(operationId: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/**
+ * Local account-backed OMP catalogs expose ChatGPT models under
+ * `openai-codex/*`, while managed Scaffold OMP receives the same account route
+ * from the central broker as `openai/*`. Keep the captured source selection in
+ * the transfer manifest, but bind the fresh destination thread to the managed
+ * runtime's equivalent route.
+ */
+export function workspaceMigrationDestinationModelSelection(
+  source: ModelSelection,
+): ModelSelection {
+  const [provider, ...modelParts] = source.model.split("/");
+  if (provider !== "openai-codex" || modelParts.length === 0) return source;
+  return {
+    ...source,
+    model: `openai/${modelParts.join("/")}`,
+  };
+}
+
 export function buildRetentionCloneDestinationPlan(input: {
   readonly request: ScaffoldRetentionCloneImportInput;
   readonly destinationT3SessionId: string;
@@ -177,6 +195,9 @@ export function buildWorkspaceMigrationDestinationPlan(input: {
   readonly destinationEnvironmentId: EnvironmentId;
   readonly importedOmpSessionId: string;
 }) {
+  const destinationModelSelection = workspaceMigrationDestinationModelSelection(
+    input.source.modelSelection,
+  );
   const projectId = ProjectId.make(stableId("transfer-project", input.request.operationId));
   const threadId = ThreadId.make(stableId("transfer-thread", input.request.operationId));
   const ompSessionId = workspaceMigrationOmpSessionId(input.request.operationId);
@@ -213,7 +234,7 @@ export function buildWorkspaceMigrationDestinationPlan(input: {
       projectId,
       title: input.source.title,
       workspaceRoot: input.request.workspace.rootDir,
-      defaultModelSelection: input.source.modelSelection,
+      defaultModelSelection: destinationModelSelection,
       createdAt: input.source.capturedAt,
     },
     threadCommand: {
@@ -222,7 +243,7 @@ export function buildWorkspaceMigrationDestinationPlan(input: {
       threadId,
       projectId,
       title: input.source.title,
-      modelSelection: input.source.modelSelection,
+      modelSelection: destinationModelSelection,
       runtimeMode: input.source.runtimeMode,
       interactionMode: input.source.interactionMode,
       branch: null,
@@ -232,7 +253,7 @@ export function buildWorkspaceMigrationDestinationPlan(input: {
     binding: {
       threadId,
       provider: ProviderDriverKind.make("omp"),
-      providerInstanceId: input.source.modelSelection.instanceId,
+      providerInstanceId: destinationModelSelection.instanceId,
       status: "starting" as const,
       resumeCursor,
       runtimeMode: input.source.runtimeMode,
@@ -240,9 +261,9 @@ export function buildWorkspaceMigrationDestinationPlan(input: {
     startInput: {
       threadId,
       provider: ProviderDriverKind.make("omp"),
-      providerInstanceId: input.source.modelSelection.instanceId,
+      providerInstanceId: destinationModelSelection.instanceId,
       cwd: input.request.workspace.rootDir,
-      modelSelection: input.source.modelSelection,
+      modelSelection: destinationModelSelection,
       resumeCursor,
       runtimeMode: input.source.runtimeMode,
     },
@@ -444,7 +465,7 @@ export const makeLiveWorkspaceMigrationDestination = Effect.fn(
         ompBundleSha256: input.request.ompBundleSha256,
         t3MetadataSha256: input.request.t3MetadataSha256,
         workspaceArchiveSha256: input.request.workspace.archiveSha256,
-        modelSelection: input.source.modelSelection,
+        modelSelection: recoveryPlan.threadCommand.modelSelection,
         runtimeMode: input.source.runtimeMode,
         interactionMode: input.source.interactionMode,
         destinationEnvironmentId: environmentId,
@@ -485,7 +506,7 @@ export const makeLiveWorkspaceMigrationDestination = Effect.fn(
         ompSessionId: recoveryPlan.result.ompSessionId,
         importedAcpSequence: input.source.continuation.acpSequence,
         transcriptSha256: input.source.transcriptSha256,
-        modelSelection: input.source.modelSelection,
+        modelSelection: recoveryPlan.threadCommand.modelSelection,
         runtimeMode: input.source.runtimeMode,
         interactionMode: input.source.interactionMode,
       } as const;

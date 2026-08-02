@@ -313,6 +313,30 @@ export function advanceOmpEventCursor(input: {
   return { sequence: input.currentSequence + 1, duplicate: false };
 }
 
+export function reserveOmpEventCursor(input: {
+  readonly currentSequence: number;
+  readonly sessionId: string;
+  readonly offeredEventIds: ReadonlySet<EventId>;
+  readonly source?: { readonly sequence: number; readonly discriminator: string };
+}): { readonly sequence: number; readonly eventId: EventId; readonly duplicate: boolean } {
+  const sourceEventId = input.source
+    ? makeOmpSourceEventId(input.sessionId, input.source.sequence, input.source.discriminator)
+    : undefined;
+  if (sourceEventId !== undefined && input.offeredEventIds.has(sourceEventId)) {
+    return {
+      sequence: input.currentSequence,
+      eventId: sourceEventId,
+      duplicate: true,
+    };
+  }
+  const next = advanceOmpEventCursor({ currentSequence: input.currentSequence });
+  return {
+    sequence: next.sequence,
+    eventId: sourceEventId ?? makeOmpEventId(input.sessionId, next.sequence),
+    duplicate: false,
+  };
+}
+
 export function resumedOmpCursorForSession(
   sessionId: string,
   resume: ReturnType<typeof parseOmpResume>,
@@ -421,14 +445,21 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           sessionId: `thread-${threadId}`,
           sequence: 0,
         };
-        const next = advanceOmpEventCursor({ currentSequence: current.sequence });
-        const sequence = next.sequence;
-        eventSequences.set(threadId, {
-          ...current,
-          sequence: Math.max(current.sequence, sequence),
+        const reserved = reserveOmpEventCursor({
+          currentSequence: current.sequence,
+          sessionId: current.sessionId,
+          offeredEventIds,
+          ...(source ? { source } : {}),
         });
+        const sequence = reserved.sequence;
+        if (!reserved.duplicate) {
+          eventSequences.set(threadId, {
+            ...current,
+            sequence: Math.max(current.sequence, sequence),
+          });
+        }
         const ctx = sessions.get(threadId);
-        if (ctx) {
+        if (ctx && !reserved.duplicate) {
           if (source) {
             ctx.acpSequence = Math.max(ctx.acpSequence, source.sequence);
           }
@@ -444,9 +475,7 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
           };
         }
         return {
-          eventId: source
-            ? makeOmpSourceEventId(current.sessionId, source.sequence, source.discriminator)
-            : makeOmpEventId(current.sessionId, sequence),
+          eventId: reserved.eventId,
           createdAt: yield* nowIso,
         };
       });
@@ -1549,6 +1578,23 @@ export function makeOmpAdapter(ompSettings: OmpSettings, options?: OmpAdapterLiv
             });
           }
           if (steer.accepted) {
+            // A native steer keeps the same provider turn, so OMP does not
+            // emit another turn.started boundary. Re-assert the running
+            // session state after the steer is accepted so orchestration can
+            // consume the pending turn-start request that carried the steer.
+            // Without this acknowledgement, the read model retains a stale
+            // pending turn after the original turn completes and treats the
+            // otherwise-idle thread as permanently busy.
+            yield* offerRuntimeEvent({
+              type: "session.state.changed",
+              ...(yield* makeEventStamp(input.threadId)),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              payload: {
+                state: "running",
+                reason: "OMP native steer accepted into the active turn",
+              },
+            });
             return {
               threadId: input.threadId,
               turnId: prepared.turnId,

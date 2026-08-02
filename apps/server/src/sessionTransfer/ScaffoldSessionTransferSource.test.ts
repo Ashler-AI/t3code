@@ -605,7 +605,7 @@ describe("captureThenMigrateWithSourceRestore", () => {
     assert.strictEqual(restore.startInput.providerInstanceId, "omp-primary");
   });
 
-  it.effect("restarts the source before invoking the Scaffold migration", () =>
+  it.effect("keeps the source stopped through migration and then restores it", () =>
     Effect.gen(function* () {
       const calls: string[] = [];
       const result = yield* captureThenMigrateWithSourceRestore({
@@ -623,7 +623,27 @@ describe("captureThenMigrateWithSourceRestore", () => {
       });
 
       assert.strictEqual(result, "receipt");
-      assert.deepStrictEqual(calls, ["stop", "capture", "restart", "migrate:bundle"]);
+      assert.deepStrictEqual(calls, ["stop", "capture", "migrate:bundle", "restart"]);
+    }),
+  );
+
+  it.effect("restarts the source when the Scaffold migration fails", () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const error = yield* captureThenMigrateWithSourceRestore({
+        stop: Effect.sync(() => calls.push("stop")).pipe(Effect.asVoid),
+        capture: Effect.sync(() => {
+          calls.push("capture");
+          return "bundle";
+        }),
+        restart: Effect.sync(() => calls.push("restart")).pipe(Effect.asVoid),
+        migrate: (bundle) =>
+          Effect.sync(() => calls.push(`migrate:${bundle}`)).pipe(
+            Effect.andThen(Effect.fail("migration failed")),
+          ),
+      }).pipe(Effect.flip);
+      assert.strictEqual(error, "migration failed");
+      assert.deepStrictEqual(calls, ["stop", "capture", "migrate:bundle", "restart"]);
     }),
   );
 
@@ -693,6 +713,44 @@ describe("captureThenMigrateWithSourceRestore", () => {
       assert.deepStrictEqual(concurrent, first);
       assert.deepStrictEqual(completed, first);
       assert.strictEqual(executions, 1);
+    }),
+  );
+
+  it.effect("keeps an in-process transfer pending without revoking pre-bind authority", () =>
+    Effect.gen(function* () {
+      const { store } = memoryStore();
+      const release = yield* Deferred.make<void>();
+      let reconciliations = 0;
+      const source = makeTestSource({
+        store,
+        execute: (_input, _capture, journal) =>
+          Deferred.await(release).pipe(
+            Effect.andThen(journal.bind(authorityBinding)),
+            Effect.as(receipt),
+          ),
+        authority: {
+          reconcile: async () => {
+            reconciliations += 1;
+            throw new Error("destination authority must not be consulted while source is running");
+          },
+          abort: async () => {
+            throw new Error("not used");
+          },
+        },
+      });
+
+      const running = yield* source
+        .start(startInput)
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Effect.yieldNow;
+      const pending = yield* source.reconcile(startInput).pipe(Effect.flip);
+      assert.strictEqual(pending.code, "workspace_migration_source_reconciliation_pending");
+      assert.strictEqual(reconciliations, 0);
+
+      yield* Deferred.succeed(release, undefined);
+      assert.deepStrictEqual(yield* Fiber.join(running), receipt);
+      assert.deepStrictEqual(yield* source.reconcile(startInput), receipt);
+      assert.strictEqual(reconciliations, 0);
     }),
   );
 

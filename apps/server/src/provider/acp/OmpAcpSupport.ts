@@ -266,7 +266,7 @@ export function buildOmpAcpSpawnInput(
     if (allowedModels.length > 0) args.push("--models", allowedModels.join(","));
   }
   return {
-    command: ompSettings?.binaryPath || "omp",
+    command: environment?.OMP_ACP_COMMAND?.trim() || ompSettings?.binaryPath || "omp",
     args,
     cwd,
     ...(environment ? { env: environment } : {}),
@@ -348,9 +348,9 @@ export function applyOmpAdvisorSelection<E>(input: {
     readonly cause: EffectAcpErrors.AcpError;
     readonly configId: typeof OMP_ADVISOR_CONFIG_ID;
   }) => E;
-}): Effect.Effect<string, E> {
-  if (input.currentAdvisorId === input.requestedAdvisorId) {
-    return Effect.succeed(input.requestedAdvisorId);
+}): Effect.Effect<string | undefined, E> {
+  if (input.currentAdvisorId === undefined || input.currentAdvisorId === input.requestedAdvisorId) {
+    return Effect.succeed(input.currentAdvisorId);
   }
   return input.runtime.setConfigOption(OMP_ADVISOR_CONFIG_ID, input.requestedAdvisorId).pipe(
     Effect.as(input.requestedAdvisorId),

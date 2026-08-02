@@ -101,6 +101,19 @@ describe("buildOmpAcpSpawnInput", () => {
     });
   });
 
+  it("uses the packaged OMP ACP command supplied by the host runtime", () => {
+    expect(
+      buildOmpAcpSpawnInput({ binaryPath: "omp" }, "/tmp/project", {
+        OMP_ACP_COMMAND: " /opt/ashler/runtime/omp ",
+      }),
+    ).toEqual({
+      command: "/opt/ashler/runtime/omp",
+      args: ["acp"],
+      cwd: "/tmp/project",
+      env: { OMP_ACP_COMMAND: " /opt/ashler/runtime/omp " },
+    });
+  });
+
   it("passes configured local model routing through OMP's native ACP CLI flags", () => {
     expect(
       buildOmpAcpSpawnInput({ binaryPath: "/opt/omp" }, "/tmp/project", {
@@ -301,6 +314,26 @@ describe("OMP config selection", () => {
       });
       expect(advisor).toBe("anthropic/claude-sonnet-5:high");
       expect(calls).toEqual([["advisor", "anthropic/claude-sonnet-5:high"]]);
+    }),
+  );
+
+  it.effect("leaves advisor selection to OMP when ACP does not advertise it", () =>
+    Effect.gen(function* () {
+      let called = false;
+      const advisor = yield* applyOmpAdvisorSelection({
+        runtime: {
+          setConfigOption: () =>
+            Effect.sync(() => {
+              called = true;
+              return { configOptions: [] };
+            }),
+        },
+        currentAdvisorId: undefined,
+        requestedAdvisorId: "anthropic/claude-sonnet-5:high",
+        mapError: ({ cause }) => cause,
+      });
+      expect(advisor).toBeUndefined();
+      expect(called).toBe(false);
     }),
   );
 });

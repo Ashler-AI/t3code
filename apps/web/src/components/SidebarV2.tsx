@@ -38,6 +38,7 @@ import {
   Globe2Icon,
   GitBranchIcon,
   EllipsisIcon,
+  MessageSquareIcon,
   PlusIcon,
   PanelsTopLeftIcon,
   SearchIcon,
@@ -100,11 +101,7 @@ import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useNowMinute } from "../hooks/useNowMinute";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
-import {
-  readEnvironmentSupportsSettlement,
-  useProjects,
-  useThreadShells,
-} from "../state/entities";
+import { readEnvironmentSupportsSettlement, useProjects, useThreadShells } from "../state/entities";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
@@ -1132,15 +1129,6 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
     </li>
   );
 });
-
-function latestTurnDiff(
-  thread: SidebarThreadSummary,
-): { insertions: number; deletions: number } | null {
-  // Shells don't carry checkpoint summaries; diff stats render only when the
-  // shell projection grows them. Kept as a seam so the row layout is ready.
-  void thread;
-  return null;
-}
 
 const SidebarV2SearchResultRow = memo(function SidebarV2SearchResultRow(props: {
   thread: SidebarThreadSummary;

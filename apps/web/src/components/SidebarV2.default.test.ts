@@ -77,8 +77,8 @@ describe("Sidebar v2 default", () => {
     expect(sidebarV2Source).toContain('["Tilt", scaffoldLinks.tiltUrl]');
     expect(sidebarV2Source).toContain("Mirror");
     expect(sidebarV2Source).toContain("onClick={(event) => event.stopPropagation()}");
-    expect(sidebarV2Source).toContain(
-      "event.stopPropagation();\n                                  navigateToFabricSession(session);",
+    expect(sidebarV2Source).toMatch(
+      /event\.stopPropagation\(\);\s+navigateToFabricSession\(session\);/u,
     );
   });
 

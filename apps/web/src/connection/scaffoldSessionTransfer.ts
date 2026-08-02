@@ -40,8 +40,8 @@ const TRANSFER_PATH = "/api/scaffold/session-transfer";
 const RECONCILE_PATH = "/api/scaffold/session-transfer/reconcile";
 const ABORT_PATH = "/api/scaffold/session-transfer/abort";
 const REQUEST_DEADLINE_MS = 30_000;
-const OPERATION_DEADLINE_MS = 90_000;
-const RECONCILIATION_WINDOW_MS = 30_000;
+const OPERATION_DEADLINE_MS = 5 * 60_000;
+const RECONCILIATION_WINDOW_MS = 4 * 60_000;
 const ABORT_REQUEST_DEADLINE_MS = 15_000;
 const RECONCILE_BACKOFF_MAX_MS = 2_000;
 

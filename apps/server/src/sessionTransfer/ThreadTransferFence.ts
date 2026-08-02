@@ -1,4 +1,4 @@
-import type { OrchestrationCommand } from "@t3tools/contracts";
+import type { OrchestrationCommand, OrchestrationEventMetadata } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -48,10 +48,31 @@ export function isSourceMutationCommand(
   return sourceTransferBlockedCommandTypes.has(command.type);
 }
 
+function isCanonicalProviderMetadataUpdate(
+  command: SourceMutationCommand,
+  metadata: OrchestrationEventMetadata | undefined,
+): boolean {
+  return (
+    command.type === "thread.meta.update" &&
+    metadata?.providerEventId !== undefined &&
+    metadata.providerEnvironmentId !== undefined &&
+    metadata.providerThreadId === command.threadId &&
+    metadata.providerSourceSequence !== undefined &&
+    metadata.providerInstanceId !== undefined
+  );
+}
+
 /** Must run in the same SQL transaction that commits the command's events. */
 export const rejectSourceMutationWhileTransferIsActive = Effect.fn(
   "rejectSourceMutationWhileTransferIsActive",
-)(function* (sql: SqlClient.SqlClient, command: SourceMutationCommand) {
+)(function* (
+  sql: SqlClient.SqlClient,
+  command: SourceMutationCommand,
+  metadata?: OrchestrationEventMetadata,
+) {
+  if (isCanonicalProviderMetadataUpdate(command, metadata)) {
+    return;
+  }
   const active =
     command.type === "project.meta.update" || command.type === "project.delete"
       ? yield* sql<{ readonly operationId: string }>`

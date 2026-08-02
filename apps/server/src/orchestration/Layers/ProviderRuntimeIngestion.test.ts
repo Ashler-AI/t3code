@@ -35,6 +35,7 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
@@ -260,7 +261,8 @@ describe("ProviderRuntimeIngestion", () => {
     | OrchestrationEngineService
     | ProviderSessionDirectory
     | ProviderRuntimeIngestionService
-    | ProjectionSnapshotQuery,
+    | ProjectionSnapshotQuery
+    | SqlClient.SqlClient,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -346,6 +348,7 @@ describe("ProviderRuntimeIngestion", () => {
     const commandReceipts = await runtime.runPromise(
       Effect.service(OrchestrationCommandReceiptRepository),
     );
+    const sql = await runtime.runPromise(Effect.service(SqlClient.SqlClient));
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(ingestion.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(ingestion.drain);
@@ -472,6 +475,56 @@ describe("ProviderRuntimeIngestion", () => {
               });
             }
           }),
+        ),
+      acknowledgeCanonicalCursor: (input: {
+        environmentId: EnvironmentId;
+        threadId: ThreadId;
+        runtimeSessionId: RuntimeSessionId;
+        sourceSequence: number;
+        eventId: EventId;
+      }) =>
+        runtime!.runPromise(
+          providerSessionDirectory.upsert({
+            threadId: input.threadId,
+            provider: ProviderDriverKind.make("omp"),
+            providerInstanceId: ProviderInstanceId.make("omp"),
+            canonicalSourceCursor: {
+              ...input,
+              providerInstanceId: ProviderInstanceId.make("omp"),
+            },
+          }),
+        ),
+      installSourceTransferFence: (threadId: ThreadId) =>
+        runtime!.runPromise(
+          sql`
+            INSERT INTO scaffold_session_transfer_fences (
+              operation_id,
+              series_operation_id,
+              attempt_generation,
+              source_thread_id,
+              request_fingerprint_sha256,
+              captured_at,
+              status,
+              lease_owner,
+              lease_expires_at,
+              receipt_json,
+              created_at,
+              updated_at
+            ) VALUES (
+              'operation-provider-ingestion-fence',
+              'operation-provider-ingestion-fence',
+              1,
+              ${threadId},
+              ${"f".repeat(64)},
+              ${createdAt},
+              'active',
+              'owner-provider-ingestion-fence',
+              '2099-01-01T00:00:00.000Z',
+              NULL,
+              ${createdAt},
+              ${createdAt}
+            )
+          `,
         ),
       drain,
     };
@@ -1437,6 +1490,98 @@ describe("ProviderRuntimeIngestion", () => {
     );
   });
 
+  it("keeps canonical OMP metadata cursors advancing while source mutations are fenced", async () => {
+    const harness = await createHarness({ canonicalDeliveries: true });
+    const environmentId = EnvironmentId.make("environment-transfer-fence");
+    const threadId = asThreadId("thread-1");
+    const runtimeSessionId = RuntimeSessionId.make("session-transfer-fence");
+    const providerInstanceId = ProviderInstanceId.make("omp");
+    await harness.bindCanonicalRuntimeSession({ threadId, runtimeSessionId });
+    await harness.installSourceTransferFence(threadId);
+
+    const deliver = async (event: ProviderRuntimeEvent, sourceSequence: number) => {
+      const envelope: ProviderRuntimeEventEnvelope = {
+        protocolVersion: 1,
+        eventId: event.eventId,
+        environmentId,
+        threadId,
+        sourceSequence,
+        resumeCursor: {
+          kind: "omp",
+          schemaVersion: 3,
+          sessionId: runtimeSessionId,
+          eventSequence: sourceSequence,
+          acpSequence: sourceSequence,
+        },
+        providerInstanceId,
+        runtimeSessionId,
+        event,
+      };
+      let acknowledgeCount = 0;
+      let retryCount = 0;
+      let rejectCount = 0;
+      harness.emitDelivery({
+        envelope,
+        acknowledge: Effect.promise(async () => {
+          await harness.acknowledgeCanonicalCursor({
+            environmentId,
+            threadId,
+            runtimeSessionId,
+            sourceSequence,
+            eventId: event.eventId,
+          });
+          acknowledgeCount += 1;
+        }),
+        retry: () =>
+          Effect.sync(() => {
+            retryCount += 1;
+          }),
+        reject: () =>
+          Effect.sync(() => {
+            rejectCount += 1;
+          }),
+      });
+      await harness.drain();
+      expect({ acknowledgeCount, retryCount, rejectCount }).toEqual({
+        acknowledgeCount: 1,
+        retryCount: 0,
+        rejectCount: 0,
+      });
+    };
+
+    await deliver(
+      {
+        type: "thread.metadata.updated",
+        eventId: asEventId("omp:session-transfer-fence:1"),
+        provider: ProviderDriverKind.make("omp"),
+        providerInstanceId,
+        createdAt: "2026-01-01T00:00:01.000Z",
+        threadId,
+        payload: {
+          name: "Provider title during transfer",
+          metadata: { source: "omp" },
+        },
+      },
+      1,
+    );
+    await deliver(
+      {
+        type: "session.started",
+        eventId: asEventId("omp:session-transfer-fence:2"),
+        provider: ProviderDriverKind.make("omp"),
+        providerInstanceId,
+        createdAt: "2026-01-01T00:00:02.000Z",
+        threadId,
+        payload: {},
+      },
+      2,
+    );
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.title).toBe("Provider title during transfer");
+    expect(thread?.session?.status).toBe("ready");
+  });
+
   it("retries only acknowledgment after projection committed for the same envelope", async () => {
     const harness = await createHarness({ canonicalDeliveries: true });
     const environmentId = EnvironmentId.make("environment-ack-redelivery");
@@ -1922,7 +2067,10 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   it("does not repeat buffered assistant cache mutations when a canonical envelope is replayed", async () => {
-    const harness = await createHarness({ canonicalDeliveries: true });
+    const harness = await createHarness({
+      canonicalDeliveries: true,
+      serverSettings: { enableAssistantStreaming: false },
+    });
     const now = "2026-01-01T00:00:00.000Z";
     const environmentId = EnvironmentId.make("environment-buffered-replay");
     const threadId = asThreadId("thread-1");
@@ -2881,8 +3029,10 @@ describe("ProviderRuntimeIngestion", () => {
     expect(proposedPlan?.planMarkdown).toBe("## Buffered plan\n\n- first\n- second");
   });
 
-  it("buffers assistant deltas by default until completion", async () => {
-    const harness = await createHarness();
+  it("buffers assistant deltas when assistant streaming is disabled", async () => {
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: false },
+    });
     const now = "2026-01-01T00:00:00.000Z";
 
     harness.emit({
@@ -2950,7 +3100,9 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   it("flushes and completes buffered assistant text when an approval request opens", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: false },
+    });
     const now = "2026-01-01T00:00:00.000Z";
 
     harness.emit({
@@ -3010,7 +3162,9 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   it("flushes and completes buffered assistant text when user input is requested", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: false },
+    });
     const now = "2026-01-01T00:00:00.000Z";
 
     harness.emit({
@@ -3077,7 +3231,9 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   it("does not create assistant segments for whitespace-only buffered text at approval boundaries", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: false },
+    });
     const startedAt = "2026-03-28T06:28:00.000Z";
     const pausedAt = "2026-03-28T06:28:01.000Z";
 
@@ -3137,7 +3293,9 @@ describe("ProviderRuntimeIngestion", () => {
   });
 
   it("starts a new buffered assistant message segment after approval and completes without duplication", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: false },
+    });
     const startedAt = "2026-03-28T06:07:00.000Z";
     const pausedAt = "2026-03-28T06:07:01.000Z";
     const resumedAt = "2026-03-28T06:07:02.000Z";
@@ -3474,7 +3632,9 @@ describe("ProviderRuntimeIngestion", () => {
   );
 
   it("spills oversized buffered deltas and still finalizes full assistant text", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({
+      serverSettings: { enableAssistantStreaming: false },
+    });
     const now = "2026-01-01T00:00:00.000Z";
     const oversizedText = "x".repeat(40_000);
 

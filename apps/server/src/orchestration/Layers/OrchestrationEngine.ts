@@ -183,7 +183,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           .withTransaction(
             Effect.gen(function* () {
               if (isSourceMutationCommand(envelope.command)) {
-                yield* rejectSourceMutationWhileTransferIsActive(sql, envelope.command);
+                yield* rejectSourceMutationWhileTransferIsActive(
+                  sql,
+                  envelope.command,
+                  envelope.metadata,
+                );
               }
               const committedEvents: OrchestrationEvent[] = [];
               let nextCommandReadModel = commandReadModel;

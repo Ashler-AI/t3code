@@ -124,9 +124,12 @@ describe("ScaffoldWorkspaceMigrationCli", () => {
           };
         },
       },
+      environmentForDeployment: (deployment) => ({
+        SCAFFOLD_CONTROL_PLANE_URL: `https://${deployment}.example`,
+      }),
     });
 
-    await expect(cli.migrate(command)).resolves.toEqual(receipt);
+    await expect(cli.migrate(command, "staging")).resolves.toEqual(receipt);
     expect(command.source.capturedAt).toBe("2026-07-26T00:00:00.000Z");
     expect(command.credentialExclusions).toEqual(
       SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1,
@@ -139,6 +142,9 @@ describe("ScaffoldWorkspaceMigrationCli", () => {
         command: "scaffold-handoff",
         args: ["workspace-migrate", "--input", "-", "--json"],
         stdin: JSON.stringify(command),
+        env: {
+          SCAFFOLD_CONTROL_PLANE_URL: "https://staging.example",
+        },
       }),
     ]);
   });
@@ -201,7 +207,7 @@ describe("ScaffoldWorkspaceMigrationCli", () => {
       },
     });
 
-    await cli.migrate(commandWithHandshake, async (authority) => {
+    await cli.migrate(commandWithHandshake, "staging", async (authority) => {
       bound = authority;
     });
     expect(JSON.parse(files.get(acknowledgementPath) ?? "null")).toEqual({
@@ -232,17 +238,24 @@ describe("ScaffoldWorkspaceMigrationCli", () => {
     const operation = {
       operationId: command.operationId,
       requestFingerprintSha256: "8".repeat(64),
+      deployment: "staging" as const,
     };
     await cli.reconcile(operation);
     await cli.abort(operation);
     expect(calls).toEqual([
       expect.objectContaining({
         args: ["workspace-migration-status", "--input", "-", "--json"],
-        stdin: JSON.stringify(operation),
+        stdin: JSON.stringify({
+          operationId: operation.operationId,
+          requestFingerprintSha256: operation.requestFingerprintSha256,
+        }),
       }),
       expect.objectContaining({
         args: ["workspace-migration-abort", "--input", "-", "--json"],
-        stdin: JSON.stringify(operation),
+        stdin: JSON.stringify({
+          operationId: operation.operationId,
+          requestFingerprintSha256: operation.requestFingerprintSha256,
+        }),
       }),
     ]);
   });
@@ -265,6 +278,7 @@ describe("ScaffoldWorkspaceMigrationCli", () => {
       cli.reconcile({
         operationId: command.operationId,
         requestFingerprintSha256: "8".repeat(64),
+        deployment: "staging",
       }),
     ).resolves.toEqual({ error: "workspace_migration_operation_unknown" });
   });
@@ -286,7 +300,34 @@ describe("ScaffoldWorkspaceMigrationCli", () => {
       },
     });
 
-    await expect(cli.migrate(command)).rejects.toBeInstanceOf(ScaffoldWorkspaceMigrationCliError);
+    await expect(cli.migrate(command, "staging")).rejects.toBeInstanceOf(
+      ScaffoldWorkspaceMigrationCliError,
+    );
+  });
+
+  it("surfaces a safe Scaffold error code without response details", async () => {
+    const cli = makeScaffoldWorkspaceMigrationCli({
+      process: {
+        run: async () => ({
+          stdout: "",
+          stderr: `${JSON.stringify({
+            code: "workspace_migration_destination_not_ready",
+            status: 409,
+            body: { reason: "agent_transport_authority_missing" },
+          })}\n`,
+          code: 1,
+          timedOut: false,
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        }),
+      },
+    });
+
+    await expect(cli.migrate(command, "staging")).rejects.toMatchObject({
+      code: "workspace_migration_destination_not_ready",
+      detail: "Scaffold workspace migration failed (workspace_migration_destination_not_ready).",
+      status: 409,
+    });
   });
 
   it.each([
@@ -309,6 +350,8 @@ describe("ScaffoldWorkspaceMigrationCli", () => {
       },
     });
 
-    await expect(cli.migrate(command)).rejects.toBeInstanceOf(ScaffoldWorkspaceMigrationCliError);
+    await expect(cli.migrate(command, "staging")).rejects.toBeInstanceOf(
+      ScaffoldWorkspaceMigrationCliError,
+    );
   });
 });

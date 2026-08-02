@@ -2,9 +2,11 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EnvironmentId,
+  EventId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
+  RuntimeSessionId,
   SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1,
   SCAFFOLD_WORKSPACE_MIGRATION_UNSUPPORTED_FILESYSTEM_CASES_V1,
   ScaffoldSessionTransferStartInput,
@@ -623,6 +625,32 @@ it.layer(OrchestrationIntegrationLayer)("source transfer durable authority", (it
             },
           }),
         ),
+      );
+
+      yield* engine.dispatch(
+        {
+          type: "thread.meta.update",
+          commandId: CommandId.make("cmd-transfer-provider-metadata-update"),
+          threadId,
+          title: "Provider metadata remains projectable",
+        },
+        {
+          metadata: {
+            providerEventId: EventId.make("omp:session-transfer:222"),
+            providerEnvironmentId: sourceEnvironmentId,
+            providerThreadId: threadId,
+            providerSourceSequence: 222,
+            providerResumeCursor: {
+              kind: "omp",
+              schemaVersion: 3,
+              sessionId: RuntimeSessionId.make("session-transfer"),
+              eventSequence: 222,
+              acpSequence: 92,
+            },
+            providerInstanceId: ProviderInstanceId.make("omp-primary"),
+            providerRuntimeSessionId: RuntimeSessionId.make("session-transfer"),
+          },
+        },
       );
 
       const blocked = yield* engine

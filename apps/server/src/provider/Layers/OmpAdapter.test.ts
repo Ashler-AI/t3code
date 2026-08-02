@@ -34,6 +34,7 @@ import {
   ompPromptSettlementBelongsToContext,
   parseOmpResume,
   parseOmpSteerResult,
+  reserveOmpEventCursor,
   resumedOmpCursorForSession,
 } from "./OmpAdapter.ts";
 
@@ -143,6 +144,32 @@ it("advances OMP replay cursors contiguously and rejects gaps and duplicate boun
   assert.deepEqual(advanceOmpEventCursor({ currentSequence: 7, sourceSequence: 6 }), {
     sequence: 6,
     duplicate: true,
+  });
+});
+
+it("does not advance the canonical cursor for an already-offered OMP source event", () => {
+  const eventId = makeOmpSourceEventId("omp-session", 13, "content:assistant");
+  const duplicate = reserveOmpEventCursor({
+    currentSequence: 218,
+    sessionId: "omp-session",
+    offeredEventIds: new Set([eventId]),
+    source: { sequence: 13, discriminator: "content:assistant" },
+  });
+  assert.deepEqual(duplicate, {
+    sequence: 218,
+    eventId,
+    duplicate: true,
+  });
+
+  const next = reserveOmpEventCursor({
+    currentSequence: duplicate.sequence,
+    sessionId: "omp-session",
+    offeredEventIds: new Set([eventId]),
+  });
+  assert.deepEqual(next, {
+    sequence: 219,
+    eventId: makeOmpEventId("omp-session", 219),
+    duplicate: false,
   });
 });
 
@@ -1073,10 +1100,15 @@ it.layer(testLayer)("OmpAdapter", (it) => {
       );
       const adapter = yield* makeOmpAdapter(decodeOmpSettings({ binaryPath: wrapperPath }));
       const startedTurn = yield* Deferred.make<TurnId>();
+      const events: ProviderRuntimeEvent[] = [];
       const eventFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
-        event.type === "turn.started" && event.turnId
-          ? Deferred.succeed(startedTurn, event.turnId).pipe(Effect.ignore)
-          : Effect.void,
+        Effect.sync(() => events.push(event)).pipe(
+          Effect.andThen(
+            event.type === "turn.started" && event.turnId
+              ? Deferred.succeed(startedTurn, event.turnId).pipe(Effect.ignore)
+              : Effect.void,
+          ),
+        ),
       ).pipe(Effect.forkChild);
       yield* adapter.startSession({
         threadId,
@@ -1095,6 +1127,14 @@ it.layer(testLayer)("OmpAdapter", (it) => {
       const requestLog = yield* Effect.promise(() => NodeFSP.readFile(requestLogPath, "utf8"));
       assert.include(requestLog, '"method":"_omp/session/steer"');
       assert.include(requestLog, '"sessionId":"mock-session-1","text":"steer"');
+      assert.isTrue(
+        events.some(
+          (event) =>
+            event.type === "session.state.changed" &&
+            event.payload.state === "running" &&
+            event.payload.reason === "OMP native steer accepted into the active turn",
+        ),
+      );
 
       yield* Fiber.interrupt(firstTurnFiber);
       yield* adapter.stopSession(threadId);

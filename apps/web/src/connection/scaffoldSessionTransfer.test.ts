@@ -344,7 +344,7 @@ describe("Scaffold session copy client", () => {
         (error: unknown) => ({ _tag: "Rejected" as const, error }),
       );
       await firstFetch;
-      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.advanceTimersByTimeAsync(4 * 60_000 + 1);
       const unresolvedOutcome = await settled;
       expect(unresolvedOutcome._tag).toBe("Rejected");
       if (unresolvedOutcome._tag === "Rejected") {
@@ -408,7 +408,7 @@ describe("Scaffold session copy client", () => {
       const rejection = expect(result).rejects.toThrow("safely aborted");
       await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
       await vi.advanceTimersByTimeAsync(30_000);
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
       await rejection;
       expect(urls[0]).toBe("http://127.0.0.1:4773/mounted/api/scaffold/session-transfer");
       expect(urls.filter((url) => url.endsWith("/abort"))).toHaveLength(1);

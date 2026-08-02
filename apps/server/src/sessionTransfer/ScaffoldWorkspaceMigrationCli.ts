@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import {
+  type ScaffoldDeployment,
   SCAFFOLD_WORKSPACE_MIGRATION_CREDENTIAL_EXCLUSIONS_V1,
   SCAFFOLD_WORKSPACE_MIGRATION_UNSUPPORTED_FILESYSTEM_CASES_V1,
   ScaffoldWorkspaceMigrationAuthorityAcknowledgement,
@@ -16,6 +17,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import { ProcessRunner } from "../processRunner.ts";
+import { resolveScaffoldTarget } from "../scaffold/ScaffoldConfig.ts";
 
 export class ScaffoldWorkspaceMigrationCliError extends Data.TaggedError(
   "ScaffoldWorkspaceMigrationCliError",
@@ -32,6 +34,7 @@ export interface ScaffoldWorkspaceMigrationProcessPort {
     readonly stdin: string;
     readonly timeout: Duration.Input;
     readonly maxOutputBytes: number;
+    readonly env?: NodeJS.ProcessEnv;
   }) => Promise<{
     readonly stdout: string;
     readonly stderr: string;
@@ -99,14 +102,22 @@ function validateReceipt(
 export function makeScaffoldWorkspaceMigrationCli(options: {
   readonly process: ScaffoldWorkspaceMigrationProcessPort;
   readonly authorityFiles?: AuthorityFiles;
+  readonly environmentForDeployment?: (deployment: ScaffoldDeployment) => NodeJS.ProcessEnv;
 }) {
-  const run = async (args: ReadonlyArray<string>, input: unknown) => {
+  const run = async (
+    args: ReadonlyArray<string>,
+    input: unknown,
+    deployment: ScaffoldDeployment,
+  ) => {
     const output = await options.process.run({
       command: "scaffold-handoff",
       args,
       stdin: JSON.stringify(input),
       timeout: Duration.minutes(5),
       maxOutputBytes: 1024 * 1024,
+      ...(options.environmentForDeployment
+        ? { env: options.environmentForDeployment(deployment) }
+        : {}),
     });
     if (output.timedOut || output.code !== 0) {
       let errorStatus: number | undefined;
@@ -114,9 +125,8 @@ export function makeScaffoldWorkspaceMigrationCli(options: {
       try {
         const lastLine = output.stderr
           .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .at(-1);
+          .findLast((line) => line.trim().length > 0)
+          ?.trim();
         const error = JSON.parse(lastLine ?? "null") as Record<string, unknown>;
         if (typeof error.status === "number") errorStatus = error.status;
         if (typeof error.code === "string") errorCode = error.code;
@@ -129,7 +139,9 @@ export function makeScaffoldWorkspaceMigrationCli(options: {
           : (errorCode ?? "scaffold_workspace_migration_failed"),
         detail: output.timedOut
           ? "Scaffold workspace migration timed out."
-          : `Scaffold workspace migration failed with exit code ${String(output.code)}.`,
+          : errorCode
+            ? `Scaffold workspace migration failed (${errorCode}).`
+            : `Scaffold workspace migration failed with exit code ${String(output.code)}.`,
         ...(errorStatus === undefined ? {} : { status: errorStatus }),
       });
     }
@@ -145,11 +157,16 @@ export function makeScaffoldWorkspaceMigrationCli(options: {
 
   const migrate = async (
     command: ScaffoldWorkspaceMigrationCommand,
+    deployment: ScaffoldDeployment,
     bindAuthority?: (
       binding: ScaffoldWorkspaceMigrationAuthorityProposal["binding"],
     ) => Promise<void>,
   ): Promise<ScaffoldWorkspaceMigrationReceipt> => {
-    const processPromise = run(["workspace-migrate", "--input", "-", "--json"], command);
+    const processPromise = run(
+      ["workspace-migrate", "--input", "-", "--json"],
+      command,
+      deployment,
+    );
     const handshake = command.authorityHandshake;
     if (bindAuthority && handshake) {
       const files = options.authorityFiles;
@@ -226,10 +243,15 @@ export function makeScaffoldWorkspaceMigrationCli(options: {
 
   const reconcileOrAbort = async (
     command: "workspace-migration-status" | "workspace-migration-abort",
-    input: { operationId: string; requestFingerprintSha256: string },
+    input: {
+      operationId: string;
+      requestFingerprintSha256: string;
+      deployment: ScaffoldDeployment;
+    },
   ) => {
+    const { deployment, ...operation } = input;
     try {
-      return await run([command, "--input", "-", "--json"], input);
+      return await run([command, "--input", "-", "--json"], operation, deployment);
     } catch (error) {
       if (error instanceof ScaffoldWorkspaceMigrationCliError && error.status === 404) {
         return { error: "workspace_migration_operation_unknown" };
@@ -237,10 +259,16 @@ export function makeScaffoldWorkspaceMigrationCli(options: {
       throw error;
     }
   };
-  const reconcile = (input: { operationId: string; requestFingerprintSha256: string }) =>
-    reconcileOrAbort("workspace-migration-status", input);
-  const abort = (input: { operationId: string; requestFingerprintSha256: string }) =>
-    reconcileOrAbort("workspace-migration-abort", input);
+  const reconcile = (input: {
+    operationId: string;
+    requestFingerprintSha256: string;
+    deployment: ScaffoldDeployment;
+  }) => reconcileOrAbort("workspace-migration-status", input);
+  const abort = (input: {
+    operationId: string;
+    requestFingerprintSha256: string;
+    deployment: ScaffoldDeployment;
+  }) => reconcileOrAbort("workspace-migration-abort", input);
 
   return { migrate, reconcile, abort };
 }
@@ -254,6 +282,21 @@ export const makeLiveScaffoldWorkspaceMigrationCli = Effect.fn(
   return makeScaffoldWorkspaceMigrationCli({
     process: {
       run: (input) => runner.run(input).pipe(Effect.runPromise),
+    },
+    environmentForDeployment: (deployment) => {
+      const target = resolveScaffoldTarget(deployment);
+      const bearerPrefix = "Bearer ";
+      if (!target.authorization.startsWith(bearerPrefix)) {
+        throw new ScaffoldWorkspaceMigrationCliError({
+          code: "scaffold_workspace_migration_auth_invalid",
+          detail: "Scaffold workspace migration authentication is invalid.",
+        });
+      }
+      return {
+        ...process.env,
+        SCAFFOLD_CONTROL_PLANE_URL: target.baseUrl,
+        SCAFFOLD_AGENT_HANDOFF_TOKEN: target.authorization.slice(bearerPrefix.length),
+      };
     },
     authorityFiles: {
       read: (filePath) =>
