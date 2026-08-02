@@ -6,10 +6,13 @@ import {
   decideEventAppend,
   decideRunnerGeneration,
   commandTargetsRunnerGeneration,
+  commandNeedsScaffoldWakeRetry,
   isCurrentRunnerAttachment,
   runnerHelloMatchesLease,
   SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
   SESSION_FABRIC_PERMISSION_CLOSE_CODE,
+  scaffoldWakeRetryDelayMs,
+  resolveScaffoldWakeActorId,
   shouldReplayCommand,
 } from "./SessionStreamModel.ts";
 
@@ -160,5 +163,77 @@ describe("SessionStreamModel", () => {
         runnerGeneration: 7,
       }),
     ).toBe(false);
+  });
+  it("retries only unfinished Scaffold wake commands with persisted actor identity", () => {
+    expect(
+      commandNeedsScaffoldWakeRetry({
+        status: "queued",
+        targetRunnerGeneration: 8,
+        runnerGeneration: 7,
+        wakeActorId: "actor-a",
+      }),
+    ).toBe(true);
+    expect(
+      commandNeedsScaffoldWakeRetry({
+        status: "accepted",
+        targetRunnerGeneration: 8,
+        runnerGeneration: 7,
+        wakeActorId: "actor-a",
+      }),
+    ).toBe(false);
+    expect(
+      commandNeedsScaffoldWakeRetry({
+        status: "queued",
+        targetRunnerGeneration: 7,
+        runnerGeneration: 7,
+        wakeActorId: "actor-a",
+      }),
+    ).toBe(false);
+    expect(
+      commandNeedsScaffoldWakeRetry({
+        status: "queued",
+        targetRunnerGeneration: 8,
+        runnerGeneration: 7,
+        wakeActorId: null,
+      }),
+    ).toBe(false);
+  });
+  it("backs off Scaffold wake retries and expires stalled commands", () => {
+    const wakeStartedAt = "2026-07-28T20:00:00.000Z";
+    const wakeStartedAtMs = Date.parse(wakeStartedAt);
+    expect(scaffoldWakeRetryDelayMs({ wakeStartedAt, nowMs: wakeStartedAtMs })).toBe(2_000);
+    expect(scaffoldWakeRetryDelayMs({ wakeStartedAt, nowMs: wakeStartedAtMs + 20_000 })).toBe(
+      5_000,
+    );
+    expect(scaffoldWakeRetryDelayMs({ wakeStartedAt, nowMs: wakeStartedAtMs + 60_000 })).toBe(
+      15_000,
+    );
+    expect(scaffoldWakeRetryDelayMs({ wakeStartedAt, nowMs: wakeStartedAtMs + 3 * 60_000 })).toBe(
+      60_000,
+    );
+    expect(
+      scaffoldWakeRetryDelayMs({ wakeStartedAt, nowMs: wakeStartedAtMs + 10 * 60_000 }),
+    ).toBeNull();
+    expect(
+      scaffoldWakeRetryDelayMs({ wakeStartedAt: "invalid", nowMs: wakeStartedAtMs }),
+    ).toBeNull();
+  });
+  it("coalesces concurrent wake commands on the first actor for one generation", () => {
+    expect(
+      resolveScaffoldWakeActorId({
+        claimedGeneration: 8,
+        claimedActorId: "actor-a",
+        targetRunnerGeneration: 8,
+        candidateActorId: "actor-b",
+      }),
+    ).toBe("actor-a");
+    expect(
+      resolveScaffoldWakeActorId({
+        claimedGeneration: 8,
+        claimedActorId: "actor-a",
+        targetRunnerGeneration: 9,
+        candidateActorId: "actor-b",
+      }),
+    ).toBe("actor-b");
   });
 });

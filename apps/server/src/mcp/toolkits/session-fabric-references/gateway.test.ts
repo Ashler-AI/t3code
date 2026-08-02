@@ -105,9 +105,31 @@ describe("SessionFabricGateway", () => {
       resolveSessionFabricGatewayRelayUrl(null, "https://build-relay.example/base/")?.href,
     ).toBe("https://build-relay.example/base/");
     expect(resolveSessionFabricGatewayRelayUrl(null, "file:///tmp/relay")).toBeNull();
+    expect(
+      resolveSessionFabricGatewayRelayUrl(
+        new URL("http://relay.example/runtime"),
+        "https://build-relay.example/base/",
+      )?.href,
+    ).toBe("https://build-relay.example/base/");
+    expect(
+      resolveSessionFabricGatewayRelayUrl(
+        new URL("file:///tmp/runtime-relay"),
+        "https://build-relay.example/base/",
+      )?.href,
+    ).toBe("https://build-relay.example/base/");
+    expect(
+      resolveSessionFabricGatewayRelayUrl(
+        new URL("https://user:password@runtime-relay.example/"),
+        "https://build-relay.example/base/",
+      )?.href,
+    ).toBe("https://build-relay.example/base/");
+    expect(resolveSessionFabricGatewayRelayUrl(null, "http://relay.example/build/")).toBeNull();
+    expect(resolveSessionFabricGatewayRelayUrl(null, "http://localhost:8787/base/")?.href).toBe(
+      "http://localhost:8787/base/",
+    );
   });
 
-  it.effect("allows disabled authorization only for loopback HTTP", () =>
+  it.effect("allows disabled authorization only for canonical loopback URLs", () =>
     Effect.gen(function* () {
       let loopbackAuthorization: string | null | undefined;
       const loopbackGateway = makeSessionFabricGateway({
@@ -121,20 +143,25 @@ describe("SessionFabricGateway", () => {
       expect((yield* loopbackGateway.search({ query: "oauth", limit: 1 })).results).toEqual([]);
       expect(loopbackAuthorization).toBeNull();
 
-      let remoteFetchCalled = false;
-      const remoteGateway = makeSessionFabricGateway({
-        relayBaseUrl: new URL("https://relay.example/"),
-        authMode: "disabled",
-        fetch: async () => {
-          remoteFetchCalled = true;
-          return Response.json({ results: [] });
-        },
-      });
-      const error = yield* remoteGateway.search({ query: "oauth", limit: 1 }).pipe(Effect.flip);
-      expect(error.detail).toBe(
-        "Disabled session fabric authorization is restricted to loopback HTTP.",
-      );
-      expect(remoteFetchCalled).toBe(false);
+      for (const relayBaseUrl of [
+        new URL("https://relay.example/"),
+        new URL("http://127.0.0.2:8787/"),
+      ]) {
+        let remoteFetchCalled = false;
+        const remoteGateway = makeSessionFabricGateway({
+          relayBaseUrl,
+          authMode: "disabled",
+          fetch: async () => {
+            remoteFetchCalled = true;
+            return Response.json({ results: [] });
+          },
+        });
+        const error = yield* remoteGateway.search({ query: "oauth", limit: 1 }).pipe(Effect.flip);
+        expect(error.detail).toBe(
+          "Disabled session fabric authorization requires a loopback relay.",
+        );
+        expect(remoteFetchCalled).toBe(false);
+      }
     }),
   );
 

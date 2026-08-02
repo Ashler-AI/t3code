@@ -167,33 +167,51 @@ function parseWakeResponse(
   return response as unknown as SessionFabricScaffoldWakeResponse;
 }
 
-async function fetchWithDeadline(input: {
-  readonly fetch: SessionFabricWakeFetch;
+function requestWakeWithDeadline(input: {
+  readonly fetch: typeof fetch;
   readonly url: URL;
   readonly init: RequestInit;
   readonly timeoutMs: number;
-}): Promise<Response> {
-  const controller = new AbortController();
-  const deadlineController = new AbortController();
-  const deadline = Effect.runPromise(
-    Effect.sleep(`${input.timeoutMs} millis`).pipe(
-      Effect.tap(() => Effect.sync(() => controller.abort())),
-      Effect.flatMap(() =>
-        Effect.fail(new SessionFabricScaffoldWakeError({ reason: "timeout", status: null })),
-      ),
-    ),
-    { signal: deadlineController.signal },
+}) {
+  const request = Effect.callback<
+    { readonly status: number; readonly value: unknown | null },
+    SessionFabricScaffoldWakeError
+  >((resume, signal) => {
+    const run = async () => {
+      const response = await input.fetch(input.url, {
+        ...input.init,
+        signal,
+      });
+      if (response.status !== 200 && response.status !== 202) {
+        await (response.body?.cancel() ?? Promise.resolve()).catch(() => undefined);
+        return { status: response.status, value: null };
+      }
+      try {
+        return { status: response.status, value: (await response.json()) as unknown };
+      } catch {
+        throw new SessionFabricScaffoldWakeError({
+          reason: "response",
+          status: response.status,
+        });
+      }
+    };
+    void run().then(
+      (result) => resume(Effect.succeed(result)),
+      (cause: unknown) =>
+        resume(
+          Effect.fail(
+            isSessionFabricScaffoldWakeError(cause)
+              ? cause
+              : new SessionFabricScaffoldWakeError({ reason: "transport", status: null }),
+          ),
+        ),
+    );
+  });
+  const deadline = Effect.sleep(`${input.timeoutMs} millis`).pipe(
+    Effect.flatMap(() => new SessionFabricScaffoldWakeError({ reason: "timeout", status: null })),
   );
-  try {
-    return await Promise.race([
-      input.fetch(input.url, { ...input.init, signal: controller.signal }),
-      deadline,
-    ]);
-  } finally {
-    deadlineController.abort();
-  }
+  return Effect.raceFirst(request, deadline);
 }
-
 export const wakeScaffoldSession = Effect.fn("session_fabric.wake_scaffold_session")(function* (
   config: SessionFabricScaffoldWakeConfig,
   request: Omit<SessionFabricScaffoldWakeRequest, "version">,
@@ -216,39 +234,27 @@ export const wakeScaffoldSession = Effect.fn("session_fabric.wake_scaffold_sessi
     try: () => signWakeRequest(config.secret, timestamp, body),
     catch: () => new SessionFabricScaffoldWakeError({ reason: "transport", status: null }),
   });
-  const response = yield* Effect.tryPromise({
-    try: () =>
-      fetchWithDeadline({
-        fetch: options.fetch ?? globalThis.fetch.bind(globalThis),
-        url: config.url,
-        init: {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            [SESSION_FABRIC_SCAFFOLD_WAKE_TIMESTAMP_HEADER]: timestamp,
-            [SESSION_FABRIC_SCAFFOLD_WAKE_SIGNATURE_HEADER]: signature,
-          },
-          body,
-        },
-        timeoutMs: config.timeoutMs,
-      }),
-    catch: (cause) =>
-      isSessionFabricScaffoldWakeError(cause)
-        ? cause
-        : new SessionFabricScaffoldWakeError({ reason: "transport", status: null }),
+  const response = yield* requestWakeWithDeadline({
+    fetch: options.fetch ?? globalThis.fetch.bind(globalThis),
+    url: config.url,
+    init: {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        [SESSION_FABRIC_SCAFFOLD_WAKE_TIMESTAMP_HEADER]: timestamp,
+        [SESSION_FABRIC_SCAFFOLD_WAKE_SIGNATURE_HEADER]: signature,
+      },
+      body,
+    },
+    timeoutMs: config.timeoutMs,
   });
   if (response.status !== 200 && response.status !== 202) {
-    yield* Effect.promise(() => response.body?.cancel() ?? Promise.resolve()).pipe(Effect.ignore);
     return yield* new SessionFabricScaffoldWakeError({
       reason: "response",
       status: response.status,
     });
   }
-  const value = yield* Effect.tryPromise({
-    try: () => response.json() as Promise<unknown>,
-    catch: () =>
-      new SessionFabricScaffoldWakeError({ reason: "response", status: response.status }),
-  });
+  const value = response.value;
   return yield* Effect.try({
     try: () => parseWakeResponse(value, payload),
     catch: (cause) =>

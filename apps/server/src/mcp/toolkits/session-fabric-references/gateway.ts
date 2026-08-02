@@ -19,6 +19,7 @@ import {
   type SessionFabricSearchResponse as SessionFabricSearchResponseType,
   type SessionFabricSessionId,
 } from "@t3tools/contracts/session-fabric";
+import { isLoopbackSessionFabricRequestUrl } from "@t3tools/shared/sessionFabricCapability";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -116,16 +117,15 @@ const buildSessionFabricRelayUrl =
     ? undefined
     : __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__;
 
-function normalizeSessionFabricRelayUrl(value: string | undefined): URL | null {
-  const normalized = value?.trim();
+function normalizeSessionFabricRelayUrl(value: string | URL | null | undefined): URL | null {
+  const normalized = typeof value === "string" ? value.trim() : value?.href;
   if (!normalized) return null;
   try {
     const url = new URL(normalized);
-    return (url.protocol === "http:" || url.protocol === "https:") &&
-      url.username.length === 0 &&
-      url.password.length === 0
-      ? url
-      : null;
+    const protocolAllowed =
+      url.protocol === "https:" ||
+      (url.protocol === "http:" && isLoopbackSessionFabricRequestUrl(url.href));
+    return protocolAllowed && url.username.length === 0 && url.password.length === 0 ? url : null;
   } catch {
     return null;
   }
@@ -135,7 +135,7 @@ export function resolveSessionFabricGatewayRelayUrl(
   runtimeUrl: URL | null,
   buildUrl = buildSessionFabricRelayUrl,
 ): URL | null {
-  return runtimeUrl ?? normalizeSessionFabricRelayUrl(buildUrl);
+  return normalizeSessionFabricRelayUrl(runtimeUrl) ?? normalizeSessionFabricRelayUrl(buildUrl);
 }
 
 function apiUrl(relayBaseUrl: URL, resource: "search" | "context"): URL {
@@ -146,14 +146,8 @@ function apiUrl(relayBaseUrl: URL, resource: "search" | "context"): URL {
   return url;
 }
 
-function isLoopbackHttpRelay(url: URL): boolean {
-  return (
-    url.protocol === "http:" &&
-    (url.hostname === "localhost" ||
-      url.hostname === "::1" ||
-      url.hostname === "[::1]" ||
-      url.hostname.startsWith("127."))
-  );
+function isLoopbackRelay(url: URL): boolean {
+  return isLoopbackSessionFabricRequestUrl(url.href);
 }
 
 export function sessionFabricGatewayWebSocketUrl(
@@ -311,12 +305,12 @@ export function makeSessionFabricGateway(
     capabilityRequest: ScaffoldSessionFabricCapabilityInput,
   ): Effect.Effect<SessionFabricCapabilityGrant | null, SessionFabricGatewayError> => {
     if (options.authMode === "disabled") {
-      return isLoopbackHttpRelay(relayBaseUrl)
+      return isLoopbackRelay(relayBaseUrl)
         ? Effect.succeed(null)
         : Effect.fail(
             new SessionFabricGatewayError({
               operation,
-              detail: "Disabled session fabric authorization is restricted to loopback HTTP.",
+              detail: "Disabled session fabric authorization requires a loopback relay.",
             }),
           );
     }

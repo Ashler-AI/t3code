@@ -100,3 +100,41 @@ export function commandTargetsRunnerGeneration(input: {
     input.targetRunnerGeneration === null || input.targetRunnerGeneration === input.runnerGeneration
   );
 }
+
+export function commandNeedsScaffoldWakeRetry(input: {
+  readonly status: string;
+  readonly targetRunnerGeneration: number | null;
+  readonly runnerGeneration: number;
+  readonly wakeActorId: string | null;
+}): boolean {
+  return (
+    shouldReplayCommand(input.status) &&
+    input.wakeActorId !== null &&
+    input.targetRunnerGeneration === input.runnerGeneration + 1
+  );
+}
+
+export function scaffoldWakeRetryDelayMs(input: {
+  readonly wakeStartedAt: string;
+  readonly nowMs: number;
+}): number | null {
+  const wakeStartedAtMs = Date.parse(input.wakeStartedAt);
+  if (!Number.isFinite(wakeStartedAtMs)) return null;
+  const elapsedMs = Math.max(0, input.nowMs - wakeStartedAtMs);
+  if (elapsedMs >= 10 * 60_000) return null;
+  if (elapsedMs < 10_000) return 2_000;
+  if (elapsedMs < 30_000) return 5_000;
+  if (elapsedMs < 2 * 60_000) return 15_000;
+  return 60_000;
+}
+
+export function resolveScaffoldWakeActorId(input: {
+  readonly claimedGeneration: number | null;
+  readonly claimedActorId: string | null;
+  readonly targetRunnerGeneration: number;
+  readonly candidateActorId: string;
+}): string {
+  return input.claimedGeneration === input.targetRunnerGeneration && input.claimedActorId !== null
+    ? input.claimedActorId
+    : input.candidateActorId;
+}

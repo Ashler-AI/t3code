@@ -250,6 +250,26 @@ jobs:
             exit 1
           fi
 
+          if ! node -e '
+            const raw = process.argv[1];
+            try {
+              const url = new URL(raw);
+              const valid =
+                raw === raw.trim() &&
+                url.protocol === "https:" &&
+                url.username.length === 0 &&
+                url.password.length === 0 &&
+                url.search.length === 0 &&
+                url.hash.length === 0;
+              process.exit(valid ? 0 : 1);
+            } catch {
+              process.exit(1);
+            }
+          ' "$SESSION_FABRIC_RELAY_URL"; then
+            echo "SESSION_FABRIC_RELAY_URL must be an HTTPS URL without credentials, query, or fragment." >&2
+            exit 1
+          fi
+
           echo "clerk_publishable_key=$CLERK_PUBLISHABLE_KEY" >> "$GITHUB_OUTPUT"
           echo "clerk_jwt_template=$CLERK_JWT_TEMPLATE" >> "$GITHUB_OUTPUT"
           echo "clerk_cli_oauth_client_id=$CLERK_CLI_OAUTH_CLIENT_ID" >> "$GITHUB_OUTPUT"

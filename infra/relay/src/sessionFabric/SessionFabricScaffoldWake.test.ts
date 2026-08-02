@@ -1,5 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 
 import {
   scaffoldWakeFailureIsDefinitive,
@@ -154,11 +156,44 @@ describe("SessionFabricScaffoldWake", () => {
   it.effect("bounds a transport that never settles", () =>
     Effect.gen(function* () {
       const bounded = { ...config, timeoutMs: 5 };
-      const error = yield* wakeScaffoldSession(bounded, request, {
-        fetch: () => new Promise<Response>(() => undefined),
-      }).pipe(Effect.flip);
+      let markStarted = () => {};
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const fiber = yield* wakeScaffoldSession(bounded, request, {
+        fetch: () => {
+          markStarted();
+          return new Promise<Response>(() => undefined);
+        },
+      }).pipe(Effect.flip, Effect.forkChild);
+      yield* Effect.promise(() => started);
+      yield* TestClock.adjust("5 millis");
+      const error = yield* Fiber.join(fiber);
 
       expect(error.reason).toBe("timeout");
+    }),
+  );
+  it.effect("bounds a response body that never settles", () =>
+    Effect.gen(function* () {
+      const bounded = { ...config, timeoutMs: 5 };
+      let capturedSignal: AbortSignal | undefined;
+      let markStarted = () => {};
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const fiber = yield* wakeScaffoldSession(bounded, request, {
+        fetch: async (_input, init) => {
+          capturedSignal = init?.signal ?? undefined;
+          markStarted();
+          return new Response(new ReadableStream({ start() {} }), { status: 202 });
+        },
+      }).pipe(Effect.flip, Effect.forkChild);
+      yield* Effect.promise(() => started);
+      yield* TestClock.adjust("5 millis");
+      const error = yield* Fiber.join(fiber);
+
+      expect(error.reason).toBe("timeout");
+      expect(capturedSignal?.aborted).toBe(true);
     }),
   );
 });
