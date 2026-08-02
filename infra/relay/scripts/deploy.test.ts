@@ -216,6 +216,28 @@ describe("release workflow tracing config propagation", () => {
       expect(workflow).toContain('cat "$config_path" >> "$GITHUB_ENV"');
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("requires and forwards the session fabric relay to every packaged client", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const workflowPath = yield* path.fromFileUrl(
+        new URL("../../../.github/workflows/release.yml", import.meta.url),
+      );
+      const workflow = yield* fileSystem.readFileString(workflowPath);
+
+      expect(workflow).toContain("SESSION_FABRIC_RELAY_URL: ${{ vars.SESSION_FABRIC_RELAY_URL }}");
+      expect(workflow).toContain(
+        "session_fabric_relay_url: ${{ steps.public_config.outputs.session_fabric_relay_url }}",
+      );
+      expect(workflow).toContain(
+        "T3CODE_SESSION_FABRIC_RELAY_URL: ${{ needs.relay_public_config.outputs.session_fabric_relay_url }}",
+      );
+      expect(workflow).toContain(
+        '--build-env "T3CODE_SESSION_FABRIC_RELAY_URL=${T3CODE_SESSION_FABRIC_RELAY_URL:-}"',
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });
 
 describe("publicConfigFromOutput", () => {

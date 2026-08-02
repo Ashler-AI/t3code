@@ -49,6 +49,7 @@ import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 
 import {
+  commandTargetsRunnerGeneration,
   decideAuthorizedCommandSubmit,
   decideCommandSubmit,
   decideEventAppend,
@@ -58,6 +59,11 @@ import {
   SESSION_FABRIC_PERMISSION_CLOSE_CODE,
   shouldReplayCommand,
 } from "./SessionStreamModel.ts";
+import {
+  resolveSessionFabricScaffoldWakeConfig,
+  scaffoldWakeFailureIsDefinitive,
+  wakeScaffoldSession,
+} from "./SessionFabricScaffoldWake.ts";
 import SessionDirectory from "./SessionDirectory.ts";
 
 interface SocketAttachment {
@@ -232,6 +238,7 @@ interface CommandRow {
   readonly result_sequence: number | null;
   readonly detail: string | null;
   readonly updated_at: string;
+  readonly target_runner_generation: number | null;
 }
 
 interface ContextRow {
@@ -298,6 +305,17 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       audience: Option.getOrUndefined(authAudience),
       publicKeysJson: Option.getOrUndefined(authPublicKeys),
     });
+    const scaffoldWakeConfig = resolveSessionFabricScaffoldWakeConfig({
+      url: Option.getOrUndefined(
+        yield* Config.string("SESSION_FABRIC_SCAFFOLD_WAKE_URL").pipe(Config.option),
+      ),
+      secret: Option.getOrUndefined(
+        yield* Config.string("SESSION_FABRIC_SCAFFOLD_WAKE_SECRET").pipe(Config.option),
+      ),
+      timeoutMs: Option.getOrUndefined(
+        yield* Config.string("SESSION_FABRIC_SCAFFOLD_WAKE_TIMEOUT_MS").pipe(Config.option),
+      ),
+    });
     return Effect.gen(function* () {
       const state = yield* Cloudflare.DurableObjectState;
       const { sql } = state.storage;
@@ -331,9 +349,21 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         .pipe(Effect.asVoid);
       yield* sql
         .exec(
-          "CREATE TABLE IF NOT EXISTS session_commands (command_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, status TEXT NOT NULL, result_sequence INTEGER, detail TEXT, updated_at TEXT NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS session_commands (command_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, status TEXT NOT NULL, result_sequence INTEGER, detail TEXT, updated_at TEXT NOT NULL, target_runner_generation INTEGER)",
         )
         .pipe(Effect.asVoid);
+      const commandColumns = yield* sql.exec<{ readonly name: string }>(
+        "PRAGMA table_info(session_commands)",
+      );
+      if (
+        !(yield* commandColumns.toArray()).some(
+          (column) => column.name === "target_runner_generation",
+        )
+      ) {
+        yield* sql
+          .exec("ALTER TABLE session_commands ADD COLUMN target_runner_generation INTEGER")
+          .pipe(Effect.asVoid);
+      }
       yield* sql
         .exec(
           "CREATE TABLE IF NOT EXISTS session_context (id INTEGER PRIMARY KEY CHECK (id = 1), code_diff TEXT, continuation_ref TEXT, published_at TEXT NOT NULL)",
@@ -592,7 +622,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
       ) {
         const existing = yield* sql
           .exec<CommandRow>(
-            "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
+            "SELECT command_id, payload_json, status, result_sequence, detail, updated_at, target_runner_generation FROM session_commands WHERE command_id = ? LIMIT 1",
             receipt.commandId,
           )
           .pipe(
@@ -613,13 +643,18 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         yield* broadcast("client", { type: "command.receipt", receipt });
       });
 
-      const rejectPendingCommands = Effect.fn("session_fabric.reject_pending_commands")(function* (
+      const pendingCommands = Effect.fn("session_fabric.pending_commands")(function* () {
+        const cursor = yield* sql.exec<CommandRow>(
+          "SELECT command_id, payload_json, status, result_sequence, detail, updated_at, target_runner_generation FROM session_commands WHERE status IN ('queued', 'delivered') ORDER BY rowid ASC",
+        );
+        return yield* cursor.toArray();
+      });
+
+      const rejectCommandRows = Effect.fn("session_fabric.reject_command_rows")(function* (
+        rows: ReadonlyArray<CommandRow>,
         detail: string,
       ) {
-        const cursor = yield* sql.exec<CommandRow>(
-          "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE status IN ('queued', 'delivered') ORDER BY rowid ASC",
-        );
-        for (const row of yield* cursor.toArray()) {
+        for (const row of rows) {
           const command = decodeCommand(row.payload_json);
           yield* storeReceipt({
             sessionId: command.sessionId,
@@ -632,21 +667,64 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
         }
       });
 
+      const rejectPendingCommandsForGeneration = Effect.fn(
+        "session_fabric.reject_pending_commands_for_generation",
+      )(function* (runnerGeneration: number, detail: string) {
+        yield* rejectCommandRows(
+          (yield* pendingCommands()).filter(
+            (row) =>
+              row.target_runner_generation === null ||
+              row.target_runner_generation === runnerGeneration,
+          ),
+          detail,
+        );
+      });
+
+      const rejectPendingCommandsExceptGeneration = Effect.fn(
+        "session_fabric.reject_pending_commands_except_generation",
+      )(function* (runnerGeneration: number, detail: string) {
+        yield* rejectCommandRows(
+          (yield* pendingCommands()).filter(
+            (row) =>
+              row.target_runner_generation === null ||
+              row.target_runner_generation !== runnerGeneration,
+          ),
+          detail,
+        );
+      });
+
       const dispatchPendingCommands = Effect.fn("session_fabric.dispatch_pending_commands")(
-        function* () {
+        function* (replayDelivered = true) {
           const snapshot = yield* readSnapshot();
           if (snapshot === null) return;
           const meta = yield* readMeta();
+          const pending = yield* pendingCommands();
+          yield* rejectCommandRows(
+            pending.filter(
+              (row) =>
+                !commandTargetsRunnerGeneration({
+                  targetRunnerGeneration: row.target_runner_generation,
+                  runnerGeneration: meta.runner_generation,
+                }),
+            ),
+            "Runner generation changed",
+          );
           const runners = yield* eligibleRunners(snapshot, meta);
           const runner = runners.at(0);
           if (runner === undefined || meta.runner_state !== "online") {
-            return yield* rejectPendingCommands("Session runner is offline");
+            return;
           }
-          const cursor = yield* sql.exec<CommandRow>(
-            "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE status IN ('queued', 'delivered') ORDER BY rowid ASC",
-          );
-          for (const row of yield* cursor.toArray()) {
+          for (const row of pending) {
             if (!shouldReplayCommand(row.status)) continue;
+            if (
+              !commandTargetsRunnerGeneration({
+                targetRunnerGeneration: row.target_runner_generation,
+                runnerGeneration: meta.runner_generation,
+              }) ||
+              (!replayDelivered && row.status === "delivered")
+            ) {
+              continue;
+            }
             const command = decodeCommand(row.payload_json);
             const frame = encodeFrame({ type: "command.dispatch", command });
             const sent = yield* runner.send(frame).pipe(Effect.result);
@@ -790,7 +868,10 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           );
         }
         if (frame.hello.runnerGeneration > meta.runner_generation) {
-          yield* rejectPendingCommands("Runner generation changed");
+          yield* rejectPendingCommandsExceptGeneration(
+            frame.hello.runnerGeneration,
+            "Runner generation changed",
+          );
         }
         yield* (
           localCapability === null
@@ -818,7 +899,14 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           capability: attachment.capability,
         });
         yield* setRunnerState("online");
-        yield* dispatchPendingCommands();
+        const snapshot = yield* readSnapshot();
+        if (
+          snapshot !== null &&
+          (!isPublicScaffoldLocation(snapshot.session.location) ||
+            snapshot.session.location.scaffoldLifecycleEpoch === frame.hello.runnerGeneration)
+        ) {
+          yield* dispatchPendingCommands();
+        }
       });
 
       const handleClientHello = Effect.fn("session_fabric.handle_client_hello")(function* (
@@ -1004,6 +1092,11 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             type: "session.snapshot",
             snapshot: published.snapshot,
           });
+          // A resumed Scaffold runner authenticates at the new lifecycle epoch
+          // before it can publish the matching snapshot. Dispatch only queued
+          // commands here; delivered commands remain runner-idempotent replay
+          // work for an actual socket reconnect.
+          yield* dispatchPendingCommands(false);
         },
       );
 
@@ -1073,8 +1166,56 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
                     location: snapshot.session.location,
                   }))));
         const runners = snapshot === null ? [] : yield* eligibleRunners(snapshot, meta);
+        const scaffoldWakeEligible =
+          scaffoldWakeConfig !== null &&
+          snapshot !== null &&
+          meta.runner_state === "offline" &&
+          runners.length === 0 &&
+          meta.runner_generation < Number.MAX_SAFE_INTEGER &&
+          isPublicScaffoldLocation(snapshot.session.location) &&
+          snapshot.session.location.scaffoldLifecycleEpoch === meta.runner_generation &&
+          attachment.capability?.role === "controller" &&
+          !isLocalSessionFabricCapability(attachment.capability);
+        const wakeScaffoldCommand = Effect.fn("session_fabric.wake_scaffold_command")(function* () {
+          if (
+            scaffoldWakeConfig === null ||
+            snapshot === null ||
+            !isPublicScaffoldLocation(snapshot.session.location) ||
+            attachment.capability?.role !== "controller" ||
+            isLocalSessionFabricCapability(attachment.capability)
+          ) {
+            return;
+          }
+          const wakeResult = yield* wakeScaffoldSession(scaffoldWakeConfig, {
+            fabricSessionId: command.sessionId,
+            commandId: command.commandId,
+            environmentId: snapshot.session.location.environmentId,
+            threadId: snapshot.session.location.threadId,
+            scaffoldSessionId: snapshot.session.location.scaffoldSessionId,
+            expectedLifecycleEpoch: snapshot.session.location.scaffoldLifecycleEpoch,
+            actorId: attachment.capability.actorId,
+          }).pipe(Effect.result);
+          if (wakeResult._tag === "Failure") {
+            yield* Effect.logWarning("session fabric could not wake Scaffold runner", {
+              sessionId: command.sessionId,
+              commandId: command.commandId,
+              reason: wakeResult.failure.reason,
+              status: wakeResult.failure.status,
+            });
+            if (scaffoldWakeFailureIsDefinitive(wakeResult.failure)) {
+              yield* storeReceipt({
+                sessionId: command.sessionId,
+                commandId: command.commandId,
+                status: "rejected",
+                resultSequence: null,
+                detail: "Scaffold session could not be resumed",
+                updatedAt: yield* currentIso,
+              });
+            }
+          }
+        });
         const existingCursor = yield* sql.exec<CommandRow>(
-          "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ? LIMIT 1",
+          "SELECT command_id, payload_json, status, result_sequence, detail, updated_at, target_runner_generation FROM session_commands WHERE command_id = ? LIMIT 1",
           command.commandId,
         );
         const existing = (yield* existingCursor.toArray()).at(0);
@@ -1092,12 +1233,32 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
               }),
             }),
           );
+          if (shouldReplayCommand(existing.status)) {
+            if (
+              commandTargetsRunnerGeneration({
+                targetRunnerGeneration: existing.target_runner_generation,
+                runnerGeneration: meta.runner_generation,
+              })
+            ) {
+              yield* dispatchPendingCommands();
+            } else if (
+              scaffoldWakeEligible &&
+              existing.target_runner_generation === meta.runner_generation + 1
+            ) {
+              // A Durable Object can be evicted after persisting the queued
+              // command but before the wake request completes. Retrying the
+              // same command id reuses the stored receipt and safely reissues
+              // the idempotent fenced wake request.
+              yield* wakeScaffoldCommand();
+            }
+          }
           return;
         }
         const authorizationDecision = decideAuthorizedCommandSubmit({
           controllerMatchesSession: commandAuthorized,
           runnerState: meta.runner_state,
           eligibleRunnerCount: runners.length,
+          scaffoldWakeEligible,
         });
         if (authorizationDecision.type === "rejected") {
           const updatedAt = yield* currentIso;
@@ -1112,7 +1273,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           if (commandAuthorized) {
             yield* sql
               .exec(
-                "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at) VALUES (?, ?, 'rejected', NULL, ?, ?)",
+                "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at, target_runner_generation) VALUES (?, ?, 'rejected', NULL, ?, ?, NULL)",
                 command.commandId,
                 encodeCommand(command),
                 authorizationDecision.detail,
@@ -1124,13 +1285,18 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
           return;
         }
         const decision = decideCommandSubmit(existing);
+        const targetRunnerGeneration =
+          authorizationDecision.delivery === "scaffold-wake"
+            ? meta.runner_generation + 1
+            : meta.runner_generation;
         if (decision.type === "accepted") {
           yield* sql
             .exec(
-              "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at) VALUES (?, ?, 'queued', NULL, NULL, ?)",
+              "INSERT INTO session_commands (command_id, payload_json, status, result_sequence, detail, updated_at, target_runner_generation) VALUES (?, ?, 'queued', NULL, NULL, ?, ?)",
               command.commandId,
               encodeCommand(command),
               command.submittedAt,
+              targetRunnerGeneration,
             )
             .pipe(Effect.asVoid);
         }
@@ -1139,7 +1305,7 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             ? decision.existing
             : yield* sql
                 .exec<CommandRow>(
-                  "SELECT command_id, payload_json, status, result_sequence, detail, updated_at FROM session_commands WHERE command_id = ?",
+                  "SELECT command_id, payload_json, status, result_sequence, detail, updated_at, target_runner_generation FROM session_commands WHERE command_id = ?",
                   command.commandId,
                 )
                 .pipe(Effect.flatMap((cursor) => cursor.one()));
@@ -1154,7 +1320,11 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
             updatedAt: row.updated_at,
           }),
         });
-        yield* dispatchPendingCommands();
+        if (authorizationDecision.delivery === "runner") {
+          yield* dispatchPendingCommands();
+          return;
+        }
+        yield* wakeScaffoldCommand();
       });
 
       const handleFrame = Effect.fn("session_fabric.handle_frame")(function* (
@@ -1334,7 +1504,10 @@ export default class SessionStreamCoordinator extends Cloudflare.DurableObjectNa
               })
             ) {
               yield* setRunnerState("offline");
-              yield* rejectPendingCommands("Session runner disconnected");
+              yield* rejectPendingCommandsForGeneration(
+                meta.runner_generation,
+                "Session runner disconnected",
+              );
             }
           }
           yield* socket.close(code, reason);

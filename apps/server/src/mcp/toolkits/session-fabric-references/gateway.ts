@@ -1,16 +1,20 @@
 import {
+  SESSION_FABRIC_WS_CAPABILITY_PREFIX,
   SESSION_FABRIC_PROTOCOL_VERSION,
+  SESSION_FABRIC_WS_PROTOCOL,
   SessionFabricClientFrame,
   SessionFabricContextBundle,
   SessionFabricContextRequest,
   SessionFabricSearchRequest,
   SessionFabricSearchResponse,
   SessionFabricServerFrame,
+  type SessionFabricCapabilityGrant,
   type SessionFabricClientId,
   type SessionFabricCommand,
   type SessionFabricCommandReceipt,
   type SessionFabricContextBundle as SessionFabricContextBundleType,
   type SessionFabricContextRequest as SessionFabricContextRequestType,
+  type SessionFabricExecutionLocation,
   type SessionFabricSearchRequest as SessionFabricSearchRequestType,
   type SessionFabricSearchResponse as SessionFabricSearchResponseType,
   type SessionFabricSessionId,
@@ -22,6 +26,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+
+import type { ScaffoldSessionFabricCapabilityInput } from "../../../scaffold/ScaffoldControlPlaneClient.ts";
+import { makeScaffoldLifecycleService } from "../../../scaffold/ScaffoldLifecycleService.ts";
+
+declare const __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__: string | undefined;
 
 export class SessionFabricGatewayError extends Schema.TaggedErrorClass<SessionFabricGatewayError>()(
   "SessionFabricGatewayError",
@@ -46,15 +55,26 @@ export interface SessionFabricWebSocketLike {
   close(): void;
 }
 
-export type SessionFabricWebSocketConstructor = new (url: string) => SessionFabricWebSocketLike;
+export type SessionFabricWebSocketConstructor = new (
+  url: string,
+  protocols?: string | string[],
+) => SessionFabricWebSocketLike;
 
 export type SessionFabricFetch = (
   input: string | URL | Request,
   init?: RequestInit,
 ) => Promise<Response>;
 
+export type SessionFabricGatewayAuthMode = "required" | "disabled";
+
+export type SessionFabricGatewayCapabilityIssuer = (
+  input: ScaffoldSessionFabricCapabilityInput,
+) => Promise<SessionFabricCapabilityGrant>;
+
 export interface SessionFabricGatewayOptions {
   readonly relayBaseUrl: URL | null;
+  readonly authMode?: SessionFabricGatewayAuthMode;
+  readonly issueCapability?: SessionFabricGatewayCapabilityIssuer;
   readonly fetch?: SessionFabricFetch;
   readonly webSocketConstructor?: SessionFabricWebSocketConstructor;
   readonly now?: () => string;
@@ -72,6 +92,7 @@ export interface SessionFabricGatewayShape {
   readonly submit: (input: {
     readonly sessionId: SessionFabricSessionId;
     readonly clientId: SessionFabricClientId;
+    readonly location: SessionFabricExecutionLocation;
     readonly command: SessionFabricCommand;
   }) => Effect.Effect<SessionFabricCommandReceipt, SessionFabricGatewayError>;
 }
@@ -90,12 +111,49 @@ const decodeServerFrame = Schema.decodeUnknownSync(Schema.fromJsonString(Session
 
 const currentIso = () => DateTime.formatIso(DateTime.nowUnsafe());
 
+const buildSessionFabricRelayUrl =
+  typeof __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__ === "undefined"
+    ? undefined
+    : __T3CODE_BUILD_SESSION_FABRIC_RELAY_URL__;
+
+function normalizeSessionFabricRelayUrl(value: string | undefined): URL | null {
+  const normalized = value?.trim();
+  if (!normalized) return null;
+  try {
+    const url = new URL(normalized);
+    return (url.protocol === "http:" || url.protocol === "https:") &&
+      url.username.length === 0 &&
+      url.password.length === 0
+      ? url
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveSessionFabricGatewayRelayUrl(
+  runtimeUrl: URL | null,
+  buildUrl = buildSessionFabricRelayUrl,
+): URL | null {
+  return runtimeUrl ?? normalizeSessionFabricRelayUrl(buildUrl);
+}
+
 function apiUrl(relayBaseUrl: URL, resource: "search" | "context"): URL {
   const url = new URL(relayBaseUrl);
   url.pathname = `${url.pathname.replace(/\/$/, "")}/v1/session-fabric/${resource}`;
   url.search = "";
   url.hash = "";
   return url;
+}
+
+function isLoopbackHttpRelay(url: URL): boolean {
+  return (
+    url.protocol === "http:" &&
+    (url.hostname === "localhost" ||
+      url.hostname === "::1" ||
+      url.hostname === "[::1]" ||
+      url.hostname.startsWith("127."))
+  );
 }
 
 export function sessionFabricGatewayWebSocketUrl(
@@ -126,6 +184,7 @@ async function fetchJsonWithTimeout(input: {
   readonly url: URL;
   readonly operation: "search" | "context";
   readonly body: string;
+  readonly authorization: string | null;
   readonly timeoutMs: number;
 }): Promise<unknown> {
   const controller = new AbortController();
@@ -141,7 +200,12 @@ async function fetchJsonWithTimeout(input: {
     try {
       response = await input.fetch(input.url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(input.authorization === null
+            ? {}
+            : { authorization: `Bearer ${input.authorization}` }),
+        },
         body: input.body,
         signal: controller.signal,
       });
@@ -191,6 +255,35 @@ async function fetchJsonWithTimeout(input: {
   }
 }
 
+function controllerCapabilityRequest(
+  sessionId: SessionFabricSessionId,
+  location: SessionFabricExecutionLocation,
+): ScaffoldSessionFabricCapabilityInput | null {
+  if (location.environmentKind === "local") {
+    return {
+      role: "controller",
+      fabricSessionId: sessionId,
+      environmentKind: "local",
+      environmentId: location.environmentId,
+      threadId: location.threadId,
+    };
+  }
+  if (
+    location.environmentKind === "scaffold" &&
+    location.scaffoldSessionId !== null &&
+    location.scaffoldLifecycleEpoch !== null &&
+    location.scaffoldLifecycleEpoch !== undefined
+  ) {
+    return {
+      role: "controller",
+      fabricSessionId: sessionId,
+      scaffoldSessionId: location.scaffoldSessionId,
+      scaffoldLifecycleEpoch: location.scaffoldLifecycleEpoch,
+    };
+  }
+  return null;
+}
+
 export function makeSessionFabricGateway(
   options: SessionFabricGatewayOptions,
 ): SessionFabricGatewayShape {
@@ -212,6 +305,39 @@ export function makeSessionFabricGateway(
         )
       : Effect.succeed(options.relayBaseUrl);
 
+  const authorize = (
+    relayBaseUrl: URL,
+    operation: SessionFabricGatewayError["operation"],
+    capabilityRequest: ScaffoldSessionFabricCapabilityInput,
+  ): Effect.Effect<SessionFabricCapabilityGrant | null, SessionFabricGatewayError> => {
+    if (options.authMode === "disabled") {
+      return isLoopbackHttpRelay(relayBaseUrl)
+        ? Effect.succeed(null)
+        : Effect.fail(
+            new SessionFabricGatewayError({
+              operation,
+              detail: "Disabled session fabric authorization is restricted to loopback HTTP.",
+            }),
+          );
+    }
+    if (options.issueCapability === undefined) {
+      return Effect.fail(
+        new SessionFabricGatewayError({
+          operation,
+          detail: "Session fabric capability authorization is not configured.",
+        }),
+      );
+    }
+    return Effect.tryPromise({
+      try: () => options.issueCapability!(capabilityRequest),
+      catch: () =>
+        new SessionFabricGatewayError({
+          operation,
+          detail: "Session fabric capability authorization failed.",
+        }),
+    });
+  };
+
   const request = <A>(input: {
     readonly operation: "search" | "context";
     readonly body: string;
@@ -219,6 +345,7 @@ export function makeSessionFabricGateway(
   }): Effect.Effect<A, SessionFabricGatewayError> =>
     Effect.gen(function* () {
       const relayBaseUrl = yield* requireRelay(input.operation);
+      const grant = yield* authorize(relayBaseUrl, input.operation, { role: "viewer" });
       const payload = yield* Effect.tryPromise({
         try: () =>
           fetchJsonWithTimeout({
@@ -226,6 +353,7 @@ export function makeSessionFabricGateway(
             url: apiUrl(relayBaseUrl, input.operation),
             operation: input.operation,
             body: input.body,
+            authorization: grant?.capability ?? null,
             timeoutMs: options.requestTimeoutMs ?? 30_000,
           }),
         catch: (cause) =>
@@ -250,6 +378,14 @@ export function makeSessionFabricGateway(
   const submit: SessionFabricGatewayShape["submit"] = (input) =>
     Effect.gen(function* () {
       const relayBaseUrl = yield* requireRelay("submit");
+      const capabilityRequest = controllerCapabilityRequest(input.sessionId, input.location);
+      if (capabilityRequest === null) {
+        return yield* new SessionFabricGatewayError({
+          operation: "submit",
+          detail: "Session fabric target does not have an exact controller capability binding.",
+        });
+      }
+      const grant = yield* authorize(relayBaseUrl, "submit", capabilityRequest);
       const socketUrl = sessionFabricGatewayWebSocketUrl(relayBaseUrl, input.sessionId);
       if (socketUrl === null || WebSocketImplementation === undefined) {
         return yield* new SessionFabricGatewayError({
@@ -260,7 +396,15 @@ export function makeSessionFabricGateway(
 
       return yield* Effect.callback<SessionFabricCommandReceipt, SessionFabricGatewayError>(
         (resume) => {
-          const socket = new WebSocketImplementation(socketUrl.toString());
+          const socket = new WebSocketImplementation(
+            socketUrl.toString(),
+            grant === null
+              ? []
+              : [
+                  SESSION_FABRIC_WS_PROTOCOL,
+                  `${SESSION_FABRIC_WS_CAPABILITY_PREFIX}${grant.capability}`,
+                ],
+          );
           let settled = false;
           const finish = (
             result: Effect.Effect<SessionFabricCommandReceipt, SessionFabricGatewayError>,
@@ -362,15 +506,26 @@ export function makeSessionFabricGateway(
   });
 }
 
-const config = Config.url("T3CODE_SESSION_FABRIC_RELAY_URL").pipe(Config.option);
+const config = Config.all({
+  relayUrl: Config.url("T3CODE_SESSION_FABRIC_RELAY_URL").pipe(Config.option),
+  authMode: Config.literals(["required", "disabled"], "T3CODE_SESSION_FABRIC_AUTH_MODE").pipe(
+    Config.withDefault("required"),
+  ),
+});
 
 export const layer = Layer.effect(
   SessionFabricGateway,
   config.pipe(
-    Effect.map((relayUrl) =>
-      makeSessionFabricGateway({
-        relayBaseUrl: Option.isSome(relayUrl) ? relayUrl.value : null,
-      }),
-    ),
+    Effect.map(({ relayUrl, authMode }) => {
+      const scaffoldLifecycle = makeScaffoldLifecycleService();
+      return makeSessionFabricGateway({
+        relayBaseUrl: resolveSessionFabricGatewayRelayUrl(
+          Option.isSome(relayUrl) ? relayUrl.value : null,
+        ),
+        authMode,
+        issueCapability: (capability) =>
+          scaffoldLifecycle.issueSessionFabricCapability({ capability }),
+      });
+    }),
   ),
 );

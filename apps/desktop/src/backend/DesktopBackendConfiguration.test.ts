@@ -138,6 +138,7 @@ describe("DesktopBackendConfiguration", () => {
         assert.isUndefined(first.env.T3CODE_PORT);
         assert.isUndefined(first.env.T3CODE_MODE);
         assert.isUndefined(first.env.T3CODE_DESKTOP_LAN_HOST);
+        assert.isUndefined(first.env.T3CODE_SESSION_FABRIC_RELAY_URL);
 
         assert.equal(first.bootstrap.mode, "desktop");
         assert.equal(first.bootstrap.noBrowser, true);
@@ -449,10 +450,12 @@ describe("DesktopBackendConfiguration", () => {
       const previousWslEnv = process.env.WSLENV;
       const previousOpenAiKey = process.env.OPENAI_API_KEY;
       const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+      const previousSessionFabricRelayUrl = process.env.T3CODE_SESSION_FABRIC_RELAY_URL;
       try {
         process.env.WSLENV = "GOPATH/p:OPENAI_API_KEY/u:EMPTY::AZURE_DEVOPS_EXT_PAT/u";
         process.env.OPENAI_API_KEY = "openai-key";
         process.env.ANTHROPIC_API_KEY = "anthropic-key";
+        process.env.T3CODE_SESSION_FABRIC_RELAY_URL = "https://fabric.example.test";
 
         yield* Effect.gen(function* () {
           const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
@@ -470,13 +473,14 @@ describe("DesktopBackendConfiguration", () => {
           assert.equal(config.httpBaseUrl.href, "http://172.27.0.99:5050/");
           assert.equal(config.env.OPENAI_API_KEY, "openai-key");
           assert.equal(config.env.ANTHROPIC_API_KEY, "anthropic-key");
+          assert.equal(config.env.T3CODE_SESSION_FABRIC_RELAY_URL, "https://fabric.example.test/");
           // The existing WSLENV is preserved byte-for-byte (note the empty
           // "::" segment survives — WSL ignores it, so we don't normalize
           // it away) and ANTHROPIC_API_KEY is appended. OPENAI_API_KEY is
           // already declared, so it isn't forwarded twice.
           assert.equal(
             config.env.WSLENV,
-            "GOPATH/p:OPENAI_API_KEY/u:EMPTY::AZURE_DEVOPS_EXT_PAT/u:ANTHROPIC_API_KEY",
+            "GOPATH/p:OPENAI_API_KEY/u:EMPTY::AZURE_DEVOPS_EXT_PAT/u:ANTHROPIC_API_KEY:T3CODE_SESSION_FABRIC_RELAY_URL",
           );
         }).pipe(
           Effect.provide(
@@ -498,8 +502,31 @@ describe("DesktopBackendConfiguration", () => {
         restoreEnv("WSLENV", previousWslEnv);
         restoreEnv("OPENAI_API_KEY", previousOpenAiKey);
         restoreEnv("ANTHROPIC_API_KEY", previousAnthropicKey);
+        restoreEnv("T3CODE_SESSION_FABRIC_RELAY_URL", previousSessionFabricRelayUrl);
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("resolvePrimary forwards the configured session fabric relay", () =>
+    Effect.gen(function* () {
+      const previousSessionFabricRelayUrl = process.env.T3CODE_SESSION_FABRIC_RELAY_URL;
+      process.env.T3CODE_SESSION_FABRIC_RELAY_URL = "https://fabric.example.test";
+      try {
+        yield* withHarness(
+          Effect.gen(function* () {
+            const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+            const config = yield* configuration.resolvePrimary;
+
+            assert.equal(
+              config.env.T3CODE_SESSION_FABRIC_RELAY_URL,
+              "https://fabric.example.test/",
+            );
+          }),
+        );
+      } finally {
+        restoreEnv("T3CODE_SESSION_FABRIC_RELAY_URL", previousSessionFabricRelayUrl);
+      }
+    }),
   );
 
   it.effect(

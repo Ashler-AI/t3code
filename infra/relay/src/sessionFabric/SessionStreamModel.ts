@@ -72,19 +72,31 @@ export function isCurrentRunnerAttachment(input: {
 }
 
 export type AuthorizedCommandSubmitDecision =
-  | { readonly type: "accepted" }
+  | { readonly type: "accepted"; readonly delivery: "runner" | "scaffold-wake" }
   | { readonly type: "rejected"; readonly detail: string };
 
 export function decideAuthorizedCommandSubmit(input: {
   readonly controllerMatchesSession: boolean;
   readonly runnerState: string;
   readonly eligibleRunnerCount: number;
+  readonly scaffoldWakeEligible: boolean;
 }): AuthorizedCommandSubmitDecision {
   if (!input.controllerMatchesSession) {
     return { type: "rejected", detail: "Controller capability required" };
   }
-  if (input.runnerState !== "online" || input.eligibleRunnerCount === 0) {
-    return { type: "rejected", detail: "Session runner is offline" };
+  if (input.runnerState === "online" && input.eligibleRunnerCount > 0) {
+    return { type: "accepted", delivery: "runner" };
   }
-  return { type: "accepted" };
+  return input.scaffoldWakeEligible
+    ? { type: "accepted", delivery: "scaffold-wake" }
+    : { type: "rejected", detail: "Session runner is offline" };
+}
+
+export function commandTargetsRunnerGeneration(input: {
+  readonly targetRunnerGeneration: number | null;
+  readonly runnerGeneration: number;
+}): boolean {
+  return (
+    input.targetRunnerGeneration === null || input.targetRunnerGeneration === input.runnerGeneration
+  );
 }

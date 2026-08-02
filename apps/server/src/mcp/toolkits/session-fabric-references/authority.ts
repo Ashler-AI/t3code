@@ -203,7 +203,12 @@ export const make = Effect.gen(function* () {
       submittedAt: createdAt,
     };
     const receipt = yield* gateway
-      .submit({ sessionId, clientId, command })
+      .submit({
+        sessionId,
+        clientId,
+        location: target.session.location,
+        command,
+      })
       .pipe(Effect.mapError((cause) => gatewayError(scope, "send", sessionId, cause)));
     if (receipt.sessionId !== sessionId) {
       return yield* makeError({

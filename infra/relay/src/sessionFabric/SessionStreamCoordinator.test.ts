@@ -128,13 +128,15 @@ describe("SessionStreamCoordinator local authority", () => {
         controllerMatchesSession: controllerA,
         runnerState: "online",
         eligibleRunnerCount: 1,
+        scaffoldWakeEligible: false,
       }),
-    ).toEqual({ type: "accepted" });
+    ).toEqual({ type: "accepted", delivery: "runner" });
     expect(
       decideAuthorizedCommandSubmit({
         controllerMatchesSession: controllerB,
         runnerState: "online",
         eligibleRunnerCount: 1,
+        scaffoldWakeEligible: false,
       }),
     ).toEqual({ type: "rejected", detail: "Controller capability required" });
   });

@@ -5,6 +5,7 @@ import {
   decideCommandSubmit,
   decideEventAppend,
   decideRunnerGeneration,
+  commandTargetsRunnerGeneration,
   isCurrentRunnerAttachment,
   runnerHelloMatchesLease,
   SESSION_FABRIC_AUTHENTICATION_CLOSE_CODE,
@@ -106,6 +107,7 @@ describe("SessionStreamModel", () => {
         controllerMatchesSession: false,
         runnerState: "online",
         eligibleRunnerCount: 1,
+        scaffoldWakeEligible: false,
       }),
     ).toEqual({ type: "rejected", detail: "Controller capability required" });
     expect(
@@ -113,6 +115,7 @@ describe("SessionStreamModel", () => {
         controllerMatchesSession: true,
         runnerState: "offline",
         eligibleRunnerCount: 1,
+        scaffoldWakeEligible: false,
       }),
     ).toEqual({ type: "rejected", detail: "Session runner is offline" });
     expect(
@@ -120,6 +123,7 @@ describe("SessionStreamModel", () => {
         controllerMatchesSession: true,
         runnerState: "online",
         eligibleRunnerCount: 0,
+        scaffoldWakeEligible: false,
       }),
     ).toEqual({ type: "rejected", detail: "Session runner is offline" });
   });
@@ -130,7 +134,31 @@ describe("SessionStreamModel", () => {
         controllerMatchesSession: true,
         runnerState: "online",
         eligibleRunnerCount: 1,
+        scaffoldWakeEligible: false,
       }),
-    ).toEqual({ type: "accepted" });
+    ).toEqual({ type: "accepted", delivery: "runner" });
+  });
+
+  it("queues an offline Scaffold command for the next fenced runner generation", () => {
+    expect(
+      decideAuthorizedCommandSubmit({
+        controllerMatchesSession: true,
+        runnerState: "offline",
+        eligibleRunnerCount: 0,
+        scaffoldWakeEligible: true,
+      }),
+    ).toEqual({ type: "accepted", delivery: "scaffold-wake" });
+    expect(
+      commandTargetsRunnerGeneration({
+        targetRunnerGeneration: 8,
+        runnerGeneration: 8,
+      }),
+    ).toBe(true);
+    expect(
+      commandTargetsRunnerGeneration({
+        targetRunnerGeneration: 8,
+        runnerGeneration: 7,
+      }),
+    ).toBe(false);
   });
 });

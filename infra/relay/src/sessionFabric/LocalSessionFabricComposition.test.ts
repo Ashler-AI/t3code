@@ -330,6 +330,7 @@ class ComposedRelay {
       controllerMatchesSession: authorized,
       runnerState: snapshot.session.runnerState,
       eligibleRunnerCount: 1,
+      scaffoldWakeEligible: false,
     });
     if (decision.type === "rejected") {
       this.rejectedCommands += 1;

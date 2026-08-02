@@ -16,6 +16,7 @@ import serverPackageJson from "../../../server/package.json" with { type: "json"
 
 import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import { resolveDesktopSessionFabricRelayUrl } from "../app/DesktopSessionFabric.ts";
 import * as DesktopServerExposure from "./DesktopServerExposure.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
@@ -84,12 +85,13 @@ const DESKTOP_BACKEND_ENV_NAMES = [
   "T3CODE_DESKTOP_HTTPS_ENDPOINTS",
   "T3CODE_TAILSCALE_SERVE",
   "T3CODE_TAILSCALE_SERVE_PORT",
+  "T3CODE_SESSION_FABRIC_RELAY_URL",
 ] as const;
 
-// Sensitive env vars that the WSL backend needs but Windows process.env won't
+// Environment values that the WSL backend needs but Windows process.env won't
 // forward across the wsl.exe boundary without WSLENV. The dev-server URL is
-// handled separately via a `--dev-url` CLI flag because WSLENV translation of
-// URL-shaped values (colons / slashes) is unreliable.
+// handled separately via a `--dev-url` CLI flag because it also selects the
+// backend's dev state directory during bootstrap.
 const WSL_FORWARDED_ENV_NAMES = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"] as const;
 
 const WSL_SERVER_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -355,6 +357,7 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       cwd: environment.backendCwd,
       env: {
         ...backendChildEnvPatch(),
+        T3CODE_SESSION_FABRIC_RELAY_URL: resolveDesktopSessionFabricRelayUrl(),
         ELECTRON_RUN_AS_NODE: "1",
       },
       // Primary wants process.env (PATH, dev-runner's T3CODE_HOME, etc.).
@@ -468,6 +471,11 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
       forwardedEnv[name] = value;
       forwardedEnvNames.push(name);
     }
+  }
+  const sessionFabricRelayUrl = resolveDesktopSessionFabricRelayUrl();
+  if (sessionFabricRelayUrl !== undefined) {
+    forwardedEnv.T3CODE_SESSION_FABRIC_RELAY_URL = sessionFabricRelayUrl;
+    forwardedEnvNames.push("T3CODE_SESSION_FABRIC_RELAY_URL");
   }
 
   // Build an explicit copy of process.env minus T3CODE_HOME (dev-runner
