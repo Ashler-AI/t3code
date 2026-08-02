@@ -1,0 +1,153 @@
+diff --git a/lib/Cloudflare/Workers/Worker.js b/lib/Cloudflare/Workers/Worker.js
+index 38fd9d167da92600f57a3399bb8bf36784e79abe..04c57a51296b423cef3303283553174637bd5f19 100644
+--- a/lib/Cloudflare/Workers/Worker.js
++++ b/lib/Cloudflare/Workers/Worker.js
+@@ -911,13 +911,32 @@ export const LiveWorkerProvider = () => Provider.effect(Worker, Effect.gen(funct
+             }).pipe(Effect.map((s) => s), Effect.catch(() => Effect.succeed(undefined))));
+         const oldTags = Array.from(new Set(oldSettings?.tags ?? []));
+         const oldBindings = oldSettings?.bindings ?? [];
+-        // Parse alchemy:do:{logicalId}:{className} tags
++        // Parse alchemy:do:{logicalId}:{className} tags. Legacy Alchemy
++        // deployments predate these tags, so recover their logical ids from
++        // the binding names returned by Cloudflare before planning migrations.
+         const oldDoClassNameByLogicalId = getDurableObjectTagMap(oldTags);
+         const currentDoBindings = getDurableObjectBindings(bindings, name);
+         const currentDoClassNameByLogicalId = Object.fromEntries(currentDoBindings.map((binding) => [
+             binding.logicalId,
+             binding.className,
+         ]));
++        const previousDoClassNameByLogicalId = {
++            ...oldDoClassNameByLogicalId,
++        };
++        if (Object.keys(oldDoClassNameByLogicalId).length === 0) {
++            for (const oldBinding of oldBindings) {
++                if (oldBinding.type !== "durable_object_namespace" ||
++                    !oldBinding.className ||
++                    (oldBinding.scriptName != null && oldBinding.scriptName !== name)) {
++                    continue;
++                }
++                const currentBinding = currentDoBindings.find((binding) => binding.bindingName === oldBinding.name);
++                if (currentBinding) {
++                    previousDoClassNameByLogicalId[currentBinding.logicalId] =
++                        oldBinding.className;
++                }
++            }
++        }
+         // Parse alchemy:migration-tag:{version}
+         const oldMigrationTag = oldTags.flatMap((tag) => tag.startsWith("alchemy:migration-tag:")
+             ? [tag.slice("alchemy:migration-tag:".length)]
+@@ -925,7 +944,7 @@ export const LiveWorkerProvider = () => Provider.effect(Worker, Effect.gen(funct
+         const newMigrationTag = bumpMigrationTagVersion(oldMigrationTag);
+         // Compute deleted classes
+         const deletedClasses = [];
+-        for (const [logicalId, className] of Object.entries(oldDoClassNameByLogicalId)) {
++        for (const [logicalId, className] of Object.entries(previousDoClassNameByLogicalId)) {
+             if (!currentDoClassNameByLogicalId[logicalId]) {
+                 deletedClasses.push(className);
+             }
+@@ -937,7 +956,7 @@ export const LiveWorkerProvider = () => Provider.effect(Worker, Effect.gen(funct
+         // and we don't own its lifecycle.
+         if (Object.keys(oldDoClassNameByLogicalId).length === 0) {
+             for (const oldBinding of oldBindings) {
+-                const ownedLocally = !("scriptName" in oldBinding) || oldBinding.scriptName === name;
++                const ownedLocally = oldBinding.scriptName == null || oldBinding.scriptName === name;
+                 if (oldBinding.type === "durable_object_namespace" &&
+                     "className" in oldBinding &&
+                     oldBinding.className &&
+@@ -954,7 +973,7 @@ export const LiveWorkerProvider = () => Provider.effect(Worker, Effect.gen(funct
+         const newSqliteClasses = [];
+         const renamedClasses = [];
+         for (const binding of currentDoBindings) {
+-            const previousClassName = oldDoClassNameByLogicalId[binding.logicalId];
++            const previousClassName = previousDoClassNameByLogicalId[binding.logicalId];
+             if (!previousClassName) {
+                 // Default all new Durable Object classes to SQLite. Cloudflare
+                 // recommends SQLite for new namespaces, and container-backed
+@@ -969,7 +988,7 @@ export const LiveWorkerProvider = () => Provider.effect(Worker, Effect.gen(funct
+             }
+         }
+         yield* Effect.logInfo(`Cloudflare Worker put: durable object reconciliation ${JSON.stringify({
+-            oldDoClassNameByLogicalId,
++            previousDoClassNameByLogicalId,
+             currentDoClassNameByLogicalId,
+             deletedClasses,
+             renamedClasses,
+diff --git a/src/Cloudflare/Workers/Worker.ts b/src/Cloudflare/Workers/Worker.ts
+index 8460f6c6571f95275adfed637216ab4289eb4404..3043a5e54eb07708ab348fcb40f7b9fc62ff007f 100644
+--- a/src/Cloudflare/Workers/Worker.ts
++++ b/src/Cloudflare/Workers/Worker.ts
+@@ -1476,7 +1476,9 @@ export const LiveWorkerProvider = () =>
+         const oldTags = Array.from(new Set(oldSettings?.tags ?? []));
+         const oldBindings = oldSettings?.bindings ?? [];
+ 
+-        // Parse alchemy:do:{logicalId}:{className} tags
++        // Parse alchemy:do:{logicalId}:{className} tags. Legacy Alchemy
++        // deployments predate these tags, so recover their logical ids from
++        // the binding names returned by Cloudflare before planning migrations.
+         const oldDoClassNameByLogicalId = getDurableObjectTagMap(oldTags);
+         const currentDoBindings = getDurableObjectBindings(bindings, name);
+         const currentDoClassNameByLogicalId = Object.fromEntries(
+@@ -1485,6 +1487,27 @@ export const LiveWorkerProvider = () =>
+             binding.className,
+           ]),
+         );
++        const previousDoClassNameByLogicalId = {
++          ...oldDoClassNameByLogicalId,
++        };
++        if (Object.keys(oldDoClassNameByLogicalId).length === 0) {
++          for (const oldBinding of oldBindings) {
++            if (
++              oldBinding.type !== "durable_object_namespace" ||
++              !oldBinding.className ||
++              (oldBinding.scriptName != null && oldBinding.scriptName !== name)
++            ) {
++              continue;
++            }
++            const currentBinding = currentDoBindings.find(
++              (binding) => binding.bindingName === oldBinding.name,
++            );
++            if (currentBinding) {
++              previousDoClassNameByLogicalId[currentBinding.logicalId] =
++                oldBinding.className;
++            }
++          }
++        }
+ 
+         // Parse alchemy:migration-tag:{version}
+         const oldMigrationTag = oldTags.flatMap((tag) =>
+@@ -1497,7 +1520,7 @@ export const LiveWorkerProvider = () =>
+         // Compute deleted classes
+         const deletedClasses: string[] = [];
+         for (const [logicalId, className] of Object.entries(
+-          oldDoClassNameByLogicalId,
++          previousDoClassNameByLogicalId,
+         )) {
+           if (!currentDoClassNameByLogicalId[logicalId]) {
+             deletedClasses.push(className);
+@@ -1512,7 +1535,7 @@ export const LiveWorkerProvider = () =>
+         if (Object.keys(oldDoClassNameByLogicalId).length === 0) {
+           for (const oldBinding of oldBindings) {
+             const ownedLocally =
+-              !("scriptName" in oldBinding) || oldBinding.scriptName === name;
++              oldBinding.scriptName == null || oldBinding.scriptName === name;
+             if (
+               oldBinding.type === "durable_object_namespace" &&
+               "className" in oldBinding &&
+@@ -1540,7 +1563,7 @@ export const LiveWorkerProvider = () =>
+         const renamedClasses: { from: string; to: string }[] = [];
+         for (const binding of currentDoBindings) {
+           const previousClassName =
+-            oldDoClassNameByLogicalId[binding.logicalId];
++            previousDoClassNameByLogicalId[binding.logicalId];
+           if (!previousClassName) {
+             // Default all new Durable Object classes to SQLite. Cloudflare
+             // recommends SQLite for new namespaces, and container-backed
+@@ -1557,7 +1580,7 @@ export const LiveWorkerProvider = () =>
+         yield* Effect.logInfo(
+           `Cloudflare Worker put: durable object reconciliation ${JSON.stringify(
+             {
+-              oldDoClassNameByLogicalId,
++              previousDoClassNameByLogicalId,
+               currentDoClassNameByLogicalId,
+               deletedClasses,
+               renamedClasses,
