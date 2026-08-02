@@ -99,20 +99,29 @@ export const resolveSessionFabricCorsOrigin = (input: {
 
 export default class SessionFabricApi extends Cloudflare.Worker<SessionFabricApi>()(
   "SessionFabricApi",
-  {
-    name: "ashler-session-fabric-proof",
-    main: import.meta.filename,
-    compatibility: {
-      date: "2026-05-22",
-      flags: ["nodejs_compat"],
-    },
-    dev: {
-      host: "127.0.0.1",
-      port: 8788,
-      strictPort: true,
-    },
-    observability: { enabled: true },
-  },
+  Effect.gen(function* () {
+    const deploymentMarker = yield* Config.string("SESSION_FABRIC_DEPLOYMENT_MARKER").pipe(
+      Config.option,
+    );
+    return {
+      name: "ashler-session-fabric-proof",
+      main: import.meta.filename,
+      compatibility: {
+        date: "2026-05-22",
+        flags: ["nodejs_compat"],
+      },
+      dev: {
+        host: "127.0.0.1",
+        port: 8788,
+        strictPort: true,
+      },
+      observability: { enabled: true },
+      env: Option.match(deploymentMarker, {
+        onNone: () => ({}),
+        onSome: (marker) => ({ SESSION_FABRIC_DEPLOYMENT_MARKER: marker }),
+      }),
+    };
+  }),
   Effect.gen(function* () {
     const sessionStreams = yield* SessionStreamCoordinator;
     const sessionDirectory = yield* SessionDirectory;
