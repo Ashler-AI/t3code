@@ -49,7 +49,7 @@ describe("Ashler OMP models overlay", () => {
     });
 
     expect(providers).toEqual({
-      openai: {
+      "openai-codex": {
         baseUrl: "https://scaffold.test/api/llm-proxy/openai/v1",
         apiKey: "SCAFFOLD_OMP_OPENAI_BROKER_GRANT",
       },

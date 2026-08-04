@@ -8,7 +8,7 @@ import { writeFileStringAtomically } from "../atomicWrite.ts";
 
 const MODEL_CONFIG_FILE = "models.yml";
 const GATEWAY_PROVIDER_ID = "ashler";
-const OPENAI_BROKER_PROVIDER_ID = "openai";
+const OPENAI_BROKER_PROVIDER_ID = "openai-codex";
 const ANTHROPIC_BROKER_PROVIDER_ID = "anthropic";
 
 const MANAGED_BROKER_DEFINITIONS = [
